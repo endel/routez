@@ -182,7 +182,6 @@ Relative numbers only; a VM is not a benchmark machine.
   set of names per week, and failed validations per hour); test against
   the staging directory before production.
 
-- The WebTransport relay has no backpressure between its two sides.
 - During a reload, new QUIC connections that the kernel hands to the old
   generation's sockets are refused until it finishes draining (up to 10 s);
   browsers fall back to TCP meanwhile.
@@ -192,9 +191,6 @@ Relative numbers only; a VM is not a benchmark machine.
   vanishes holds its connection slot until the timeout.
 - `limit_req` and per-IP limits count per worker, so the effective limit is
   multiplied by the number of workers.
-- With several workers, a QUIC client that changes address can land on a
-  worker that doesn't hold its connection and gets reset; steering by
-  connection ID (QUIC-LB or eBPF) isn't wired up.
 - Static files are read on the worker thread; fine for page-cached files,
   slow disks stall that worker.
 - Upstream pools and health state are per worker, so health checks run once
