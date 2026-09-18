@@ -123,6 +123,32 @@ SUITE=reload check reload-no-errors "$(sort -u "$WORK/reload_codes.txt" | tr '\n
 SUITE=limits check per-ip-limit "$(python3 "$HERE/conn_limit.py" 25)" 5
 SUITE=limits check stub-status "$($CURL_BIN -s http://127.0.0.1:18080/status | grep -c '^Active connections: ')" 1
 
+# QUIC connection migration across workers: four workers share UDP 18444;
+# a NAT relay moves the client to a new source port mid-connection, which
+# the kernel usually hashes to another worker. Steering by connection ID
+# keeps every connection alive. (macOS hands all of a port's UDP to one
+# socket, so only Linux really exercises the steering.)
+(cd "$ROOT" && zig build h3-test-client) || exit 1
+cat > "$WORK/mig.zon" <<EOF2
+.{ .access_log = false, .workers = 4, .servers = .{.{
+    .listen = .{.{ .address = "127.0.0.1", .port = 18444, .quic = true, .tcp = false }},
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{ .{ .prefix = "/", .@"return" = .{ .body = "ok" } }, .{ .prefix = "/status", .stub_status = true } },
+}} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/mig.zon" 2> "$WORK/mig.log" & MIG=$!; PIDS+=($MIG)
+perl -e 'select(undef,undef,undef,0.5)'
+migrated=0
+for i in $(seq 1 8); do
+    python3 "$HERE/nat_relay.py" 18500 18444 12 > /dev/null & NAT=$!
+    perl -e 'select(undef,undef,undef,0.3)'
+    "$ROOT/zig-out/bin/h3-test-client" 18500 "$CERTS/ca.crt" 40 > "$WORK/mig_client.log" 2>&1 && migrated=$((migrated+1))
+    kill $NAT; wait $NAT 2>/dev/null
+done
+SUITE=migration check survives-rebinding "$migrated" 8
+kill $MIG; wait $MIG 2>/dev/null
+echo "migration: $(grep -o 'quic steered: [0-9]*' "$WORK/mig.log")"
+
 # WebTransport through the relay: a stream and a datagram, echoed.
 (cd "$ROOT" && zig build wt-test-client) || exit 1
 "$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" > "$WORK/wt.log" 2>&1 & WT=$!

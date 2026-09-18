@@ -12,6 +12,12 @@ const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const tls = @import("../net/tls.zig");
 const wt_relay = @import("wt_relay.zig");
+const steering = @import("../steering.zig");
+
+fn onForeign(ctx: ?*anyopaque, dg: *const event_loop.ForeignDatagram) void {
+    const w: *Worker = @ptrCast(@alignCast(ctx.?));
+    steering.registry.route(w.io, dg);
+}
 const Worker = @import("../worker.zig").Worker;
 const Exchange = exchange.Exchange;
 const Header = common.Header;
@@ -88,6 +94,12 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .reuse_port = true,
                 .max_connections = w.cfg.limits.max_connections,
                 .recv_buffer_size = 4 * 1024 * 1024,
+                // Our id in every connection ID, so a sibling worker that gets
+                // our packets after a client's address changes can pass them on.
+                .quic_lb = steering.lbConfig(w.id),
+                .foreign_datagram = .{ .ctx = w, .func = onForeign },
+                .retry_token_key = w.shared.quic_keys.retry,
+                .static_reset_key = w.shared.quic_keys.reset,
                 .send_buffer_size = 4 * 1024 * 1024,
             });
             if (w.id == 0) log.info("listening on {s}:{d} (quic{s})", .{ l.address, l.port, if (proto == .webtransport) ", webtransport" else "" });
