@@ -101,6 +101,18 @@ The end-to-end script needs python3, bun, node >= 22, a curl built with
 HTTP/3 (Homebrew's), and a built `../quic-zig` (its WebTransport echo server
 is the relay's upstream).
 
+## Performance
+
+A rough comparison with nginx 1.24 on the same Linux VM (Docker on an Apple
+M-series Mac, 10 cores), both with 4 workers, keep-alive, `wrk -t4 -c100`.
+Relative numbers only; a VM is not a benchmark machine.
+
+| Workload | nginx | routez |
+|---|---|---|
+| Fixed response (`return`) | 563k req/s | 521k req/s |
+| 10 KB static file | 277k req/s | 249k req/s |
+| Reverse proxy to a keep-alive upstream | 195k req/s | 186k req/s |
+
 ## Limitations
 
 - The WebTransport relay has no backpressure between its two sides.
