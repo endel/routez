@@ -15,14 +15,27 @@ const Stream = struct { entry: *event_loop.ConnEntry, id: u64, window: usize = 0
 
 const Handler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
-    streams: std.AutoHashMapUnmanaged(u64, Stream) = .empty,
+    /// Keyed by connection and stream: stream ids restart on every connection.
+    streams: std.AutoHashMapUnmanaged(Key, Stream) = .empty,
+
+    const Key = struct { conn: u64, stream: u64 };
+
+    /// Paused streams hold a pointer to their connection; drop them with it.
+    pub fn onConnectionClosed(self: *Handler, session: *event_loop.Session) void {
+        var doomed: std.ArrayListUnmanaged(Key) = .empty;
+        defer doomed.deinit(std.heap.page_allocator);
+        var it = self.streams.keyIterator();
+        while (it.next()) |k| if (k.conn == session.id()) doomed.append(std.heap.page_allocator, k.*) catch {};
+        for (doomed.items) |k| _ = self.streams.remove(k);
+    }
 
     pub fn onConnectRequest(_: *Handler, session: *event_loop.Session, session_id: u64, _: []const u8, _: []const quic.qpack.Header) void {
         session.acceptSession(session_id) catch {};
     }
 
     pub fn onStreamData(self: *Handler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
-        const gop = self.streams.getOrPut(std.heap.page_allocator, stream_id) catch return;
+        const key: Key = .{ .conn = session.id(), .stream = stream_id };
+        const gop = self.streams.getOrPut(std.heap.page_allocator, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .{ .entry = session.entry, .id = stream_id };
         const s = gop.value_ptr;
         s.total += data.len;
@@ -31,7 +44,7 @@ const Handler = struct {
             var buf: [32]u8 = undefined;
             session.sendStreamData(stream_id, std.fmt.bufPrint(&buf, "got {d}", .{s.total}) catch unreachable) catch {};
             session.closeStream(stream_id);
-            _ = self.streams.remove(stream_id);
+            _ = self.streams.remove(key);
             return;
         }
         if (s.window >= budget and !s.paused) {
