@@ -9,8 +9,6 @@ In priority order. Effort: S (days), M (a week or two), L (several weeks).
      client keeps retransmitting after the server has dropped it.
    - quic-zig: QPACK encoder instructions split across reads are fatal.
    - quic-zig: a bidi stream is freed on FIN while a gap is still open.
-   - A request during a SIGHUP reload occasionally gets no response (seen on
-     Linux CI).
 2. **Redirects with variables** (S). `return` can't build a `Location` from
    the request, so there's no plain HTTP to HTTPS redirect. Needs `$host`
    and `$request_uri`.

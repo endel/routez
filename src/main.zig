@@ -52,7 +52,9 @@ const Generation = struct {
     threads: []std.Thread,
 
     /// Start workers on `source` if given, else on the file at `path`.
-    fn start(io: std.Io, path: []const u8, source: ?[:0]const u8, first_id: usize, manager: *acme.Manager) !*Generation {
+    /// `prev` is the running generation being replaced, whose listening
+    /// sockets are shared. Its workers only read them before `prev.stop()`.
+    fn start(io: std.Io, path: []const u8, source: ?[:0]const u8, first_id: usize, manager: *acme.Manager, prev: ?*const Generation) !*Generation {
         const alloc = std.heap.smp_allocator;
         const g = try alloc.create(Generation);
         g.* = .{ .arena_state = .init(alloc), .source = undefined, .cfg = undefined, .shared = undefined, .workers = &.{}, .threads = &.{} };
@@ -78,7 +80,8 @@ const Generation = struct {
         var created: usize = 0;
         errdefer for (workers[0..created]) |w| w.destroy();
         for (workers, 0..) |*w, i| {
-            w.* = Worker.create(alloc, io, &g.cfg, &g.shared, first_id + i) catch |err| {
+            const prev_worker = if (prev) |p| (if (i < p.workers.len) p.workers[i] else null) else null;
+            w.* = Worker.create(alloc, io, &g.cfg, &g.shared, first_id + i, prev_worker) catch |err| {
                 log.err("worker {d}: {s}", .{ i, @errorName(err) });
                 return err;
             };
@@ -180,7 +183,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const manager = try acme.Manager.create(std.heap.smp_allocator, init.io, onCertificateRenewed);
     var next_id: usize = 0;
-    var gen = Generation.start(init.io, path, null, next_id, manager) catch return 1;
+    var gen = Generation.start(init.io, path, null, next_id, manager, null) catch return 1;
     next_id += gen.workers.len;
     log.info("{d} worker(s) running, config {s}", .{ gen.workers.len, path });
 
@@ -192,7 +195,7 @@ pub fn main(init: std.process.Init) !u8 {
             // A new certificate reloads the same config text, not whatever
             // the file holds now: edits wait for their SIGHUP.
             if (b == 'r') log.info("reloading {s}", .{path}) else log.info("reloading for a new certificate", .{});
-            const fresh = Generation.start(init.io, path, if (b == 'c') gen.source else null, next_id, manager) catch {
+            const fresh = Generation.start(init.io, path, if (b == 'c') gen.source else null, next_id, manager, gen) catch {
                 log.err("reload failed; keeping the running configuration", .{});
                 continue;
             };

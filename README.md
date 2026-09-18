@@ -26,8 +26,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   keep-alive connections close when idle, HTTP/3 connections get GOAWAY and
   finish their requests, with a 10 s limit.
 - Reload on SIGHUP: new workers start on the new config beside the old ones,
-  which stop accepting and drain. A config that fails to load is rejected
-  and the running one kept.
+  taking over their TCP listening sockets, and the old ones drain. A config
+  that fails to load is rejected and the running one kept.
 - Per location: gzip for text-like responses, `add_headers`,
   `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
   (per-client token bucket).
@@ -210,6 +210,8 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
 - During a reload, new QUIC connections that the kernel hands to the old
   generation's sockets are refused until it finishes draining (up to 10 s);
   browsers fall back to TCP meanwhile.
+- A reload that lowers `workers` closes the extra TCP listening sockets,
+  resetting any connection queued on them at that moment.
 - QUIC connections close after `limits.quic_idle_timeout_ms` of silence
   (30 s by default). Each end uses the smaller of the two advertised values,
   so raising it only helps clients that advertise more; a client that

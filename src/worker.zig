@@ -149,7 +149,9 @@ pub const Worker = struct {
         }
     };
 
-    pub fn create(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config, shared: *const Shared, id: usize) !*Worker {
+    /// `prev` is the worker this one replaces on a reload, if any: its TCP
+    /// listening sockets are shared rather than reopened.
+    pub fn create(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config, shared: *const Shared, id: usize, prev: ?*const Worker) !*Worker {
         const w = try alloc.create(Worker);
         errdefer alloc.destroy(w);
         w.* = .{
@@ -166,7 +168,7 @@ pub const Worker = struct {
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
         try w.setupUpstreams();
-        try w.setupListeners();
+        try w.setupListeners(prev);
         try w.setupQuicListeners();
         for (cfg.udp_proxies) |*u| try w.udp_proxies.append(alloc, try UdpProxy.create(w, u));
         return w;
@@ -218,7 +220,7 @@ pub const Worker = struct {
         return null;
     }
 
-    fn setupListeners(self: *Worker) !void {
+    fn setupListeners(self: *Worker, prev: ?*const Worker) !void {
         // One TCP listener per address:port, shared by the servers naming it.
         for (self.cfg.servers) |*srv| {
             for (srv.listen) |l| {
@@ -232,7 +234,8 @@ pub const Worker = struct {
                     continue;
                 }
                 const tc: ?*const tls.ServerConfig = if (l.tls) self.shared.tlsFor(l.address, l.port) orelse return error.InvalidConfig else null;
-                const lst = try Listener.create(self, l, tc);
+                const inherit = if (prev) |p| p.findListenerConst(l.address, l.port) else null;
+                const lst = try Listener.create(self, l, tc, inherit);
                 try lst.addServer(srv);
                 try self.listeners.append(self.alloc, lst);
             }
@@ -281,6 +284,13 @@ pub const Worker = struct {
         var n: usize = 0;
         for (self.quic_listeners.items) |l| n += l.liveConnections();
         return n;
+    }
+
+    fn findListenerConst(self: *const Worker, address: []const u8, port: u16) ?*const Listener {
+        for (self.listeners.items) |l| {
+            if (l.port == port and std.mem.eql(u8, l.address, address)) return l;
+        }
+        return null;
     }
 
     fn findListener(self: *Worker, address: []const u8, port: u16) ?*Listener {
@@ -507,17 +517,19 @@ pub const Listener = struct {
     retry: timers.Deadline = .{ .callback = onRetryAccept },
     cancel_c: xev.Completion = .{},
     accepting: bool = false,
+    accept_errors: u8 = 0,
     closed: bool = false,
 
-    fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig) !*Listener {
-        const addr = try std.Io.net.IpAddress.parse(l.address, l.port);
-        const tcp = try xev.TCP.init(addr);
+    /// With `inherit` (the same listener in the worker being replaced),
+    /// share its socket: closing a listening socket resets the connections
+    /// queued on it, and a SYN racing the close is refused.
+    fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig, inherit: ?*const Listener) !*Listener {
+        const tcp = if (inherit) |old| blk: {
+            const fd = std.c.fcntl(old.tcp.fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+            if (fd < 0) return error.DupFailed;
+            break :blk xev.TCP.initFd(fd);
+        } else try openListener(l);
         errdefer _ = std.c.close(tcp.fd);
-        const one: c_int = 1;
-        // Every worker binds the same port; the kernel spreads connections.
-        _ = std.c.setsockopt(tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(c_int));
-        try tcp.bind(addr);
-        try tcp.listen(1024);
 
         const self = try w.alloc.create(Listener);
         self.* = .{ .worker = w, .address = l.address, .port = l.port, .tcp = tcp, .tls_config = tc };
@@ -526,6 +538,18 @@ pub const Listener = struct {
         }
         if (w.id == 0) log.info("listening on {s}:{d}{s}", .{ l.address, l.port, if (tc != null) " (tls)" else "" });
         return self;
+    }
+
+    fn openListener(l: config.Listen) !xev.TCP {
+        const addr = try std.Io.net.IpAddress.parse(l.address, l.port);
+        const tcp = try xev.TCP.init(addr);
+        errdefer _ = std.c.close(tcp.fd);
+        const one: c_int = 1;
+        // Every worker binds the same port; the kernel spreads connections.
+        _ = std.c.setsockopt(tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(c_int));
+        try tcp.bind(addr);
+        try tcp.listen(1024);
+        return tcp;
     }
 
     fn addServer(self: *Listener, srv: *const config.Server) !void {
@@ -550,20 +574,16 @@ pub const Listener = struct {
         self.tcp.accept(&self.worker.loop, &self.accept_c, Listener, self, onAccept);
     }
 
-    /// Stop accepting and close the listening socket, so the kernel sends
-    /// new connections to the other listeners on this port.
+    /// Stop accepting and close our fd for the listening socket: the new
+    /// generation's dup keeps a shared socket open, and an unshared one
+    /// leaves the SO_REUSEPORT group.
     fn stopAccepting(self: *Listener) void {
         if (self.closed) return;
         self.closed = true;
         self.worker.timers.clear(&self.retry);
-        // Serve what is already queued: closing a listener resets the
-        // connections in its backlog, which a reload shouldn't do.
-        while (socket.acceptNow(self.tcp.fd)) |fd| {
-            stats.inc(&stats.accepted);
-            _ = H1Conn.create(self.worker, self, xev.TCP.initFd(fd)) catch {
-                _ = std.c.close(fd);
-            };
-        }
+        // Serve what is already queued: closing an unshared listener resets
+        // the connections in its backlog.
+        while (socket.acceptNow(self.tcp.fd)) |fd| self.serve(xev.TCP.initFd(fd));
         if (!self.accepting) {
             _ = std.c.close(self.tcp.fd);
             return;
@@ -594,22 +614,38 @@ pub const Listener = struct {
 
     fn onAccept(ud: ?*Listener, _: *xev.Loop, _: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
         const self = ud.?;
-        const w = self.worker;
         if (self.closed) {
-            self.accepting = false;
-            if (r) |tcp| _ = std.c.close(tcp.fd) else |_| {}
-            return .disarm;
+            if (r) |tcp| {
+                self.serve(tcp);
+                return .rearm;
+            } else |_| {}
+            // kqueue reports the cancel here (Canceled). epoll doesn't, and
+            // disarming would close the dup'd fd the queued cancel then
+            // deletes from epoll: EBADF, a panic, or someone else's fd.
+            return if (xev.backend == .epoll) .rearm else .disarm;
         }
         const tcp = r catch |err| {
+            // Another loop sharing the socket (a reload) took the connection:
+            // EAGAIN, which libxev's epoll backend reports as `Unknown`.
+            // Only a streak means fd exhaustion; then back off, not spin.
+            self.accept_errors +|= 1;
+            if (self.accept_errors < 8) return .rearm;
+            self.accept_errors = 0;
             self.accepting = false;
-            // Usually fd exhaustion; retry shortly instead of spinning.
             log.warn("accept on :{d}: {s}", .{ self.port, @errorName(err) });
-            w.timers.set(&self.retry, 100);
+            self.worker.timers.set(&self.retry, 100);
             return .disarm;
         };
-        if (w.stopping or w.conn_count >= w.cfg.limits.max_connections) {
+        self.accept_errors = 0;
+        self.serve(tcp);
+        return .rearm;
+    }
+
+    fn serve(self: *Listener, tcp: xev.TCP) void {
+        const w = self.worker;
+        if (w.conn_count >= w.cfg.limits.max_connections) {
             _ = std.c.close(tcp.fd);
-            return .rearm;
+            return;
         }
         stats.inc(&stats.accepted);
         var ip_key: ?[16]u8 = null;
@@ -618,7 +654,7 @@ pub const Listener = struct {
                 if (!w.acquireIp(k)) {
                     stats.inc(&stats.refused_per_ip);
                     _ = std.c.close(tcp.fd);
-                    return .rearm;
+                    return;
                 }
                 ip_key = k;
             }
@@ -627,10 +663,9 @@ pub const Listener = struct {
             log.warn("connection setup: {s}", .{@errorName(err)});
             if (ip_key) |k| w.releaseIp(k);
             _ = std.c.close(tcp.fd);
-            return .rearm;
+            return;
         };
         conn.ip_key = ip_key;
-        return .rearm;
     }
 
     fn onRetryAccept(d: *timers.Deadline) void {
