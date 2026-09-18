@@ -119,6 +119,20 @@ pub fn writeAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
     try af.replace(io);
 }
 
+/// Fail early, before ordering, when the CA directory can't be written: a
+/// certificate that can't be stored would be ordered again on every retry.
+pub fn probeWritable(io: std.Io, acme: config.Acme) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const dir = try caDir(fba.allocator(), acme);
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .fromMode(0o700));
+    const probe = try std.fmt.allocPrint(fba.allocator(), "{s}/.probe", .{dir});
+    // Never materialized: deinit removes the temporary file.
+    var af = try std.Io.Dir.cwd().createFileAtomic(io, probe, .{ .permissions = .fromMode(0o600), .replace = true });
+    defer af.deinit(io);
+    try af.file.writeStreamingAll(io, "probe");
+}
+
 /// The account key under `storage`, created on first use.
 pub fn loadOrCreateAccountKey(gpa: std.mem.Allocator, io: std.Io, acme: config.Acme) !x509.KeyPair {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);

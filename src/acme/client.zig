@@ -54,7 +54,11 @@ pub const Response = struct {
     status: std.http.Status,
     body: []u8,
     location: ?[]u8,
+    retry_after_s: ?u32,
 };
+
+/// Longest a CA's Retry-After is followed while polling.
+const max_poll_pause_s = 60;
 
 pub const Client = struct {
     /// Everything that outlives one request (directory, account URL, nonce).
@@ -69,6 +73,9 @@ pub const Client = struct {
     nonce: ?[]u8 = null,
     /// Upper bound on status polling, in seconds.
     poll_limit_s: u32 = 120,
+    /// Set when the CA refused with a rate limit or Retry-After: how long
+    /// to leave it alone, in seconds.
+    retry_after_s: ?u32 = null,
 
     /// `ca_file` replaces the system roots for the directory's HTTPS.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, directory_url: []const u8, ca_file: ?[]const u8, account_key: x509.KeyPair) !Client {
@@ -146,6 +153,7 @@ pub const Client = struct {
         // Header strings die once the body reader starts.
         var location: ?[]u8 = null;
         errdefer if (location) |l| self.gpa.free(l);
+        var retry_after: ?u32 = null;
         var it = response.head.iterateHeaders();
         while (it.next()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "replay-nonce")) {
@@ -154,6 +162,9 @@ pub const Client = struct {
                 self.nonce = fresh;
             } else if (std.ascii.eqlIgnoreCase(h.name, "location")) {
                 if (location == null) location = try self.gpa.dupe(u8, h.value);
+            } else if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
+                // Delay-seconds only; an HTTP-date falls back to our own backoff.
+                retry_after = std.fmt.parseInt(u32, std.mem.trim(u8, h.value, " \t"), 10) catch null;
             }
         }
         const status = response.head.status;
@@ -162,7 +173,7 @@ pub const Client = struct {
             error.ReadFailed => return response.bodyErr().?,
             else => |e| return e,
         };
-        return .{ .status = status, .body = resp_body, .location = location };
+        return .{ .status = status, .body = resp_body, .location = location, .retry_after_s = retry_after };
     }
 
     fn takeNonce(self: *Client) ![]u8 {
@@ -197,6 +208,10 @@ pub const Client = struct {
             const ptype = if (problem) |p| p.value.type else "";
             if (std.mem.eql(u8, ptype, "urn:ietf:params:acme:error:badNonce") and attempts < 5) continue;
             log.err("{s}: HTTP {d} {s} {s}", .{ url, code, ptype, if (problem) |p| p.value.detail else resp.body });
+            if (std.mem.eql(u8, ptype, "urn:ietf:params:acme:error:rateLimited") or resp.retry_after_s != null) {
+                self.retry_after_s = resp.retry_after_s orelse 3600;
+                return error.AcmeRateLimited;
+            }
             return error.AcmeRequestFailed;
         }
     }
@@ -218,8 +233,10 @@ pub const Client = struct {
 
     /// Run one order for `names` to completion and return the PEM chain.
     /// HTTP-01 responses are published through `sink` while they're needed.
-    /// Needs `register` first.
-    pub fn issue(self: *Client, names: []const []const u8, cert_key: x509.KeyPair, sink: ChallengeSink) ![]u8 {
+    /// Once the order is finalized its URL is put in `finalized` (allocated
+    /// with the client's allocator): if anything fails after that, `resume`
+    /// picks the certificate up without ordering again. Needs `register` first.
+    pub fn issue(self: *Client, names: []const []const u8, cert_key: x509.KeyPair, sink: ChallengeSink, finalized: *?[]u8) ![]u8 {
         if (self.kid == null) return error.AcmeNotRegistered;
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
@@ -249,9 +266,22 @@ pub const Client = struct {
             const fin_payload = try std.fmt.allocPrint(a, "{{\"csr\":\"{s}\"}}", .{csr_b64});
             const fin = try self.post(order.finalize, fin_payload, null);
             defer self.freeResponse(fin);
-            order = try std.json.parseFromSliceLeaky(Order, a, try a.dupe(u8, fin.body), json_options);
+            finalized.* = try self.gpa.dupe(u8, order_url);
         }
-        if (!std.mem.eql(u8, order.status, "valid")) order = try self.pollOrder(a, order_url, "valid");
+        return self.download(a, order_url);
+    }
+
+    /// The certificate of an order already finalized, waiting for it if the
+    /// CA is still processing.
+    pub fn resumeOrder(self: *Client, order_url: []const u8) ![]u8 {
+        if (self.kid == null) return error.AcmeNotRegistered;
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        return self.download(arena_state.allocator(), order_url);
+    }
+
+    fn download(self: *Client, a: std.mem.Allocator, order_url: []const u8) ![]u8 {
+        const order = try self.pollOrder(a, order_url, "valid");
         const cert_url = order.certificate orelse return error.AcmeNoCertificateUrl;
         const cert = try self.post(cert_url, "", "application/pem-certificate-chain");
         defer if (cert.location) |l| self.gpa.free(l);
@@ -259,7 +289,7 @@ pub const Client = struct {
     }
 
     fn authorize(self: *Client, a: std.mem.Allocator, authz_url: []const u8, sink: ChallengeSink) !void {
-        var authz = try self.getJson(Authorization, a, authz_url);
+        var authz = (try self.getJson(Authorization, a, authz_url)).value;
         if (std.mem.eql(u8, authz.status, "valid")) return;
         if (!std.mem.eql(u8, authz.status, "pending")) {
             log.err("authorization for {s} is {s}", .{ authz.identifier.value, authz.status });
@@ -281,7 +311,8 @@ pub const Client = struct {
 
         const deadline = self.nowSeconds() + self.poll_limit_s;
         while (true) {
-            authz = try self.getJson(Authorization, a, authz_url);
+            const polled = try self.getJson(Authorization, a, authz_url);
+            authz = polled.value;
             if (std.mem.eql(u8, authz.status, "valid")) return;
             if (!std.mem.eql(u8, authz.status, "pending")) {
                 for (authz.challenges) |c| if (c.@"error") |p| {
@@ -290,36 +321,39 @@ pub const Client = struct {
                 return error.AcmeAuthorizationFailed;
             }
             if (self.nowSeconds() > deadline) return error.AcmeTimeout;
-            self.pause(1);
+            try self.pause(polled.retry_after_s);
         }
     }
 
     fn pollOrder(self: *Client, a: std.mem.Allocator, url: []const u8, want: []const u8) !Order {
         const deadline = self.nowSeconds() + self.poll_limit_s;
         while (true) {
-            const order = try self.getJson(Order, a, url);
+            const polled = try self.getJson(Order, a, url);
+            const order = polled.value;
             if (std.mem.eql(u8, order.status, want) or std.mem.eql(u8, order.status, "valid")) return order;
             if (std.mem.eql(u8, order.status, "invalid")) {
                 if (order.@"error") |p| log.err("order failed: {s} {s}", .{ p.type, p.detail });
                 return error.AcmeOrderFailed;
             }
             if (self.nowSeconds() > deadline) return error.AcmeTimeout;
-            self.pause(1);
+            try self.pause(polled.retry_after_s);
         }
     }
 
     /// POST-as-GET and parse; strings are copied into `a`.
-    fn getJson(self: *Client, comptime T: type, a: std.mem.Allocator, url: []const u8) !T {
+    fn getJson(self: *Client, comptime T: type, a: std.mem.Allocator, url: []const u8) !struct { value: T, retry_after_s: ?u32 } {
         const resp = try self.post(url, "", null);
         defer self.freeResponse(resp);
-        return std.json.parseFromSliceLeaky(T, a, resp.body, json_options);
+        return .{ .value = try std.json.parseFromSliceLeaky(T, a, resp.body, json_options), .retry_after_s = resp.retry_after_s };
     }
 
     fn nowSeconds(self: *Client) i64 {
         return std.Io.Clock.awake.now(self.io).toSeconds();
     }
 
-    fn pause(self: *Client, seconds: i64) void {
-        self.io.sleep(.fromSeconds(seconds), .awake) catch {};
+    /// Wait before polling again: the CA's Retry-After, else a second.
+    fn pause(self: *Client, retry_after_s: ?u32) std.Io.Cancelable!void {
+        const s: i64 = @min(retry_after_s orelse 1, max_poll_pause_s);
+        try self.io.sleep(.fromSeconds(@max(s, 1)), .awake);
     }
 };
