@@ -211,4 +211,5 @@ test {
     _ = @import("udp_proxy.zig");
     _ = @import("h3/server.zig");
     _ = @import("gzip.zig");
+    _ = @import("acme.zig");
 }
