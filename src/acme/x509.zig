@@ -1,7 +1,7 @@
 //! P-256 keys, PKCS#10 certificate requests and self-signed certificates.
 const std = @import("std");
 const quic = @import("quic");
-const der = @import("der.zig");
+pub const der = @import("der.zig");
 const Tag = der.Tag;
 const Oid = der.Oid;
 

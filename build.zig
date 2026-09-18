@@ -34,6 +34,21 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("wt-test-client", "Build the WebTransport e2e client").dependOn(&b.addInstallArtifact(wt_client, .{}).step);
 
+    // Certificates and CSRs for tests/acme/run.sh.
+    const test_cert = b.addExecutable(.{ .name = "acme-test-tool", .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/acme/tool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "x509", .module = b.createModule(.{
+            .root_source_file = b.path("src/acme/x509.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "quic", .module = quic_mod }},
+        }) }},
+    }) });
+    b.step("acme-test-tool", "Build the ACME test helper").dependOn(&b.addInstallArtifact(test_cert, .{}).step);
+
     const fuzz_options = b.addOptions();
     fuzz_options.addOption(u64, "iterations", b.option(u64, "fuzz-iterations", "Mutations per fuzz target (default 20000)") orelse 20_000);
     const fuzz = b.addTest(.{ .root_module = b.createModule(.{
