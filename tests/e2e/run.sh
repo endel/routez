@@ -137,8 +137,13 @@ kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null; sleep 0.2  # take down 19002
 check failover "$(for i in 1 2 3 4 5 6; do $CURL -o /dev/null -w '%{http_code}' "$B/api/f"; done)" "200200200200200200"
 
 if grep -qiE "panic|segmentation" "$WORK/server.log"; then fail=$((fail+1)); echo "FAIL server crashed:"; cat "$WORK/server.log"; fi
-kill -TERM $SERVER; sleep 1.5
-if kill -0 $SERVER 2>/dev/null; then fail=$((fail+1)); echo "FAIL graceful stop"; else pass=$((pass+1)); fi
+# A connection that never sends a request mustn't hold the stop for the
+# whole drain window.
+python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 18080)); time.sleep(30)" & SILENT=$!; PIDS+=($SILENT)
+perl -e 'select(undef,undef,undef,0.3)'
+kill -TERM $SERVER
+for _ in $(seq 1 30); do kill -0 $SERVER 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+if kill -0 $SERVER 2>/dev/null; then fail=$((fail+1)); echo "FAIL graceful stop within 3 s"; else pass=$((pass+1)); fi
 echo "passed=$pass failed=$fail"
 if [ $fail -ne 0 ]; then echo "--- routez log (tail)"; tail -50 "$WORK/server.log"; fi
 [ $fail -eq 0 ]
