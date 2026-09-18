@@ -23,10 +23,97 @@ const usage =
     \\
 ;
 
-var workers: []*Worker = &.{};
+/// Written by the signal handler, read by `main`: the one thing a handler
+/// can safely do.
+var signal_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
-fn onSignal(_: std.posix.SIG) callconv(.c) void {
-    for (workers) |w| w.requestStop();
+fn onSignal(sig: std.posix.SIG) callconv(.c) void {
+    const b: u8 = if (sig == .HUP) 'r' else 's';
+    _ = std.c.write(signal_pipe[1], @ptrCast(&b), 1);
+}
+
+/// One loaded config and the workers running it. A reload starts a new
+/// generation beside the old one (listeners use SO_REUSEPORT), then drains
+/// the old one.
+const Generation = struct {
+    arena_state: std.heap.ArenaAllocator,
+    cfg: config.Config,
+    shared: Worker.Shared,
+    workers: []*Worker,
+    threads: []std.Thread,
+
+    fn start(io: std.Io, path: []const u8, first_id: usize) !*Generation {
+        const alloc = std.heap.smp_allocator;
+        const g = try alloc.create(Generation);
+        g.* = .{ .arena_state = .init(alloc), .cfg = undefined, .shared = undefined, .workers = &.{}, .threads = &.{} };
+        errdefer {
+            g.arena_state.deinit();
+            alloc.destroy(g);
+        }
+        const arena = g.arena_state.allocator();
+        g.cfg = config.load(io, arena, path) catch |err| {
+            log.err("{s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        g.shared = try loadShared(arena, &g.cfg);
+
+        const workers = try arena.alloc(*Worker, g.cfg.workers);
+        var created: usize = 0;
+        errdefer for (workers[0..created]) |w| w.destroy();
+        for (workers, 0..) |*w, i| {
+            w.* = Worker.create(alloc, io, &g.cfg, &g.shared, first_id + i) catch |err| {
+                log.err("worker {d}: {s}", .{ i, @errorName(err) });
+                return err;
+            };
+            created += 1;
+        }
+        g.workers = workers;
+        g.threads = try arena.alloc(std.Thread, workers.len);
+        for (g.threads, workers) |*t, w| t.* = try std.Thread.spawn(.{}, runWorker, .{w});
+        return g;
+    }
+
+    fn stop(self: *Generation) void {
+        for (self.workers) |w| w.requestStop();
+    }
+
+    /// Wait for the workers to drain, then free the generation. Workers'
+    /// own memory is left alone: a connection that outlived the drain window
+    /// may still point into it.
+    fn join(self: *Generation) void {
+        for (self.threads) |t| t.join();
+        self.arena_state.deinit();
+        std.heap.smp_allocator.destroy(self);
+    }
+};
+
+/// TLS material per listener, loaded once and shared read-only by the
+/// workers. One ticket key per generation lets any worker resume a session.
+fn loadShared(arena: std.mem.Allocator, cfg: *const config.Config) !Worker.Shared {
+    var ticket_key: [16]u8 = undefined;
+    quic.sys.randomBytes(&ticket_key);
+    var tls_listeners: std.ArrayListUnmanaged(Worker.Shared.TlsListener) = .empty;
+    for (cfg.servers) |srv| {
+        for (srv.listen) |l| {
+            if (!l.tls and !l.quic) continue;
+            if (sharedHas(tls_listeners.items, l.address, l.port)) continue;
+            var on_listener: std.ArrayListUnmanaged(*const config.Server) = .empty;
+            for (cfg.servers) |*other| {
+                for (other.listen) |ol| {
+                    if ((ol.tls or ol.quic) and ol.port == l.port and std.mem.eql(u8, ol.address, l.address)) {
+                        try on_listener.append(arena, other);
+                        break;
+                    }
+                }
+            }
+            const tc = tls.ServerConfig.load(arena, on_listener.items, ticket_key, &.{"http/1.1"}) catch |err| {
+                log.err("tls for {s}:{d}: {s}", .{ l.address, l.port, @errorName(err) });
+                return err;
+            };
+            try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
+        }
+    }
+    return .{ .tls_listeners = tls_listeners.items };
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -46,68 +133,59 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    const cfg = config.load(init.io, arena, path) catch |err| {
-        log.err("{s}: {s}", .{ path, @errorName(err) });
-        return 1;
-    };
     if (check_only) {
+        var check_arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
+        defer check_arena.deinit();
+        const cfg = config.load(init.io, check_arena.allocator(), path) catch |err| {
+            log.err("{s}: {s}", .{ path, @errorName(err) });
+            return 1;
+        };
+        _ = loadShared(check_arena.allocator(), &cfg) catch return 1;
         log.info("{s}: configuration ok", .{path});
         return 0;
     }
 
-    // TLS material per listener, loaded once and shared read-only by all
-    // workers. One ticket key for the process lets any worker resume a session.
-    var ticket_key: [16]u8 = undefined;
-    quic.sys.randomBytes(&ticket_key);
-    var tls_listeners: std.ArrayListUnmanaged(Worker.Shared.TlsListener) = .empty;
-    for (cfg.servers) |srv| {
-        for (srv.listen) |l| {
-            if (!l.tls and !l.quic) continue;
-            if (sharedHas(tls_listeners.items, l.address, l.port)) continue;
-            var on_listener: std.ArrayListUnmanaged(*const config.Server) = .empty;
-            for (cfg.servers) |*other| {
-                for (other.listen) |ol| {
-                    if ((ol.tls or ol.quic) and ol.port == l.port and std.mem.eql(u8, ol.address, l.address)) {
-                        try on_listener.append(arena, other);
-                        break;
-                    }
-                }
-            }
-            const tc = tls.ServerConfig.load(arena, on_listener.items, ticket_key, &.{"http/1.1"}) catch |err| {
-                log.err("tls for {s}:{d}: {s}", .{ l.address, l.port, @errorName(err) });
-                return 1;
-            };
-            try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
-        }
-    }
-    const shared: Worker.Shared = .{ .tls_listeners = tls_listeners.items };
-
-    // Workers outlive main's scopes and are torn down with the process.
-    const alloc = std.heap.smp_allocator;
-    const list = try arena.alloc(*Worker, cfg.workers);
-    for (list, 0..) |*w, i| {
-        w.* = Worker.create(alloc, init.io, &cfg, &shared, i) catch |err| {
-            log.err("worker {d}: {s}", .{ i, @errorName(err) });
-            return 1;
-        };
-    }
-    workers = list;
-
+    if (std.c.pipe(&signal_pipe) != 0) return error.PipeFailed;
     const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(.PIPE, &ignore, null);
-    const stop: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(.INT, &stop, null);
-    std.posix.sigaction(.TERM, &stop, null);
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.HUP, &act, null);
 
-    const threads = try arena.alloc(std.Thread, list.len - 1);
-    for (threads, list[1..]) |*t, w| {
-        t.* = try std.Thread.spawn(.{}, runWorker, .{w});
+    var next_id: usize = 0;
+    var gen = Generation.start(init.io, path, next_id) catch return 1;
+    next_id += gen.workers.len;
+    log.info("{d} worker(s) running, config {s}", .{ gen.workers.len, path });
+
+    while (true) {
+        var b: u8 = 0;
+        const n = std.c.read(signal_pipe[0], @ptrCast(&b), 1);
+        if (n != 1) continue; // EINTR
+        if (b == 'r') {
+            log.info("reloading {s}", .{path});
+            const fresh = Generation.start(init.io, path, next_id) catch {
+                log.err("reload failed; keeping the running configuration", .{});
+                continue;
+            };
+            next_id += fresh.workers.len;
+            const old = gen;
+            gen = fresh;
+            old.stop();
+            // Joined on its own thread so a second signal isn't held up.
+            const t = std.Thread.spawn(.{}, Generation.join, .{old}) catch {
+                old.join();
+                continue;
+            };
+            t.detach();
+            log.info("reloaded: {d} worker(s)", .{gen.workers.len});
+            continue;
+        }
+        gen.stop();
+        gen.join();
+        log.info("stopped", .{});
+        return 0;
     }
-    log.info("{d} worker(s) running, config {s}", .{ list.len, path });
-    runWorker(list[0]);
-    for (threads) |t| t.join();
-    log.info("stopped", .{});
-    return 0;
 }
 
 fn sharedHas(list: []const Worker.Shared.TlsListener, address: []const u8, port: u16) bool {

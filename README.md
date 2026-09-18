@@ -23,6 +23,12 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Worker threads with SO_REUSEPORT. Graceful shutdown on SIGINT/SIGTERM:
   keep-alive connections close when idle, HTTP/3 connections get GOAWAY and
   finish their requests, with a 10 s limit.
+- Reload on SIGHUP: new workers start on the new config beside the old ones,
+  which stop accepting and drain. A config that fails to load is rejected
+  and the running one kept.
+- Per location: gzip for text-like responses, `add_headers`,
+  `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
+  (per-client token bucket).
 - `stub_status`-style counters and an access log.
 
 ## Build and run
@@ -50,7 +56,11 @@ A ZON file; see `src/config.zig` for every field and default.
         .tls = .{ .cert = "fullchain.pem", .key = "privkey.pem" },
         .locations = .{
             .{ .prefix = "/", .root = "/var/www" },
-            .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true },
+            .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true,
+               .proxy_set_headers = .{.{ .name = "x-env", .value = "prod" }},
+               .limit_req = .{ .rate = 50, .burst = 100 } },
+            .{ .prefix = "/assets/", .root = "/var/www", .gzip = true,
+               .add_headers = .{.{ .name = "cache-control", .value = "max-age=3600" }} },
             .{ .prefix = "/health", .@"return" = .{ .body = "ok\n" } },
             .{ .prefix = "/status", .stub_status = true },
             .{ .prefix = "/wt/", .webtransport_pass = "10.0.0.5:4433" },
@@ -94,6 +104,11 @@ is the relay's upstream).
 ## Limitations
 
 - The WebTransport relay has no backpressure between its two sides.
+- During a reload, new QUIC connections that the kernel hands to the old
+  generation's sockets are refused until it finishes draining (up to 10 s);
+  browsers fall back to TCP meanwhile.
+- `limit_req` and per-IP limits count per worker, so the effective limit is
+  multiplied by the number of workers.
 - With several workers, a QUIC client that changes address can land on a
   worker that doesn't hold its connection and gets reset; steering by
   connection ID (QUIC-LB or eBPF) isn't wired up.

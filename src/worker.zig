@@ -59,6 +59,16 @@ pub const QuicListener = union(enum) {
             inline else => |l| l.server.isDrained(),
         };
     }
+    fn isStopped(self: QuicListener) bool {
+        return switch (self) {
+            inline else => |l| l.server.isStopped(),
+        };
+    }
+    fn deinit(self: QuicListener) void {
+        switch (self) {
+            inline else => |l| l.server.deinit(),
+        }
+    }
     fn liveConnections(self: QuicListener) usize {
         return switch (self) {
             inline else => |l| l.liveConnections(),
@@ -98,6 +108,9 @@ pub const Worker = struct {
     stop_async: xev.Async,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
+    /// Drain is over; waiting for QUIC servers to get off the loop.
+    finishing: bool = false,
+    finish_started_ms: i64 = 0,
     stop_deadline: timers.Deadline = .{ .callback = onDrainTimeout },
 
     /// Built once in main and shared read-only by all workers.
@@ -261,6 +274,7 @@ pub const Worker = struct {
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
         try self.loop.run(.until_done);
+        log.info("worker {d} stopped", .{self.id});
     }
 
     /// Ask the worker to drain and exit. Safe from any thread or a signal handler.
@@ -274,6 +288,9 @@ pub const Worker = struct {
         if (self.stopping) return .disarm;
         self.stopping = true;
         log.info("worker {d} draining {d} connection(s)", .{ self.id, self.conn_count });
+        // Stop taking new clients here, so they reach a newer generation.
+        for (self.listeners.items) |l| l.stopAccepting();
+        for (self.udp_proxies.items) |u| u.stop();
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
@@ -291,6 +308,7 @@ pub const Worker = struct {
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
         self.sweepRateBuckets();
+        if (self.finishing) return self.pollFinish();
         if (self.stopping and self.conn_count == 0 and self.quicDrained()) self.finishStop();
     }
 
@@ -306,8 +324,30 @@ pub const Worker = struct {
     }
 
     fn finishStop(self: *Worker) void {
+        if (self.finishing) return;
+        self.finishing = true;
+        self.finish_started_ms = self.timers.now_ms;
+        self.timers.clear(&self.stop_deadline);
         // Anything still open after the drain window is closed outright.
         for (self.quic_listeners.items) |q| q.stop();
+        self.pollFinish();
+    }
+
+    /// Exit the loop once the QUIC servers are off it, or after a second.
+    fn pollFinish(self: *Worker) void {
+        const all_stopped = for (self.quic_listeners.items) |q| {
+            if (!q.isStopped()) break false;
+        } else true;
+        if (!all_stopped and self.timers.now_ms - self.finish_started_ms < 1000) return;
+        if (all_stopped) {
+            // Closes their sockets; nothing of theirs is left on the loop.
+            for (self.quic_listeners.items) |q| q.deinit();
+            self.quic_listeners.clearRetainingCapacity();
+        }
+        // Client connections that outlived the drain: close their sockets
+        // so a reload doesn't leak them. Their memory goes with the process.
+        var c = self.conns_head;
+        while (c) |conn| : (c = conn.next) _ = std.c.close(conn.sock.fd());
         self.timers.stop();
         self.loop.stop();
     }
@@ -406,6 +446,9 @@ pub const Listener = struct {
     alt_svc: ?[]const u8 = null,
     alt_svc_buf: [48]u8 = undefined,
     retry: timers.Deadline = .{ .callback = onRetryAccept },
+    cancel_c: xev.Completion = .{},
+    accepting: bool = false,
+    closed: bool = false,
 
     fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig) !*Listener {
         const addr = try std.Io.net.IpAddress.parse(l.address, l.port);
@@ -437,19 +480,51 @@ pub const Listener = struct {
     }
 
     fn destroy(self: *Listener) void {
-        _ = std.c.close(self.tcp.fd);
+        if (!self.closed) _ = std.c.close(self.tcp.fd);
         self.servers.deinit(self.worker.alloc);
         self.worker.alloc.destroy(self);
     }
 
     fn start(self: *Listener) void {
+        if (self.closed) return;
+        self.accepting = true;
         self.tcp.accept(&self.worker.loop, &self.accept_c, Listener, self, onAccept);
+    }
+
+    /// Stop accepting and close the listening socket, so the kernel sends
+    /// new connections to the other listeners on this port.
+    fn stopAccepting(self: *Listener) void {
+        if (self.closed) return;
+        self.closed = true;
+        self.worker.timers.clear(&self.retry);
+        if (!self.accepting) {
+            _ = std.c.close(self.tcp.fd);
+            return;
+        }
+        self.cancel_c = .{
+            .op = .{ .cancel = .{ .c = &self.accept_c } },
+            .userdata = self,
+            .callback = onAcceptCancelled,
+        };
+        self.worker.loop.add(&self.cancel_c);
+    }
+
+    fn onAcceptCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
+        const self: *Listener = @ptrCast(@alignCast(ud.?));
+        _ = std.c.close(self.tcp.fd);
+        return .disarm;
     }
 
     fn onAccept(ud: ?*Listener, _: *xev.Loop, _: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
         const self = ud.?;
         const w = self.worker;
+        if (self.closed) {
+            self.accepting = false;
+            if (r) |tcp| _ = std.c.close(tcp.fd) else |_| {}
+            return .disarm;
+        }
         const tcp = r catch |err| {
+            self.accepting = false;
             // Usually fd exhaustion; retry shortly instead of spinning.
             log.warn("accept on :{d}: {s}", .{ self.port, @errorName(err) });
             w.timers.set(&self.retry, 100);

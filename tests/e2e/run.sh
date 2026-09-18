@@ -106,6 +106,18 @@ SUITE=features check set-header-add "$($CURL_BIN -s http://127.0.0.1:18080/api2/
 SUITE=features check set-header-remove "$($CURL_BIN -s http://127.0.0.1:18080/api2/h | json '.get("headers").get("User-Agent")')" "None"
 SUITE=features check rate-limit "$(for i in 1 2 3 4 5 6; do $CURL_BIN -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:18080/limited; done)" "200 200 200 429 429 429 "
 
+# Reload: edit the config, SIGHUP, keep serving throughout.
+(for i in $(seq 1 100); do $CURL_BIN -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/ping; done > "$WORK/reload_codes.txt") & LOOP=$!
+python3 -c "import sys; p=sys.argv[1]; s=open(p).read().replace('pong\\\\n', 'pong2\\\\n'); open(p,'w').write(s)" "$WORK/routez.zon"
+kill -HUP $SERVER
+for _ in $(seq 1 50); do [ "$($CURL_BIN -s http://127.0.0.1:18080/ping)" == pong2 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
+wait $LOOP
+# The old generation keeps its QUIC socket until it has drained; wait it out
+# so the QUIC checks below don't land on it.
+for _ in $(seq 1 100); do grep -q "worker 0 stopped" "$WORK/server.log" && break; perl -e 'select(undef,undef,undef,0.1)'; done
+SUITE=reload check reload-applied "$($CURL_BIN -s http://127.0.0.1:18080/ping)" "pong2"
+SUITE=reload check reload-no-errors "$(sort -u "$WORK/reload_codes.txt" | tr '\n' ' ')" "200 "
+
 SUITE=limits check per-ip-limit "$(python3 "$HERE/conn_limit.py" 25)" 5
 SUITE=limits check stub-status "$($CURL_BIN -s http://127.0.0.1:18080/status | grep -c '^Active connections: ')" 1
 

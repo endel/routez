@@ -75,6 +75,8 @@ pub const UdpProxy = struct {
     fd: posix.socket_t,
     file: xev.File,
     poll_c: xev.Completion = .{},
+    cancel_c: xev.Completion = .{},
+    stopped: bool = false,
     flows: std.AutoHashMapUnmanaged(AddrKey, *Flow) = .empty,
     lb: ?quic_lb.Config = null,
     /// Server ID per peer, in the group's peer order.
@@ -121,8 +123,28 @@ pub const UdpProxy = struct {
         self.file.poll(&self.worker.loop, &self.poll_c, .read, UdpProxy, self, onReadable);
     }
 
+    /// Close the listening socket and every flow.
+    pub fn stop(self: *UdpProxy) void {
+        if (self.stopped) return;
+        self.stopped = true;
+        self.closeAll();
+        self.cancel_c = .{
+            .op = .{ .cancel = .{ .c = &self.poll_c } },
+            .userdata = self,
+            .callback = onPollCancelled,
+        };
+        self.worker.loop.add(&self.cancel_c);
+    }
+
+    fn onPollCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
+        const self: *UdpProxy = @ptrCast(@alignCast(ud.?));
+        sys.close(self.fd);
+        return .disarm;
+    }
+
     fn onReadable(ud: ?*UdpProxy, _: *xev.Loop, _: *xev.Completion, _: xev.File, r: xev.PollError!xev.PollEvent) xev.CallbackAction {
         const self = ud.?;
+        if (self.stopped) return .disarm;
         _ = r catch return .rearm;
         var i: usize = 0;
         while (i < batch) : (i += 1) {
