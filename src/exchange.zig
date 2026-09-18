@@ -192,6 +192,14 @@ pub const Exchange = struct {
     /// Route and hand the request to its handler.
     pub fn start(self: *Exchange) void {
         if (self.req.path.len == 0) return self.sendError(400);
+        // HTTP-01 validation comes over plain HTTP, ahead of any location.
+        if (std.mem.eql(u8, self.req.scheme, "http")) {
+            if (self.worker.shared.challenges) |ch| {
+                if (ch.lookup(self.worker.io, self.arena(), self.req.path)) |key_auth| {
+                    return self.sendFixed(200, "application/octet-stream", key_auth);
+                }
+            }
+        }
         const loc = router.matchLocation(self.server, self.req.path) orelse return self.sendError(404);
         self.location = loc;
         if (loc.limit_req) |lim| {

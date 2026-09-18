@@ -2,6 +2,7 @@
 const std = @import("std");
 const quic = @import("quic");
 const config = @import("../config.zig");
+const acme = @import("../acme.zig");
 const tls_server = quic.tls_server;
 const tls13 = quic.tls13;
 
@@ -14,11 +15,15 @@ pub const ServerConfig = struct {
 
     /// Build from the servers sharing a listener; the first one with TLS
     /// provides the default certificate.
-    pub fn load(arena: std.mem.Allocator, servers: []const *const config.Server, ticket_key: [16]u8, alpn: []const []const u8) !*const ServerConfig {
+    pub fn load(arena: std.mem.Allocator, io: std.Io, servers: []const *const config.Server, ticket_key: [16]u8, alpn: []const []const u8) !*const ServerConfig {
         var certs: std.ArrayListUnmanaged(tls_server.CertEntry) = .empty;
         for (servers) |srv| {
             const t = srv.tls orelse continue;
-            try certs.append(arena, .{ .server_names = srv.server_names, .cert = try loadCertificate(arena, t) });
+            const cert = if (t.acme) |a|
+                try acme.servingCertificate(arena, io, a, srv.server_names)
+            else
+                try loadCertificate(arena, t.cert.?, t.key.?);
+            try certs.append(arena, .{ .server_names = srv.server_names, .cert = cert });
         }
         if (certs.items.len == 0) return error.NoCertificate;
         const self = try arena.create(ServerConfig);
@@ -31,13 +36,13 @@ pub const ServerConfig = struct {
     }
 };
 
-pub fn loadCertificate(arena: std.mem.Allocator, t: config.Tls) !tls_server.Certificate {
-    const cert_pem = quic.sys.readFileAlloc(arena, t.cert, 1024 * 1024) catch |err| {
-        std.log.err("reading {s}: {s}", .{ t.cert, @errorName(err) });
+pub fn loadCertificate(arena: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) !tls_server.Certificate {
+    const cert_pem = quic.sys.readFileAlloc(arena, cert_path, 1024 * 1024) catch |err| {
+        std.log.err("reading {s}: {s}", .{ cert_path, @errorName(err) });
         return err;
     };
-    const key_pem = quic.sys.readFileAlloc(arena, t.key, 64 * 1024) catch |err| {
-        std.log.err("reading {s}: {s}", .{ t.key, @errorName(err) });
+    const key_pem = quic.sys.readFileAlloc(arena, key_path, 64 * 1024) catch |err| {
+        std.log.err("reading {s}: {s}", .{ key_path, @errorName(err) });
         return err;
     };
     const chain = try tls13.parsePemCertChain(arena, cert_pem);
@@ -53,7 +58,7 @@ pub fn loadCertificate(arena: std.mem.Allocator, t: config.Tls) !tls_server.Cert
     if (tls13.extractEd25519PrivateKey(key_der)) |k| {
         return .{ .cert_chain_der = chain, .private_key_bytes = try arena.dupe(u8, k), .private_key_algorithm = .ed25519 };
     } else |_| {}
-    std.log.err("{s}: only EC P-256 and Ed25519 keys are supported", .{t.key});
+    std.log.err("{s}: only EC P-256 and Ed25519 keys are supported", .{key_path});
     return error.UnsupportedKey;
 }
 

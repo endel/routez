@@ -11,6 +11,7 @@ const router = @import("router.zig");
 const timers = @import("timers.zig");
 const upstream = @import("upstream.zig");
 const tls = @import("net/tls.zig");
+const acme = @import("acme.zig");
 const H1Conn = @import("http1/server_conn.zig").Conn;
 const stats = @import("stats.zig");
 const socket = @import("net/socket.zig");
@@ -116,6 +117,8 @@ pub const Worker = struct {
     /// Built once in main and shared read-only by all workers.
     pub const Shared = struct {
         tls_listeners: []const TlsListener,
+        /// Pending HTTP-01 challenges, answered on plain-HTTP listeners.
+        challenges: ?*acme.Challenges = null,
 
         pub const TlsListener = struct { address: []const u8, port: u16, cfg: *const tls.ServerConfig };
 
