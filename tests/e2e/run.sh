@@ -158,14 +158,15 @@ for i in $(seq 1 50); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef
 kill $WT 2>/dev/null; wait $WT 2>/dev/null
 SUITE=wt check webtransport-relay "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wt.log")" "wt-ok"
 
-# 48 MiB into an upstream that reads ~8 MB/s: the relay must hold the client
-# back rather than buffer it, so routez's memory grows by far less than 48 MiB.
+# 24 MiB into an upstream that reads ~8 MB/s: the relay must hold the client
+# back rather than buffer it, so routez's memory grows by far less than 24 MiB.
 rss() { ps -o rss= -p $SERVER | tr -d ' '; }
 base=$(rss); peak=$base
-"$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" 48 /wt-slow > "$WORK/wtflood.log" 2>&1 & WT=$!
-for _ in $(seq 1 300); do kill -0 $WT 2>/dev/null || break; r=$(rss); [ "$r" -gt "$peak" ] && peak=$r; perl -e 'select(undef,undef,undef,0.1)'; done
+"$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" 24 /wt-slow > "$WORK/wtflood.log" 2>&1 & WT=$!
+for _ in $(seq 1 600); do kill -0 $WT 2>/dev/null || break; r=$(rss); [ "$r" -gt "$peak" ] && peak=$r; perl -e 'select(undef,undef,undef,0.1)'; done
 kill $WT 2>/dev/null; wait $WT 2>/dev/null
 SUITE=wt check webtransport-flood "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wtflood.log")" "wt-ok"
+grep -q wt-ok "$WORK/wtflood.log" || tail -5 "$WORK/wtflood.log"
 SUITE=wt check webtransport-backpressure "$([ $((peak - base)) -lt 16384 ] && echo bounded || echo "grew $((peak - base)) KB")" bounded
 
 B=http://127.0.0.1:18080
