@@ -128,6 +128,8 @@ pub const Proxy = struct {
             if (common.connectionListHas(connection_values[0..n_conn], h.name)) continue;
             if (skipForwarded(h.name)) continue;
             if (findSet(set, h.name) != null) continue;
+            // Downstreams validate already; this write must never be what lets CRLF through.
+            if (!common.isToken(h.name) or !common.isFieldValue(h.value)) continue;
             try head.print(a, "{s}: {s}\r\n", .{ h.name, h.value });
         }
         // Configured values replace these too.

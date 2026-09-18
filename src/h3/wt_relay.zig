@@ -229,6 +229,8 @@ pub fn Relay(comptime Listener: type) type {
 
         pub fn onConnectRequest(self: *Self, l: *Listener, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
             const w = l.worker;
+            // These headers are re-sent upstream verbatim.
+            if (!@import("server.zig").validFields(headers)) return refuse(session, session_id);
             var authority: ?[]const u8 = null;
             for (headers) |h| {
                 if (std.mem.eql(u8, h.name, ":authority")) authority = h.value;

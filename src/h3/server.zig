@@ -23,6 +23,26 @@ const log = std.log.scoped(.h3);
 /// everything else, so past this something is wrong and the stream is reset.
 const max_paused_body = 1024 * 1024;
 
+/// Field names are lowercase tokens (after an optional ':' for pseudo-headers)
+/// and values are VCHAR/SP/HTAB/obs-text: no CR, LF or NUL.
+pub fn validFields(headers: []const qpack.Header) bool {
+    for (headers) |h| {
+        const name = if (h.name.len > 0 and h.name[0] == ':') h.name[1..] else h.name;
+        if (!common.isToken(name)) return false;
+        for (name) |c| if (std.ascii.isUpper(c)) return false;
+        if (!common.isFieldValue(h.value)) return false;
+    }
+    return true;
+}
+
+test "field validation" {
+    try std.testing.expect(validFields(&.{ .{ .name = ":path", .value = "/" }, .{ .name = "x-a", .value = "b c" } }));
+    try std.testing.expect(!validFields(&.{.{ .name = "x-evil", .value = "a\r\nX-Injected: 1" }}));
+    try std.testing.expect(!validFields(&.{.{ .name = "X-Upper", .value = "a" }}));
+    try std.testing.expect(!validFields(&.{.{ .name = "bad name", .value = "a" }}));
+    try std.testing.expect(!validFields(&.{.{ .name = "x", .value = "a\x00" }}));
+}
+
 pub fn Listener(comptime proto: event_loop.Protocol) type {
     return struct {
         const Self = @This();
@@ -192,6 +212,9 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             var n: usize = 0;
             var cookies: std.ArrayListUnmanaged(u8) = .empty;
             defer cookies.deinit(a);
+            // These become HTTP/1.1 upstream: a CR or LF here would inject
+            // headers or a whole request (RFC 9114 §4.2 makes them malformed).
+            if (!validFields(headers)) return reject(session, stream_id, 400);
             for (headers) |h| {
                 if (h.name.len > 0 and h.name[0] == ':') {
                     if (std.mem.eql(u8, h.name, ":method")) method = h.value;
