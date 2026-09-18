@@ -24,6 +24,8 @@ python3 "$HERE/upstream.py" 19002 & PIDS+=($!)
 python3 "$HERE/slow_upstream.py" "$WORK/www" & PIDS+=($!)
 bun "$HERE/ws_upstream.ts" & PIDS+=($!)
 QZ="$ROOT/../quic-zig"
+(cd "$ROOT" && zig build wt-slow-server) || exit 1
+"$ROOT/zig-out/bin/wt-slow-server" 4451 "$CERTS/server.crt" "$CERTS/server.key" >/dev/null 2>&1 & PIDS+=($!)
 (cd "$QZ" && exec ./zig-out/bin/wt-echo-server --cert interop/certs/server.crt --key interop/certs/server.key --port 4450 >/dev/null 2>&1) & PIDS+=($!)
 
 # Wait until a TCP port accepts connections (slow CI machines start slowly).
@@ -155,6 +157,16 @@ echo "migration: $(grep -o 'quic steered: [0-9]*' "$WORK/mig.log")"
 for i in $(seq 1 50); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
 kill $WT 2>/dev/null; wait $WT 2>/dev/null
 SUITE=wt check webtransport-relay "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wt.log")" "wt-ok"
+
+# 48 MiB into an upstream that reads ~8 MB/s: the relay must hold the client
+# back rather than buffer it, so routez's memory grows by far less than 48 MiB.
+rss() { ps -o rss= -p $SERVER | tr -d ' '; }
+base=$(rss); peak=$base
+"$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" 48 /wt-slow > "$WORK/wtflood.log" 2>&1 & WT=$!
+for _ in $(seq 1 300); do kill -0 $WT 2>/dev/null || break; r=$(rss); [ "$r" -gt "$peak" ] && peak=$r; perl -e 'select(undef,undef,undef,0.1)'; done
+kill $WT 2>/dev/null; wait $WT 2>/dev/null
+SUITE=wt check webtransport-flood "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wtflood.log")" "wt-ok"
+SUITE=wt check webtransport-backpressure "$([ $((peak - base)) -lt 16384 ] && echo bounded || echo "grew $((peak - base)) KB")" bounded
 
 B=http://127.0.0.1:18080
 CURL="$CURL_BIN -s --max-time 10"
