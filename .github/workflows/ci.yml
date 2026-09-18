@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # quic-zig is a path dependency (../quic-zig). Point this back at main once
+  # endel/quic-zig#35 is merged.
+  QUIC_ZIG_REF: routez
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: routez
+
+      - uses: actions/checkout@v4
+        with:
+          repository: endel/quic-zig
+          ref: ${{ env.QUIC_ZIG_REF }}
+          path: quic-zig
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        working-directory: routez
+        run: zig build && zig build -Doptimize=ReleaseSafe
+
+      - name: Unit tests
+        working-directory: routez
+        run: zig build test
+
+      - name: Fuzz
+        working-directory: routez
+        run: zig build fuzz -Doptimize=ReleaseSafe -Dfuzz-iterations=300000
+
+      # The end-to-end suite uses quic-zig's WebTransport echo server as an
+      # upstream, bun and node for WebSockets, and curl for everything else.
+      - name: Build quic-zig apps
+        working-directory: quic-zig
+        run: zig build
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: curl with HTTP/3 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install curl
+
+      - name: End-to-end
+        working-directory: routez
+        run: tests/e2e/run.sh

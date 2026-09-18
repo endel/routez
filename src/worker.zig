@@ -1,0 +1,450 @@
+//! A worker thread: one libxev loop running every listener, client
+//! connection and upstream connection it owns. Workers share nothing but the
+//! config; each binds its listeners with SO_REUSEPORT.
+const std = @import("std");
+const builtin = @import("builtin");
+const quic = @import("quic");
+const xev = quic.event_loop.Xev;
+const config = @import("config.zig");
+const common = @import("http/common.zig");
+const router = @import("router.zig");
+const timers = @import("timers.zig");
+const upstream = @import("upstream.zig");
+const tls = @import("net/tls.zig");
+const H1Conn = @import("http1/server_conn.zig").Conn;
+const stats = @import("stats.zig");
+const socket = @import("net/socket.zig");
+const UdpProxy = @import("udp_proxy.zig").UdpProxy;
+const h3_server = @import("h3/server.zig");
+pub const H3Listener = h3_server.Listener(.h3);
+/// A QUIC listener that also relays WebTransport sessions.
+pub const WtListener = h3_server.Listener(.webtransport);
+
+pub const QuicListener = union(enum) {
+    h3: *H3Listener,
+    wt: *WtListener,
+
+    fn address(self: QuicListener) []const u8 {
+        return switch (self) {
+            inline else => |l| l.address,
+        };
+    }
+    fn port(self: QuicListener) u16 {
+        return switch (self) {
+            inline else => |l| l.port,
+        };
+    }
+    fn addServer(self: QuicListener, srv: *const config.Server) !void {
+        switch (self) {
+            inline else => |l| try l.addServer(srv),
+        }
+    }
+    fn start(self: QuicListener) void {
+        switch (self) {
+            inline else => |l| l.start(),
+        }
+    }
+    fn stop(self: QuicListener) void {
+        switch (self) {
+            inline else => |l| l.stop(),
+        }
+    }
+    fn drain(self: QuicListener) void {
+        switch (self) {
+            inline else => |l| l.server.drain(),
+        }
+    }
+    fn isDrained(self: QuicListener) bool {
+        return switch (self) {
+            inline else => |l| l.server.isDrained(),
+        };
+    }
+    fn liveConnections(self: QuicListener) usize {
+        return switch (self) {
+            inline else => |l| l.liveConnections(),
+        };
+    }
+};
+
+const log = std.log.scoped(.worker);
+
+/// How long a stopping worker waits for in-flight requests.
+const drain_timeout_ms = 10_000;
+
+pub const Worker = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const config.Config,
+    shared: *const Shared,
+    id: usize,
+    loop: xev.Loop,
+    timers: timers.Timers,
+    date: common.DateCache = .{},
+
+    listeners: std.ArrayListUnmanaged(*Listener) = .empty,
+    udp_proxies: std.ArrayListUnmanaged(*UdpProxy) = .empty,
+    quic_listeners: std.ArrayListUnmanaged(QuicListener) = .empty,
+    groups: std.ArrayListUnmanaged(*upstream.Group) = .empty,
+    group_names: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    conns_head: ?*H1Conn = null,
+    conn_count: u32 = 0,
+    per_ip: std.AutoHashMapUnmanaged([16]u8, u32) = .empty,
+
+    stop_async: xev.Async,
+    stop_c: xev.Completion = .{},
+    stopping: bool = false,
+    stop_deadline: timers.Deadline = .{ .callback = onDrainTimeout },
+
+    /// Built once in main and shared read-only by all workers.
+    pub const Shared = struct {
+        tls_listeners: []const TlsListener,
+
+        pub const TlsListener = struct { address: []const u8, port: u16, cfg: *const tls.ServerConfig };
+
+        pub fn tlsFor(self: *const Shared, address: []const u8, port: u16) ?*const tls.ServerConfig {
+            for (self.tls_listeners) |l| {
+                if (l.port == port and std.mem.eql(u8, l.address, address)) return l.cfg;
+            }
+            return null;
+        }
+    };
+
+    pub fn create(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config, shared: *const Shared, id: usize) !*Worker {
+        const w = try alloc.create(Worker);
+        errdefer alloc.destroy(w);
+        w.* = .{
+            .alloc = alloc,
+            .io = io,
+            .cfg = cfg,
+            .shared = shared,
+            .id = id,
+            .loop = try xev.Loop.init(.{}),
+            .timers = undefined,
+            .stop_async = try xev.Async.init(),
+        };
+        w.timers = try timers.Timers.init(&w.loop);
+        w.timers.on_tick = onTick;
+        try w.setupUpstreams();
+        try w.setupListeners();
+        try w.setupQuicListeners();
+        for (cfg.udp_proxies) |*u| try w.udp_proxies.append(alloc, try UdpProxy.create(w, u));
+        return w;
+    }
+
+    pub fn destroy(self: *Worker) void {
+        for (self.groups.items) |g| g.deinit();
+        self.groups.deinit(self.alloc);
+        self.group_names.deinit(self.alloc);
+        for (self.listeners.items) |l| l.destroy();
+        self.listeners.deinit(self.alloc);
+        self.timers.deinit();
+        self.stop_async.deinit();
+        self.loop.deinit();
+        self.alloc.destroy(self);
+    }
+
+    fn setupUpstreams(self: *Worker) !void {
+        for (self.cfg.upstreams) |up| {
+            try self.addGroup(up.name, up);
+        }
+        // proxy_pass / webtransport_pass to a literal host:port gets an implicit group.
+        for (self.cfg.servers) |srv| {
+            for (srv.locations) |loc| {
+                const target = loc.proxy_pass orelse loc.webtransport_pass orelse continue;
+                try self.addImplicitGroup(target, loc.webtransport_pass != null);
+            }
+        }
+        for (self.cfg.udp_proxies) |u| try self.addImplicitGroup(u.proxy_pass, false);
+    }
+
+    fn addImplicitGroup(self: *Worker, target: []const u8, h3: bool) !void {
+        if (self.findGroup(target) != null) return;
+        const servers = try self.alloc.alloc([]const u8, 1);
+        servers[0] = target;
+        try self.addGroup(target, .{ .name = target, .servers = servers, .h3 = h3 });
+    }
+
+    fn addGroup(self: *Worker, name: []const u8, up: config.Upstream) !void {
+        const g = try upstream.Group.init(self, up);
+        try self.groups.append(self.alloc, g);
+        try self.group_names.append(self.alloc, name);
+    }
+
+    pub fn findGroup(self: *Worker, name: []const u8) ?*upstream.Group {
+        for (self.group_names.items, self.groups.items) |n, g| {
+            if (std.mem.eql(u8, n, name)) return g;
+        }
+        return null;
+    }
+
+    fn setupListeners(self: *Worker) !void {
+        // One TCP listener per address:port, shared by the servers naming it.
+        for (self.cfg.servers) |*srv| {
+            for (srv.listen) |l| {
+                if (!l.tcp) continue;
+                if (self.findListener(l.address, l.port)) |existing| {
+                    if ((existing.tls_config != null) != l.tls) {
+                        log.err("listen {s}:{d}: servers disagree on tls", .{ l.address, l.port });
+                        return error.InvalidConfig;
+                    }
+                    try existing.addServer(srv);
+                    continue;
+                }
+                const tc: ?*const tls.ServerConfig = if (l.tls) self.shared.tlsFor(l.address, l.port) orelse return error.InvalidConfig else null;
+                const lst = try Listener.create(self, l, tc);
+                try lst.addServer(srv);
+                try self.listeners.append(self.alloc, lst);
+            }
+        }
+    }
+
+    fn setupQuicListeners(self: *Worker) !void {
+        for (self.cfg.servers) |*srv| {
+            for (srv.listen) |l| {
+                if (!l.quic) continue;
+                if (self.findQuicListener(l.address, l.port)) |existing| {
+                    try existing.addServer(srv);
+                    continue;
+                }
+                const tc = self.shared.tlsFor(l.address, l.port) orelse return error.InvalidConfig;
+                const ql: QuicListener = if (self.wantsWebTransport(l.address, l.port))
+                    .{ .wt = try WtListener.create(self, l, tc) }
+                else
+                    .{ .h3 = try H3Listener.create(self, l, tc) };
+                try ql.addServer(srv);
+                try self.quic_listeners.append(self.alloc, ql);
+            }
+        }
+    }
+
+    /// Whether any server on this QUIC port relays WebTransport.
+    fn wantsWebTransport(self: *Worker, address: []const u8, port: u16) bool {
+        for (self.cfg.servers) |srv| {
+            const here = for (srv.listen) |l| {
+                if (l.quic and l.port == port and std.mem.eql(u8, l.address, address)) break true;
+            } else false;
+            if (!here) continue;
+            for (srv.locations) |loc| if (loc.webtransport_pass != null) return true;
+        }
+        return false;
+    }
+
+    fn findQuicListener(self: *Worker, address: []const u8, port: u16) ?QuicListener {
+        for (self.quic_listeners.items) |l| {
+            if (l.port() == port and std.mem.eql(u8, l.address(), address)) return l;
+        }
+        return null;
+    }
+
+    fn quicConnections(self: *Worker) usize {
+        var n: usize = 0;
+        for (self.quic_listeners.items) |l| n += l.liveConnections();
+        return n;
+    }
+
+    fn findListener(self: *Worker, address: []const u8, port: u16) ?*Listener {
+        for (self.listeners.items) |l| {
+            if (l.port == port and std.mem.eql(u8, l.address, address)) return l;
+        }
+        return null;
+    }
+
+    pub fn run(self: *Worker) !void {
+        self.timers.start();
+        self.stop_async.wait(&self.loop, &self.stop_c, Worker, self, onStopSignal);
+        for (self.listeners.items) |l| l.start();
+        for (self.udp_proxies.items) |u| u.start();
+        for (self.quic_listeners.items) |q| q.start();
+        try self.loop.run(.until_done);
+    }
+
+    /// Ask the worker to drain and exit. Safe from any thread or a signal handler.
+    pub fn requestStop(self: *Worker) void {
+        self.stop_async.notify() catch {};
+    }
+
+    fn onStopSignal(ud: ?*Worker, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        _ = r catch {};
+        const self = ud.?;
+        if (self.stopping) return .disarm;
+        self.stopping = true;
+        log.info("worker {d} draining {d} connection(s)", .{ self.id, self.conn_count });
+        var c = self.conns_head;
+        while (c) |conn| {
+            c = conn.next;
+            conn.closeIfIdle();
+        }
+        for (self.groups.items) |g| {
+            for (g.peers) |*p| p.closeIdle();
+        }
+        // GOAWAY: in-flight HTTP/3 requests finish, new ones go elsewhere.
+        for (self.quic_listeners.items) |q| q.drain();
+        self.timers.set(&self.stop_deadline, drain_timeout_ms);
+        return .disarm;
+    }
+
+    fn onTick(t: *timers.Timers) void {
+        const self: *Worker = @fieldParentPtr("timers", t);
+        if (self.stopping and self.conn_count == 0 and self.quicDrained()) self.finishStop();
+    }
+
+    fn onDrainTimeout(d: *timers.Deadline) void {
+        const self: *Worker = @fieldParentPtr("stop_deadline", d);
+        log.warn("worker {d}: {d} connection(s) still open at shutdown", .{ self.id, self.conn_count });
+        self.finishStop();
+    }
+
+    fn quicDrained(self: *Worker) bool {
+        for (self.quic_listeners.items) |q| if (!q.isDrained()) return false;
+        return true;
+    }
+
+    fn finishStop(self: *Worker) void {
+        // Anything still open after the drain window is closed outright.
+        for (self.quic_listeners.items) |q| q.stop();
+        self.timers.stop();
+        self.loop.stop();
+    }
+
+    pub fn addConn(self: *Worker, c: *H1Conn) void {
+        c.prev = null;
+        c.next = self.conns_head;
+        if (self.conns_head) |h| h.prev = c;
+        self.conns_head = c;
+        self.conn_count += 1;
+        stats.inc(&stats.active_tcp);
+    }
+
+    pub fn removeConn(self: *Worker, c: *H1Conn) void {
+        if (c.prev) |p| p.next = c.next else self.conns_head = c.next;
+        if (c.next) |n| n.prev = c.prev;
+        self.conn_count -= 1;
+        stats.dec(&stats.active_tcp);
+        if (c.ip_key) |k| self.releaseIp(k);
+    }
+
+    /// Count a connection against its client address; false when over the limit.
+    fn acquireIp(self: *Worker, key: [16]u8) bool {
+        const limit = self.cfg.limits.max_connections_per_ip;
+        const gop = self.per_ip.getOrPut(self.alloc, key) catch return true;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        if (gop.value_ptr.* >= limit) return false;
+        gop.value_ptr.* += 1;
+        return true;
+    }
+
+    fn releaseIp(self: *Worker, key: [16]u8) void {
+        const v = self.per_ip.getPtr(key) orelse return;
+        v.* -= 1;
+        if (v.* == 0) _ = self.per_ip.remove(key);
+    }
+
+    /// Live QUIC connections on this worker.
+    pub fn quicConnectionCount(self: *Worker) usize {
+        return self.quicConnections();
+    }
+
+    pub fn dateHeader(self: *Worker) []const u8 {
+        return self.date.get(quic.sys.realtimeSeconds());
+    }
+
+    pub fn accessLog(self: *Worker, line: []const u8) void {
+        _ = self;
+        // One write(2) per line keeps lines from different workers whole.
+        _ = std.c.write(2, line.ptr, line.len);
+    }
+};
+
+pub const Listener = struct {
+    worker: *Worker,
+    address: []const u8,
+    port: u16,
+    tcp: xev.TCP,
+    accept_c: xev.Completion = .{},
+    servers: std.ArrayListUnmanaged(*const config.Server) = .empty,
+    vhosts: router.VirtualHosts = .{ .servers = &.{} },
+    tls_config: ?*const tls.ServerConfig,
+    alt_svc: ?[]const u8 = null,
+    alt_svc_buf: [48]u8 = undefined,
+    retry: timers.Deadline = .{ .callback = onRetryAccept },
+
+    fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig) !*Listener {
+        const addr = try std.Io.net.IpAddress.parse(l.address, l.port);
+        const tcp = try xev.TCP.init(addr);
+        errdefer _ = std.c.close(tcp.fd);
+        const one: c_int = 1;
+        // Every worker binds the same port; the kernel spreads connections.
+        _ = std.c.setsockopt(tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(c_int));
+        try tcp.bind(addr);
+        try tcp.listen(1024);
+
+        const self = try w.alloc.create(Listener);
+        self.* = .{ .worker = w, .address = l.address, .port = l.port, .tcp = tcp, .tls_config = tc };
+        if (l.quic) {
+            self.alt_svc = std.fmt.bufPrint(&self.alt_svc_buf, "h3=\":{d}\"; ma=86400", .{l.port}) catch null;
+        }
+        if (w.id == 0) log.info("listening on {s}:{d}{s}", .{ l.address, l.port, if (tc != null) " (tls)" else "" });
+        return self;
+    }
+
+    fn addServer(self: *Listener, srv: *const config.Server) !void {
+        try self.servers.append(self.worker.alloc, srv);
+        self.vhosts = .{ .servers = self.servers.items };
+        for (srv.listen) |l| {
+            if (l.port == self.port and l.quic and self.alt_svc == null) {
+                self.alt_svc = std.fmt.bufPrint(&self.alt_svc_buf, "h3=\":{d}\"; ma=86400", .{l.port}) catch null;
+            }
+        }
+    }
+
+    fn destroy(self: *Listener) void {
+        _ = std.c.close(self.tcp.fd);
+        self.servers.deinit(self.worker.alloc);
+        self.worker.alloc.destroy(self);
+    }
+
+    fn start(self: *Listener) void {
+        self.tcp.accept(&self.worker.loop, &self.accept_c, Listener, self, onAccept);
+    }
+
+    fn onAccept(ud: ?*Listener, _: *xev.Loop, _: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
+        const self = ud.?;
+        const w = self.worker;
+        const tcp = r catch |err| {
+            // Usually fd exhaustion; retry shortly instead of spinning.
+            log.warn("accept on :{d}: {s}", .{ self.port, @errorName(err) });
+            w.timers.set(&self.retry, 100);
+            return .disarm;
+        };
+        if (w.stopping or w.conn_count >= w.cfg.limits.max_connections) {
+            _ = std.c.close(tcp.fd);
+            return .rearm;
+        }
+        stats.inc(&stats.accepted);
+        var ip_key: ?[16]u8 = null;
+        if (w.cfg.limits.max_connections_per_ip != 0) {
+            if (socket.peerIpKey(tcp.fd)) |k| {
+                if (!w.acquireIp(k)) {
+                    stats.inc(&stats.refused_per_ip);
+                    _ = std.c.close(tcp.fd);
+                    return .rearm;
+                }
+                ip_key = k;
+            }
+        }
+        const conn = H1Conn.create(w, self, tcp) catch |err| {
+            log.warn("connection setup: {s}", .{@errorName(err)});
+            if (ip_key) |k| w.releaseIp(k);
+            _ = std.c.close(tcp.fd);
+            return .rearm;
+        };
+        conn.ip_key = ip_key;
+        return .rearm;
+    }
+
+    fn onRetryAccept(d: *timers.Deadline) void {
+        const self: *Listener = @fieldParentPtr("retry", d);
+        self.start();
+    }
+};

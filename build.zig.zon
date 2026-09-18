@@ -1,0 +1,10 @@
+.{
+    .name = .routez,
+    .version = "0.1.0",
+    .fingerprint = 0x4b097a175cbe92bd,
+    .dependencies = .{
+        .quic = .{ .path = "../quic-zig" },
+    },
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,28 @@
+.{
+    .access_log = false,
+    .limits = .{ .max_connections_per_ip = 20 },
+    .servers = .{.{
+        .listen = .{
+            .{ .address = "127.0.0.1", .port = 18080 },
+            .{ .address = "127.0.0.1", .port = 18443, .tls = true, .quic = true },
+        },
+        .tls = .{ .cert = "CERTS/server.crt", .key = "CERTS/server.key" },
+        .locations = .{
+            .{ .prefix = "/", .root = "WWW" },
+            .{ .prefix = "/ping", .@"return" = .{ .body = "pong\n" } },
+            .{ .prefix = "/status", .stub_status = true },
+            .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true },
+            .{ .prefix = "/ws/", .proxy_pass = "127.0.0.1:19003" },
+            .{ .prefix = "/slow/", .proxy_pass = "slow", .strip_prefix = true },
+            .{ .prefix = "/.well-known/webtransport", .webtransport_pass = "127.0.0.1:4450" },
+        },
+    }},
+    .upstreams = .{
+        .{
+            .name = "backend",
+            .servers = .{ "127.0.0.1:19001", "127.0.0.1:19002" },
+            .health = .{ .path = "/healthz", .interval_ms = 500, .fall = 2, .rise = 2 },
+        },
+        .{ .name = "slow", .servers = .{"127.0.0.1:19004"}, .read_timeout_ms = 1000 },
+    },
+}
