@@ -205,7 +205,8 @@ pub fn parseRange(value: []const u8, size: u64) RangeResult {
     if (last.len > 0) {
         const l = std.fmt.parseInt(u64, last, 10) catch return .ignore;
         if (l < s) return .ignore;
-        e = @min(l + 1, size);
+        // Clamp before +1: the last byte position can be up to 2^64-1.
+        e = @min(l, size - 1) + 1;
     }
     return .{ .range = .{ .start = s, .end = e } };
 }
@@ -253,4 +254,6 @@ test "range parsing" {
     try t.expectEqual(RangeResult.unsatisfiable, parseRange("bytes=100-", 100));
     try t.expectEqual(RangeResult.ignore, parseRange("bytes=0-1,5-6", 100));
     try t.expectEqual(RangeResult.ignore, parseRange("items=0-1", 100));
+    try t.expectEqual(RangeResult{ .range = .{ .start = 5, .end = 100 } }, parseRange("bytes=5-18446744073709551615", 100));
+    try t.expectEqual(RangeResult{ .range = .{ .start = 0, .end = 100 } }, parseRange("bytes=-18446744073709551615", 100));
 }
