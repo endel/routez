@@ -21,6 +21,8 @@
             .{ .prefix = "/old/", .@"return" = .{ .status = 301, .location = "https://$host$request_uri" }, .add_headers = .{
                 .{ .name = "x-vars", .value = "$scheme $uri $is_args$args $remote_addr" },
             } },
+            .{ .prefix = "/spa/", .root = "WWW/..", .try_files = .{ "$uri", "$uri/", "/spa/index.html" } },
+            .{ .prefix = "/sub/", .root = "WWW", .try_files = .{ "$uri", "=404" } },
             .{ .prefix = "/limited", .@"return" = .{ .body = "ok\n" }, .limit_req = .{ .rate = 1, .burst = 2 } },
             .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true },
             .{ .prefix = "/ws/", .proxy_pass = "127.0.0.1:19003" },

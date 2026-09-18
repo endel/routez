@@ -112,6 +112,12 @@ pub const Location = struct {
     root: ?[]const u8 = null,
     /// File served for a request that names a directory.
     index: []const u8 = "index.html",
+    /// Paths tried in order under `root`, nginx-style; the first regular
+    /// file found is served. `$uri` stands for the request path, and an
+    /// entry ending in `/` tries that directory's `index`. The last entry
+    /// is the fallback: a file served whatever the path, or `=404` (any
+    /// status). `.{ "$uri", "$uri/", "/index.html" }` serves a single-page app.
+    try_files: []const []const u8 = &.{},
 
     /// Name of an upstream, or a literal `host:port`.
     proxy_pass: ?[]const u8 = null,
@@ -305,6 +311,7 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (loc.proxy_pass) |p| try checkTarget(cfg, p);
             for (loc.proxy_set_headers) |h| try checkHeader(h);
             for (loc.add_headers) |h| try checkHeader(h);
+            if (loc.try_files.len > 0) try checkTryFiles(loc);
             if (loc.@"return") |r| {
                 if (r.status < 100 or r.status > 599) return fail("location '{s}': return status {d} is out of range", .{ loc.prefix, r.status });
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
@@ -313,6 +320,28 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkTryFiles(loc: Location) error{InvalidConfig}!void {
+    if (loc.root == null) return fail("location '{s}': try_files needs root", .{loc.prefix});
+    for (loc.try_files, 0..) |entry, i| {
+        if (tryFilesStatus(entry)) |status| {
+            if (i != loc.try_files.len - 1) return fail("location '{s}': try_files '{s}' must come last", .{ loc.prefix, entry });
+            if (status < 100 or status > 599) return fail("location '{s}': try_files '{s}' is not a status", .{ loc.prefix, entry });
+            continue;
+        }
+        const rest = if (std.mem.startsWith(u8, entry, "$uri")) entry["$uri".len..] else if (std.mem.startsWith(u8, entry, "/")) entry else return fail("location '{s}': try_files '{s}' must start with '/' or $uri", .{ loc.prefix, entry });
+        // Appended to an already-normalized path, so these are all it takes
+        // to keep the result under root.
+        if (std.mem.indexOf(u8, rest, "..") != null or std.mem.indexOfAny(u8, rest, "$\x00") != null)
+            return fail("location '{s}': try_files '{s}' may only use $uri, at the start, and no '..'", .{ loc.prefix, entry });
+    }
+}
+
+/// The status of a `=404`-style try_files entry.
+pub fn tryFilesStatus(entry: []const u8) ?u16 {
+    if (entry.len < 2 or entry[0] != '=') return null;
+    return std.fmt.parseInt(u16, entry[1..], 10) catch null;
 }
 
 fn checkTls(cfg: *const Config, srv: *const Server, t: Tls) error{InvalidConfig}!void {
@@ -536,6 +565,35 @@ test "variables in return and headers" {
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1", .proxy_set_headers = .{.{ .name = "x", .value = "$nope" }} }} }} }
         ,
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .@"return" = .{ .status = 3010 } }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "try_files" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    _ = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/", .root = "x", .try_files = .{ "$uri", "$uri/", "$uri.html", "/index.html" } },
+        \\    .{ .prefix = "/a/", .root = "x", .try_files = .{ "$uri", "=404" } },
+        \\} }} }
+    , "test");
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1", .try_files = .{"$uri"} }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "=404", "$uri" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "$uri", "/../etc/passwd" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "$uri..", "/i.html" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "index.html" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "/$host/x" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "$uri", "=40x" } }} }} }
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));

@@ -27,6 +27,7 @@ pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void 
         return ex.respondEnd();
     }
 
+    if (loc.try_files.len > 0) return tryFiles(ex, loc, root);
     const a = ex.arena();
     const dir_request = ex.req.path[ex.req.path.len - 1] == '/';
     const full = std.mem.concat(a, u8, &.{ root, ex.req.path, if (dir_request) loc.index else "" }) catch return ex.sendError(500);
@@ -54,7 +55,65 @@ pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void 
             return ex.sendError(404);
         },
     }
+    serve(ex, file, st, full);
+}
 
+/// `try_files`: serve the first entry naming a regular file.
+fn tryFiles(ex: *Exchange, loc: *const config.Location, root: []const u8) void {
+    const a = ex.arena();
+    const io = ex.worker.io;
+    for (loc.try_files, 1..) |entry, n| {
+        if (config.tryFilesStatus(entry)) |status| return ex.sendError(status);
+        const last = n == loc.try_files.len;
+        const rel = tryPath(a, entry, ex.req.path, loc.index) catch return ex.sendError(500);
+        const full = std.mem.concat(a, u8, &.{ root, rel }) catch return ex.sendError(500);
+        const file = std.Io.Dir.cwd().openFile(io, full, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName, error.IsDir => {
+                if (last) return ex.sendError(404);
+                continue;
+            },
+            error.AccessDenied, error.PermissionDenied => {
+                if (last) return ex.sendError(403);
+                continue;
+            },
+            else => return ex.sendError(500),
+        };
+        const st = file.stat(io) catch {
+            file.close(io);
+            return ex.sendError(500);
+        };
+        if (st.kind != .file) {
+            file.close(io);
+            if (last) return ex.sendError(404);
+            continue;
+        }
+        return serve(ex, file, st, full);
+    }
+}
+
+/// A `try_files` entry as a path under root. Config validation keeps `..`
+/// out of the entries and the request path is normalized, so the result
+/// can't climb out of root.
+fn tryPath(a: std.mem.Allocator, entry: []const u8, path: []const u8, index: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var rest = entry;
+    if (std.mem.startsWith(u8, entry, "$uri")) {
+        try out.appendSlice(a, path);
+        rest = entry["$uri".len..];
+    }
+    for (rest) |c| {
+        if (c == '/' and out.items.len > 0 and out.items[out.items.len - 1] == '/') continue;
+        try out.append(a, c);
+    }
+    if (out.items.len == 0 or out.items[out.items.len - 1] == '/') try out.appendSlice(a, index);
+    return out.items;
+}
+
+/// Answer with an open regular file: conditional requests, ranges, body.
+fn serve(ex: *Exchange, file: std.Io.File, st: std.Io.File.Stat, full: []const u8) void {
+    const a = ex.arena();
+    const io = ex.worker.io;
+    const is_head = ex.req.isHead();
     const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
     const etag = std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime_s, st.size }) catch return closeAndFail(ex, file);
     const lm_buf = a.create([29]u8) catch return closeAndFail(ex, file);
@@ -256,4 +315,18 @@ test "range parsing" {
     try t.expectEqual(RangeResult.ignore, parseRange("items=0-1", 100));
     try t.expectEqual(RangeResult{ .range = .{ .start = 5, .end = 100 } }, parseRange("bytes=5-18446744073709551615", 100));
     try t.expectEqual(RangeResult{ .range = .{ .start = 0, .end = 100 } }, parseRange("bytes=-18446744073709551615", 100));
+}
+
+test "try_files paths" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const t = std.testing;
+    try t.expectEqualStrings("/app/x", try tryPath(a, "$uri", "/app/x", "index.html"));
+    try t.expectEqualStrings("/app/x/index.html", try tryPath(a, "$uri/", "/app/x", "index.html"));
+    try t.expectEqualStrings("/app/x/index.html", try tryPath(a, "$uri/", "/app/x/", "index.html"));
+    try t.expectEqualStrings("/index.html", try tryPath(a, "$uri/", "/", "index.html"));
+    try t.expectEqualStrings("/app/x.html", try tryPath(a, "$uri.html", "/app/x", "index.html"));
+    try t.expectEqualStrings("/index.html", try tryPath(a, "/index.html", "/deep/link", "index.html"));
+    try t.expectEqualStrings("/spa/index.html", try tryPath(a, "/spa/", "/deep/link", "index.html"));
 }

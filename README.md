@@ -15,7 +15,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Automatic certificates from Let's Encrypt or any ACME CA (RFC 8555,
   HTTP-01), renewed and swapped in without dropping connections.
 - Static files: ranges, ETag / Last-Modified conditional requests, index
-  files, directory redirects, path normalization.
+  files, directory redirects, path normalization, `try_files` fallbacks for
+  single-page apps.
 - Reverse proxy to HTTP/1.1 upstreams: streaming in both directions with
   backpressure, keep-alive connection pools, retries of replayable requests,
   connect/read timeouts, WebSocket (Upgrade) tunnels, X-Forwarded-* headers.
@@ -95,6 +96,12 @@ A ZON file; see `src/config.zig` for every field and default.
   upstream certificates are not verified unless the upstream sets
   `tls_verify` or `tls_ca`.
 - `root` follows nginx semantics: the full request path is appended.
+- `try_files = .{ "$uri", "$uri/", "/index.html" }` on a `root` location
+  serves the first entry that is a file: `$uri` is the request path, an
+  entry ending in `/` means that directory's `index`. The last entry is the
+  fallback, served for any path, or a status such as `"=404"`. Unlike
+  nginx, the fallback is a file under the same `root`, not a new request
+  routed through the locations.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
 - TLS keys must be EC P-256 or Ed25519. TLS 1.2 is not supported.
