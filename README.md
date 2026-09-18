@@ -118,25 +118,33 @@ Instead of `cert` and `key`, a server can ask an ACME CA for its certificate:
 | `ca_file` | system roots | PEM bundle to trust for the directory's HTTPS (test CAs such as Pebble) |
 | `renew_days` | 30 | renew when fewer days than this remain (or half the lifetime, if that is shorter) |
 | `check_interval_s` | 43200 | how often stored certificates are checked |
+| `order_timeout_s` | 300 | longest one attempt may take, network waits included |
 
-- The certificate covers every name in `server_names`; the first also names
-  the file. Configuring `acme` means agreeing to the CA's terms of service.
+- The certificate covers every name in `server_names`. Configuring `acme`
+  means agreeing to the CA's terms of service.
 - Validation is HTTP-01: while an order is pending, every plain-HTTP listener
   answers `/.well-known/acme-challenge/<token>` ahead of its locations. The
-  CA connects to port 80 of each name, so one must reach a plain listener.
+  CA connects to port 80 of each name, so one must reach a plain listener
+  (routez warns when none listens on 80).
 - One thread per process talks to the CA, off the worker event loops.
-- At startup a stored certificate is used as long as it hasn't expired and
-  covers the names. Otherwise the TLS listeners come up at once with a
-  self-signed placeholder (clients see a certificate error, not a refused
-  connection) while the certificate is obtained.
+- At startup the stored certificate is used as long as it hasn't expired.
+  When the names changed, the stored one covering the most of them keeps
+  serving until the new one arrives. With nothing usable stored, the TLS
+  listeners come up at once with a self-signed placeholder (clients see a
+  certificate error, not a refused connection) while one is obtained.
 - A new certificate is written to storage, then the running configuration is
   reloaded as for SIGHUP: new workers load it, old ones drain. That reload
   reuses the configuration text already running, so edits to the file
-  still wait for a SIGHUP.
-- Failures are logged and retried after 1 minute, doubling to 32 minutes.
+  still wait for a SIGHUP. A reload that fails is asked for again every 10 s.
+- Failures are logged and retried after 1 minute, doubling to 32 minutes, or
+  later if the CA says so (Retry-After, rate limits). An attempt that hits
+  `order_timeout_s` is abandoned. A certificate issued but not yet stored,
+  or an order already finalized, is picked up on the retry rather than
+  ordered again, and no order is placed while storage can't be written.
 - Storage layout, directories 0700 and files 0600, replaced atomically:
-  `<storage>/<ca-host>/account.key` and `<storage>/<ca-host>/<first-name>.pem`
-  (the chain, then its key). Keeping them per CA host means staging
+  `<storage>/<ca-host>/account.key` and `<storage>/<ca-host>/<name>.pem`
+  (the chain, then its key), where `<name>` is the alphabetically first
+  server name. Keeping them per CA host means staging
   certificates are never served once `directory` points at production.
 
 ## Tests
