@@ -4,8 +4,10 @@
 //!
 //! The downstream session is accepted only once the upstream accepted its
 //! own, so the client can't open streams before there is somewhere to put
-//! them. Both sides buffer writes internally; there is no backpressure
-//! between them yet.
+//! them. When one side's stream backs up (unsent bytes past `high_water`),
+//! reading the paired stream on the other side pauses, so the sender is held
+//! by QUIC flow control; `checkPaused` resumes it once the backlog drains.
+//! Datagrams are unreliable and simply forwarded.
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -21,6 +23,9 @@ const Worker = @import("../worker.zig").Worker;
 const log = std.log.scoped(.wt_relay);
 
 const Key = struct { conn: u64, id: u64 };
+
+const high_water = socket.high_water;
+const low_water = socket.low_water;
 
 /// WebTransport session error for "the other side went away".
 const relay_error: u32 = 0;
@@ -113,6 +118,19 @@ pub fn Relay(comptime Listener: type) type {
             rs: *RSession,
             down_stream: u64,
             up_stream: u64,
+            /// We stopped reading the client's stream: the upstream is behind.
+            down_paused: bool = false,
+            /// We stopped reading the upstream's stream: the client is behind.
+            up_paused: bool = false,
+
+            fn upBacklog(p: *const Pair) u64 {
+                return p.rs.up.client.conn.streamBufferedBytes(p.up_stream) orelse 0;
+            }
+
+            fn downBacklog(p: *const Pair) u64 {
+                const d = p.rs.down();
+                return d.streamBufferedBytes(p.down_stream) orelse 0;
+            }
         };
 
         /// The upstream client and its handler; outlives its session until
@@ -201,7 +219,12 @@ pub fn Relay(comptime Listener: type) type {
                 const p = r.by_up.get(stream_id) orelse return;
                 var d = r.down();
                 if (data.len > 0) d.sendStreamData(p.down_stream, data) catch {};
-                if (fin) d.closeStream(p.down_stream);
+                if (fin) return d.closeStream(p.down_stream);
+                if (!p.up_paused and p.downBacklog() > high_water) {
+                    var u = r.upSession();
+                    u.pauseStream(p.up_stream) catch return;
+                    p.up_paused = true;
+                }
             }
 
             pub fn onDatagram(self: *UpHandler, _: *event_loop.ClientSession, _: u64, data: []const u8) void {
@@ -330,6 +353,30 @@ pub fn Relay(comptime Listener: type) type {
             if (data.len > 0) u.sendStreamData(p.up_stream, data) catch {};
             if (fin) u.closeStream(p.up_stream);
             r.up.flush();
+            if (!fin and !p.down_paused and p.upBacklog() > high_water) {
+                session.pauseStream(stream_id) catch return;
+                p.down_paused = true;
+            }
+        }
+
+        /// Resume streams whose destination has caught up. Called on every
+        /// worker tick.
+        pub fn checkPaused(self: *Self) void {
+            var it = self.down_streams.valueIterator();
+            while (it.next()) |pp| {
+                const p = pp.*;
+                if (p.down_paused and p.upBacklog() < low_water) {
+                    p.down_paused = false;
+                    var d = p.rs.down();
+                    d.resumeStream(p.down_stream);
+                }
+                if (p.up_paused and p.downBacklog() < low_water) {
+                    p.up_paused = false;
+                    var u = p.rs.upSession();
+                    u.resumeStream(p.up_stream);
+                    p.rs.up.flush();
+                }
+            }
         }
 
         pub fn onDatagram(self: *Self, session: *event_loop.Session, session_id: u64, data: []const u8) void {
