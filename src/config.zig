@@ -313,11 +313,17 @@ fn checkTls(cfg: *const Config, srv: *const Server, t: Tls) error{InvalidConfig}
     if (acme.renew_days == 0) return fail("acme renew_days must be > 0", .{});
     if (acme.check_interval_s == 0) return fail("acme check_interval_s must be > 0", .{});
     // HTTP-01 is answered on plain-HTTP listeners; the CA connects to port 80.
-    const has_plain = plain: {
-        for (cfg.servers) |other| for (other.listen) |l| if (l.tcp and !l.tls) break :plain true;
-        break :plain false;
+    var has_plain = false;
+    var has_port_80 = false;
+    for (cfg.servers) |other| for (other.listen) |l| if (l.tcp and !l.tls) {
+        has_plain = true;
+        if (l.port == 80) has_port_80 = true;
     };
     if (!has_plain) return fail("acme needs a plain-HTTP listener for HTTP-01 challenges", .{});
+    // Behind a port-forward or a test CA another port can work, so only warn.
+    if (!has_port_80 and !@import("builtin").is_test) {
+        std.log.scoped(.config).warn("acme for '{s}': no plain-HTTP listener on port 80, where CAs validate HTTP-01", .{srv.server_names[0]});
+    }
     // Certificates are stored under the first name; a second server using the
     // same one must ask for the same thing.
     for (cfg.servers) |*other| {
