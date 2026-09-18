@@ -1,0 +1,18 @@
+// routez under test: plain on :19081, TLS on :19444.
+.{
+    .workers = WORKERS,
+    .access_log = false,
+    .servers = .{.{
+        .listen = .{
+            .{ .address = "127.0.0.1", .port = 19081 },
+            .{ .address = "127.0.0.1", .port = 19444, .tls = true },
+        },
+        .tls = .{ .cert = "CERTS/server.crt", .key = "CERTS/server.key" },
+        .locations = .{
+            .{ .prefix = "/", .root = "WWW" },
+            .{ .prefix = "/ping", .@"return" = .{ .body = "pong", .content_type = "text/plain" } },
+            .{ .prefix = "/up/", .proxy_pass = "be" },
+        },
+    }},
+    .upstreams = .{.{ .name = "be", .servers = .{"127.0.0.1:19090"}, .keepalive = 64 }},
+}

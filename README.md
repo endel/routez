@@ -42,6 +42,11 @@ zig build -Doptimize=ReleaseFast
 
 `build.zig.zon` depends on `../quic-zig` by path.
 
+On arm64, check that the build has AES: Zig 0.16 reads some CPUs as
+`generic` without it (Apple silicon inside a Linux VM, for one), and TLS then
+encrypts in software, about 10× slower serving a 10 KB file. Build with
+`-Dcpu=native+aes+sha2` there.
+
 ## Configuration
 
 A ZON file; see `src/config.zig` for every field and default.
@@ -163,15 +168,35 @@ validation against routez.
 
 ## Performance
 
-A rough comparison with nginx 1.24 on the same Linux VM (Docker on an Apple
-M-series Mac, 10 cores), both with 4 workers, keep-alive, `wrk -t4 -c100`.
-Relative numbers only; a VM is not a benchmark machine.
+```sh
+bench/run.sh    # routez, nginx and HAProxy in a Linux container (needs Docker)
+```
 
-| Workload | nginx | routez |
-|---|---|---|
-| Fixed response (`return`) | 563k req/s | 521k req/s |
-| 10 KB static file | 277k req/s | 249k req/s |
-| Reverse proxy to a keep-alive upstream | 195k req/s | 186k req/s |
+It builds routez, starts all three beside a shared upstream, and runs wrk
+against one server at a time. The table and every run land in
+`bench/results/<timestamp>/`. Knobs: `WORKERS` (3), `CONNS` (256),
+`DURATION` (10 s), `ROUNDS` (3), `WORKLOADS` (a subset of rows).
+
+Docker Desktop on an Apple M-series Mac (10 cores), 18 Sep 2026: nginx 1.30.5
+and HAProxy 3.2.23 on OpenSSL 3.5, 3 workers each, with the server, wrk and
+upstream on separate cores. Median of 3 × 10 s runs, keep-alive, in
+requests per second. Relative numbers only; a VM is not a benchmark machine.
+
+| Workload | nginx | HAProxy | routez |
+|---|---|---|---|
+| Fixed response (`return`) | 597k | 402k | 495k |
+| 10 KB static file | 251k | — | 240k |
+| Reverse proxy to a keep-alive upstream | 218k | 180k | 225k |
+| TLS: fixed response | 368k | 275k | 385k |
+| TLS: 10 KB static file | 131k | — | 163k |
+| TLS: new connection per request | 12k | 10k | 16k |
+
+- HAProxy isn't a file server. nginx has `sendfile` on; routez reads files on
+  the worker thread.
+- TLS is 1.3 with AES-128-GCM and X25519 everywhere, routez's own choice;
+  nginx and HAProxy are pinned to it.
+- The last row measures resumed handshakes: wrk reuses the session on each
+  new connection. wrk is also at its limit there, so read it as an ordering.
 
 ## Limitations
 
