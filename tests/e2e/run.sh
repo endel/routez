@@ -152,8 +152,7 @@ SUITE=migration check survives-rebinding "$migrated" 8
 kill $MIG; wait $MIG 2>/dev/null
 echo "migration: $(grep -o 'quic steered: [0-9]*' "$WORK/mig.log")"
 
-# limits.quic_idle_timeout_ms: an idle connection is dropped after ~1.5 s
-# rather than quic-zig's default 30 s.
+# limits.quic_idle_timeout_ms: an idle connection is dropped after ~1.5 s.
 cat > "$WORK/idle.zon" <<EOF2
 .{ .access_log = false, .limits = .{ .quic_idle_timeout_ms = 1500 }, .servers = .{.{
     .listen = .{.{ .address = "127.0.0.1", .port = 18446, .quic = true }},
@@ -166,10 +165,14 @@ perl -e 'select(undef,undef,undef,0.5)'
 quic_conns() { $CURL_BIN -s http://127.0.0.1:18446/status | grep -o 'quic (this worker): [0-9]*' | grep -o '[0-9]*$'; }
 "$ROOT/zig-out/bin/h3-test-client" 18446 "$CERTS/ca.crt" 1 idle > "$WORK/idle_client.log" 2>&1 & IC=$!
 for _ in $(seq 1 50); do grep -q h3-idle "$WORK/idle_client.log" && break; perl -e 'select(undef,undef,undef,0.05)'; done
-open_conns=$(quic_conns); waited=0
-while [ "$(quic_conns)" != 0 ] && [ $waited -lt 100 ]; do perl -e 'select(undef,undef,undef,0.1)'; waited=$((waited+1)); done
+# The timeout is at least 3 PTOs (RFC 9000 §10.1), which a slow runner's RTT
+# estimates can stretch past 1.5 s; the default would hold it 30 s.
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time*1000'; }
+t0=$(now_ms); open_conns=$(quic_conns)
+while [ "$(quic_conns)" != 0 ] && [ $(($(now_ms) - t0)) -lt 15000 ]; do perl -e 'select(undef,undef,undef,0.1)'; done
+waited=$(($(now_ms) - t0))
 kill $IC 2>/dev/null; wait $IC 2>/dev/null
-SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 8 ] && [ $waited -lt 50 ] && echo in-time || echo "after ${waited}00ms")" "1 in-time"
+SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 700 ] && [ $waited -lt 12000 ] && echo in-time || echo "after ${waited}ms")" "1 in-time"
 kill $IDLE; wait $IDLE 2>/dev/null
 
 # WebTransport through the relay: a stream and a datagram, echoed.
