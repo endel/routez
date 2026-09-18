@@ -263,7 +263,7 @@ pub const Conn = struct {
             .head => return self.parseHead(),
             .body => return self.feedBody(),
             .tunnel => {
-                if (self.in.items.len == 0) return false;
+                if (self.in.items.len == 0 or self.body_paused) return false;
                 const ex = self.ex orelse {
                     self.in.clearRetainingCapacity();
                     return false;
@@ -589,7 +589,9 @@ pub const Conn = struct {
         const self = cast(ptr);
         if (self.body_paused == paused) return;
         self.body_paused = paused;
-        if (!paused) self.scheduleProcess();
+        // Stop reading at once: in a tunnel `in` is drained every pass, so
+        // waiting for it to fill would never hold the client back.
+        if (paused) self.sock.pauseRead() else self.scheduleProcess();
     }
 
     fn dsStartTunnel(ptr: *anyopaque) void {
