@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
 
 env:
-  # quic-zig is a path dependency (../quic-zig). Point this back at main once
-  # endel/quic-zig#35 and the routez-steering branch are merged.
-  QUIC_ZIG_REF: routez-steering
+  # quic-zig is a path dependency (../quic-zig), checked out at this ref.
+  QUIC_ZIG_REF: main
 
 jobs:
   test:
