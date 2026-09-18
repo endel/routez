@@ -238,6 +238,8 @@ kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null; sleep 0.2  # take down 19002
 check failover "$(for i in 1 2 3 4 5 6; do $CURL -o /dev/null -w '%{http_code}' "$B/api/f"; done)" "200200200200200200"
 
 if grep -qiE "panic|segmentation" "$WORK/server.log"; then fail=$((fail+1)); echo "FAIL server crashed:"; cat "$WORK/server.log"; fi
+# libxev's kqueue backend logs this when a completion is queued twice.
+if grep -q "invalid state" "$WORK/server.log"; then fail=$((fail+1)); echo "FAIL event loop: $(grep -c 'invalid state' "$WORK/server.log") invalid-state errors"; fi
 # A connection that never sends a request mustn't hold the stop for the
 # whole drain window.
 python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 18080)); time.sleep(30)" & SILENT=$!; PIDS+=($SILENT)
