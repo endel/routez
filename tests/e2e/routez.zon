@@ -16,6 +16,10 @@
                 .{ .name = "host", .value = "upstream.local" },
                 .{ .name = "x-custom", .value = "v1" },
                 .{ .name = "user-agent", .value = "" },
+                .{ .name = "x-orig", .value = "$request_uri" },
+            } },
+            .{ .prefix = "/old/", .@"return" = .{ .status = 301, .location = "https://$host$request_uri" }, .add_headers = .{
+                .{ .name = "x-vars", .value = "$scheme $uri $is_args$args $remote_addr" },
             } },
             .{ .prefix = "/limited", .@"return" = .{ .body = "ok\n" }, .limit_req = .{ .rate = 1, .burst = 2 } },
             .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true },

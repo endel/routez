@@ -234,6 +234,7 @@ test {
     _ = @import("net/socket.zig");
     _ = @import("net/addr.zig");
     _ = @import("http/common.zig");
+    _ = @import("http/vars.zig");
     _ = @import("http1/parser.zig");
     _ = @import("router.zig");
     _ = @import("handlers/static.zig");

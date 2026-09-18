@@ -18,6 +18,7 @@ const proxy = @import("handlers/proxy.zig");
 const Header = common.Header;
 const stats = @import("stats.zig");
 const gzip = @import("gzip.zig");
+const vars = @import("http/vars.zig");
 
 pub const Response = struct {
     status: u16,
@@ -142,6 +143,10 @@ pub const Exchange = struct {
     upstream_addr: ?[]const u8 = null,
     /// Set when this response is being gzip-compressed.
     gz: ?*gzip.Encoder = null,
+    /// The location's `add_headers` and `proxy_set_headers` values with
+    /// variables expanded; null when none has a variable.
+    add_values: ?[]const []const u8 = null,
+    set_values: ?[]const []const u8 = null,
 
     pub fn create(worker: *Worker, down: Downstream, init: RequestInit) !*Exchange {
         const ex = try worker.alloc.create(Exchange);
@@ -201,6 +206,8 @@ pub const Exchange = struct {
             }
         }
         const loc = router.matchLocation(self.server, self.req.path) orelse return self.sendError(404);
+        self.add_values = self.expandAll(loc.add_headers) catch return self.sendError(400);
+        self.set_values = self.expandAll(loc.proxy_set_headers) catch return self.sendError(400);
         self.location = loc;
         if (loc.limit_req) |lim| {
             if (!self.worker.allowRequest(loc, lim, self.req.client_addr)) {
@@ -212,7 +219,7 @@ pub const Exchange = struct {
         const max_body = self.worker.cfg.limits.max_body_bytes;
         if (max_body != 0 and (self.req.content_length orelse 0) > max_body) return self.sendError(413);
 
-        if (loc.@"return") |ret| return self.sendFixed(ret.status, ret.content_type, ret.body);
+        if (loc.@"return") |ret| return self.sendReturn(ret);
         if (loc.stub_status) {
             var buf: [512]u8 = undefined;
             return self.sendFixed(200, "text/plain; charset=utf-8", stats.format(&buf, self.worker.quicConnectionCount()));
@@ -286,7 +293,9 @@ pub const Exchange = struct {
         var list: std.ArrayListUnmanaged(Header) = .empty;
         list.ensureTotalCapacity(a, resp.headers.len + loc.add_headers.len + 2) catch return d.vtable.sendHead(d.ptr, resp_in);
         list.appendSliceAssumeCapacity(resp.headers);
-        for (loc.add_headers) |h| list.appendAssumeCapacity(.{ .name = h.name, .value = h.value });
+        for (loc.add_headers, 0..) |h, i| {
+            list.appendAssumeCapacity(.{ .name = h.name, .value = if (self.add_values) |v| v[i] else h.value });
+        }
         if (loc.gzip and self.startGzip(&resp, list.items)) {
             for (list.items) |*h| {
                 // The compressed body is a different representation.
@@ -394,6 +403,49 @@ pub const Exchange = struct {
     pub fn startTunnel(self: *Exchange) void {
         const d = self.down orelse return;
         d.vtable.startTunnel(d.ptr);
+    }
+
+    fn varRequest(self: *const Exchange) vars.Request {
+        return .{
+            .scheme = self.req.scheme,
+            .authority = self.req.authority,
+            .default_host = if (self.server.server_names.len > 0) self.server.server_names[0] else "",
+            .target = self.req.target,
+            .path = self.req.path,
+            .query = self.req.query,
+            .remote_addr = self.req.client_addr,
+        };
+    }
+
+    /// Expand `template`'s variables for this request; InvalidValue when the
+    /// result isn't a valid header value.
+    pub fn expand(self: *Exchange, template: []const u8) error{ OutOfMemory, InvalidValue }![]const u8 {
+        if (!vars.has(template)) return template;
+        return vars.expand(self.arena(), template, self.varRequest());
+    }
+
+    fn expandAll(self: *Exchange, headers: []const config.HeaderKV) !?[]const []const u8 {
+        for (headers) |h| {
+            if (vars.has(h.value)) break;
+        } else return null;
+        const out = try self.arena().alloc([]const u8, headers.len);
+        for (headers, out) |h, *v| v.* = try self.expand(h.value);
+        return out;
+    }
+
+    /// The configured value of `proxy_set_headers[i]`, expanded.
+    pub fn setHeaderValue(self: *const Exchange, i: usize) []const u8 {
+        if (self.set_values) |v| return v[i];
+        return self.location.?.proxy_set_headers[i].value;
+    }
+
+    fn sendReturn(self: *Exchange, ret: config.Location.Return) void {
+        const location = ret.location orelse return self.sendFixed(ret.status, ret.content_type, ret.body);
+        const value = self.expand(location) catch return self.sendError(400);
+        const headers = [_]Header{ .{ .name = "location", .value = value }, .{ .name = "content-type", .value = ret.content_type } };
+        self.respondHead(&.{ .status = ret.status, .headers = &headers, .content_length = ret.body.len });
+        if (!self.req.isHead()) self.respondBody(ret.body);
+        self.respondEnd();
     }
 
     pub fn sendFixed(self: *Exchange, status: u16, content_type: []const u8, body: []const u8) void {

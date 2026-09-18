@@ -110,7 +110,7 @@ pub const Proxy = struct {
         }
         try head.appendSlice(a, " HTTP/1.1\r\n");
         const set = self.loc.proxy_set_headers;
-        const host = if (findSet(set, "host")) |h| h.value else ex.req.authority;
+        const host = if (findSet(set, "host")) |i| ex.setHeaderValue(i) else ex.req.authority;
         try head.print(a, "Host: {s}\r\n", .{host});
 
         var connection_values: [8][]const u8 = undefined;
@@ -143,9 +143,10 @@ pub const Proxy = struct {
         if (findSet(set, "x-real-ip") == null) try head.print(a, "X-Real-IP: {s}\r\n", .{ex.req.client_addr});
         if (findSet(set, "x-forwarded-proto") == null) try head.print(a, "X-Forwarded-Proto: {s}\r\n", .{ex.req.scheme});
         if (findSet(set, "x-forwarded-host") == null) try head.print(a, "X-Forwarded-Host: {s}\r\n", .{ex.req.authority});
-        for (set) |h| {
-            if (h.value.len == 0 or std.ascii.eqlIgnoreCase(h.name, "host")) continue;
-            try head.print(a, "{s}: {s}\r\n", .{ h.name, h.value });
+        for (set, 0..) |h, i| {
+            const v = ex.setHeaderValue(i);
+            if (v.len == 0 or std.ascii.eqlIgnoreCase(h.name, "host")) continue;
+            try head.print(a, "{s}: {s}\r\n", .{ h.name, v });
         }
 
         switch (self.framing) {
@@ -162,8 +163,8 @@ pub const Proxy = struct {
         if (!self.send(head.items)) return error.OutOfMemory;
     }
 
-    fn findSet(set: []const config.HeaderKV, name: []const u8) ?config.HeaderKV {
-        for (set) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h;
+    fn findSet(set: []const config.HeaderKV, name: []const u8) ?usize {
+        for (set, 0..) |h, i| if (std.ascii.eqlIgnoreCase(h.name, name)) return i;
         return null;
     }
 

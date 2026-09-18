@@ -31,6 +31,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Per location: gzip for text-like responses, `add_headers`,
   `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
   (per-client token bucket).
+- Redirects and header values built from the request with nginx-style
+  variables (`$host`, `$request_uri`, ...).
 - `stub_status`-style counters and an access log.
 
 ## Build and run
@@ -96,6 +98,30 @@ A ZON file; see `src/config.zig` for every field and default.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
 - TLS keys must be EC P-256 or Ed25519. TLS 1.2 is not supported.
+
+### Redirects and variables
+
+`return` takes a `location` for redirects, and it, `add_headers` and
+`proxy_set_headers` values may use variables, written `$name` or `${name}`:
+
+```zig
+// Plain HTTP to HTTPS.
+.{ .listen = .{.{ .port = 80 }}, .locations = .{
+    .{ .prefix = "/", .@"return" = .{ .status = 301, .location = "https://$host$request_uri" } },
+} },
+```
+
+| variable | value |
+|---|---|
+| `$scheme` | `http` or `https` |
+| `$host` | `Host` / `:authority` lowercased, without the port; the first `server_names` entry if absent |
+| `$request_uri` | path and query as the client sent them |
+| `$uri` | normalized path (dot segments resolved), percent-encoded |
+| `$args`, `$is_args` | query string without the `?`; `?` if there is one |
+| `$remote_addr` | client IP |
+
+An unknown variable, or a `$` not starting one, fails the config check. A
+value that would expand to something invalid in a header gets a 400.
 
 ### Automatic certificates (ACME)
 

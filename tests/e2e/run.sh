@@ -68,6 +68,9 @@ check range "$($CURL -H 'Range: bytes=10-19' "$B/big.bin" | sha)" "$(dd if="$WOR
 ET=$($CURL -D - -o /dev/null "$B/" | grep -i etag | cut -d' ' -f2 | tr -d '\r')
 check not-modified "$($CURL -o /dev/null -w '%{http_code}' -H "If-None-Match: $ET" "$B/")" 304
 check head "$($CURL -I "$B/big.bin" | grep -i content-length | tr -d '\r' | tr A-Z a-z)" "content-length: 3000000"
+check redirect-vars "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/old/a%20b?c=1")" "301 https://127.0.0.1/old/a%20b?c=1"
+check header-vars "$($CURL -D - -o /dev/null "$B/old/a%20b?c=1" | grep -i '^x-vars' | tr -d '\r')" "x-vars: ${B%%:*} /old/a%20b ?c=1 127.0.0.1"
+check proxy-header-vars "$($CURL "$B/api2/h?q=1" | json '["headers"]["x-orig"]')" "/api2/h?q=1"
 check proxy-path "$($CURL "$B/api/hello?x=1" | json '["path"]')" "/hello?x=1"
 check proxy-xff "$($CURL "$B/api/h" | json '["headers"]["X-Forwarded-For"]')" "127.0.0.1"
 check round-robin "$(for i in 1 2 3 4; do $CURL "$B/api/p" | json '["port"]'; done | sort -u | wc -l | tr -d ' ')" 2

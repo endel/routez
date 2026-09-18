@@ -16,6 +16,7 @@
 //! }
 //! ```
 const std = @import("std");
+const vars = @import("http/vars.zig");
 
 pub const Config = struct {
     /// Worker threads, each with its own event loop and SO_REUSEPORT sockets.
@@ -120,14 +121,16 @@ pub const Location = struct {
     /// Relay WebTransport sessions to this upstream (HTTP/3 only).
     webtransport_pass: ?[]const u8 = null,
 
-    /// Answer with a fixed status and body.
+    /// Answer with a fixed status and body, or redirect.
     @"return": ?Return = null,
 
     /// Request headers set on proxied requests, replacing any the client
     /// sent under the same name. An empty value removes the header; `host`
-    /// overrides the Host sent upstream.
+    /// overrides the Host sent upstream. Values may use variables (see
+    /// `http/vars.zig`).
     proxy_set_headers: []const HeaderKV = &.{},
-    /// Headers added to every response from this location.
+    /// Headers added to every response from this location. Values may use
+    /// variables.
     add_headers: []const HeaderKV = &.{},
     /// Compress text-like responses with gzip for clients that accept it.
     gzip: bool = false,
@@ -148,6 +151,8 @@ pub const Location = struct {
         status: u16 = 200,
         body: []const u8 = "",
         content_type: []const u8 = "text/plain; charset=utf-8",
+        /// `Location` header, with variables: `"https://$host$request_uri"`.
+        location: ?[]const u8 = null,
     };
 };
 
@@ -300,6 +305,10 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (loc.proxy_pass) |p| try checkTarget(cfg, p);
             for (loc.proxy_set_headers) |h| try checkHeader(h);
             for (loc.add_headers) |h| try checkHeader(h);
+            if (loc.@"return") |r| {
+                if (r.status < 100 or r.status > 599) return fail("location '{s}': return status {d} is out of range", .{ loc.prefix, r.status });
+                if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
+            }
             if (loc.limit_req) |l| if (l.rate == 0) return fail("location '{s}': limit_req.rate must be > 0", .{loc.prefix});
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
@@ -384,6 +393,10 @@ fn checkHeader(h: HeaderKV) error{InvalidConfig}!void {
     const common = @import("http/common.zig");
     if (!common.isToken(h.name)) return fail("bad header name '{s}'", .{h.name});
     if (!common.isFieldValue(h.value)) return fail("bad value for header '{s}'", .{h.name});
+    vars.validate(h.value) catch |err| return fail("header '{s}': {s} in '{s}'", .{ h.name, switch (err) {
+        error.UnknownVariable => "unknown variable",
+        error.BadVariable => "bad variable syntax",
+    }, h.value });
 }
 
 fn checkTarget(cfg: *const Config, target: []const u8) error{InvalidConfig}!void {
@@ -499,6 +512,30 @@ test "acme tls: exactly one form, no wildcards, needs plain http" {
         ,
         // cert without key
         \\.{ .servers = .{.{ .listen = .{.{ .port = 443, .tls = true }}, .tls = .{ .cert = "c" }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "variables in return and headers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/", .@"return" = .{ .status = 301, .location = "https://$host$request_uri" },
+        \\       .add_headers = .{.{ .name = "x-uri", .value = "${uri}" }} },
+        \\} }} }
+    , "test");
+    try std.testing.expectEqualStrings("https://$host$request_uri", cfg.servers[0].locations[0].@"return".?.location.?);
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .@"return" = .{ .status = 301, .location = "https://$hostname/" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .add_headers = .{.{ .name = "x", .value = "$" }} }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1", .proxy_set_headers = .{.{ .name = "x", .value = "$nope" }} }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .@"return" = .{ .status = 3010 } }} }} }
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
