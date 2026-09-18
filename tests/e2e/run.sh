@@ -76,7 +76,9 @@ check post-chunked "$($CURL -X POST -H 'Transfer-Encoding: chunked' --data-binar
 [ "$SUITE" != h3 ] && check websocket "$(NODE_EXTRA_CA_CERTS=$CERTS/ca.crt node "$HERE/ws_client.mjs" ${B/http/ws}/ws/echo)" "ws-ok"
 check gateway-timeout "$($CURL -o /dev/null -w '%{http_code}' "$B/slow/x")" 504
 check slow-client "$($CURL --limit-rate 4M "$B/slow/big" | sha)" "$(sha < "$WORK/www/big.bin")"
-check slow-upstream-upload "$($CURL -X POST --data-binary @"$WORK/www/big.bin" "$B/slow/up")" 3000000
+# Default read timeout: the 1 s one on /slow/ is for the 504 check, and a
+# slow reader may still be draining its socket buffer that long.
+check slow-upstream-upload "$($CURL -X POST --data-binary @"$WORK/www/big.bin" "$B/slowup/up")" 3000000
 [ "$SUITE" == http ] && check smuggling "$(python3 "$HERE/pipe.py" 'POST /api/x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n' | grep -o 'HTTP/1.1 [0-9]*')" "HTTP/1.1 400"
 
 }

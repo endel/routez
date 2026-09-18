@@ -21,6 +21,7 @@
             .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true },
             .{ .prefix = "/ws/", .proxy_pass = "127.0.0.1:19003" },
             .{ .prefix = "/slow/", .proxy_pass = "slow", .strip_prefix = true },
+            .{ .prefix = "/slowup/", .proxy_pass = "127.0.0.1:19004", .strip_prefix = true },
             .{ .prefix = "/.well-known/webtransport", .webtransport_pass = "127.0.0.1:4450" },
         },
     }},
