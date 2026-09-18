@@ -67,6 +67,9 @@ pub fn Socket(comptime Owner: type) type {
         pub fn init(self: *Self, owner: *Owner, loop: *xev.Loop, t: *timers.Timers, alloc: std.mem.Allocator, tcp: xev.TCP) void {
             self.* = .{ .tcp = tcp, .loop = loop, .timers = t, .alloc = alloc, .owner = owner };
             setNoSigpipe(tcp.fd);
+            // A response is often a head write then a body write; with Nagle
+            // the second waits on the client's delayed ACK (~40 ms on Linux).
+            setNoDelay(tcp.fd);
         }
 
         pub fn fd(self: *const Self) std.posix.socket_t {
