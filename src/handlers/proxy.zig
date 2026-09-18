@@ -73,6 +73,8 @@ pub const Proxy = struct {
     /// Bytes followed the response body; the connection can't be reused.
     trailing_garbage: bool = false,
     deadline: timers.Deadline = .{ .callback = onDeadline },
+    /// Upstream reads paused because the client is behind.
+    read_paused: bool = false,
 
     const Phase = enum { connecting, waiting_head, body, tunnel, done };
     const Framing = enum { none, length, chunked, pending };
@@ -201,6 +203,7 @@ pub const Proxy = struct {
             .none, .pending => true,
         };
         if (!ok) return self.fail(500);
+        self.armDeadline();
         self.checkRequestBackpressure();
     }
 
@@ -212,6 +215,7 @@ pub const Proxy = struct {
     pub fn onRequestEnd(self: *Proxy) void {
         if (self.phase == .done) return;
         self.request_done = true;
+        self.armDeadline();
         if (self.phase == .tunnel) {
             // The client closed its side of the tunnel.
             return self.complete(false);
@@ -247,14 +251,17 @@ pub const Proxy = struct {
         };
         self.conn = c;
         self.phase = if (c.reused) .waiting_head else .connecting;
-        self.t().set(&self.deadline, if (c.reused) self.group.cfg.read_timeout_ms else self.group.cfg.connect_timeout_ms);
+        if (!c.reused) self.t().set(&self.deadline, self.group.cfg.connect_timeout_ms);
         if (self.replay_ok) {
             c.sock.write(self.replay.items);
         } else {
             c.sock.write(self.unsent.items);
             self.unsent.clearAndFree(self.alloc());
         }
-        if (c.reused) c.sock.startReading();
+        if (c.reused) {
+            c.sock.startReading();
+            self.armDeadline();
+        }
     }
 
     fn detachConn(self: *Proxy, reusable: bool) void {
@@ -278,17 +285,39 @@ pub const Proxy = struct {
             return self.retryOrFail(502);
         }
         self.phase = .waiting_head;
-        self.t().set(&self.deadline, self.group.cfg.read_timeout_ms);
+        self.armDeadline();
+    }
+
+    /// The upstream timeout covers the upstream being slow, never us: it is
+    /// off while upstream reads are paused for a slow client, and while the
+    /// request body is still coming from the client with nothing queued for
+    /// the upstream (the client connection's own timeout covers that).
+    fn armDeadline(self: *Proxy) void {
+        const c = self.conn orelse return;
+        const waiting_on_us = switch (self.phase) {
+            .connecting, .tunnel, .done => return,
+            .waiting_head => self.read_paused or (!self.request_done and c.sock.buffered() == 0),
+            .body => self.read_paused,
+        };
+        if (waiting_on_us) {
+            self.t().clear(&self.deadline);
+        } else {
+            self.t().set(&self.deadline, self.group.cfg.read_timeout_ms);
+        }
     }
 
     pub fn onUpstreamWritable(self: *Proxy) void {
         if (self.phase == .done) return;
+        self.armDeadline();
         self.ex.pauseRequestBody(false);
     }
 
     pub fn onDownstreamWritable(self: *Proxy) void {
         const c = self.conn orelse return;
-        if (self.ex.downstreamBuffered() < socket.low_water) c.sock.resumeRead();
+        if (!self.read_paused or self.ex.downstreamBuffered() >= socket.low_water) return;
+        self.read_paused = false;
+        c.sock.resumeRead();
+        self.armDeadline();
     }
 
     // ---- response side ----
@@ -301,12 +330,12 @@ pub const Proxy = struct {
                 return self.checkResponseBackpressure();
             },
             .waiting_head => {
-                self.t().set(&self.deadline, self.group.cfg.read_timeout_ms);
                 self.in.appendSlice(self.alloc(), data) catch return self.fail(502);
+                self.armDeadline();
                 self.parseHead();
             },
             .body => {
-                self.t().set(&self.deadline, self.group.cfg.read_timeout_ms);
+                self.armDeadline();
                 self.forwardBody(data);
             },
         }
@@ -394,7 +423,10 @@ pub const Proxy = struct {
 
     fn checkResponseBackpressure(self: *Proxy) void {
         const c = self.conn orelse return;
-        if (self.ex.downstreamBuffered() > socket.high_water) c.sock.pauseRead();
+        if (self.read_paused or self.ex.downstreamBuffered() <= socket.high_water) return;
+        self.read_paused = true;
+        c.sock.pauseRead();
+        self.armDeadline();
     }
 
     fn startTunnel(self: *Proxy, head: *const parser.ResponseHead, head_len: usize) void {
