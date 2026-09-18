@@ -2,10 +2,11 @@
 //!
 //! ```
 //! <storage>/<ca>/account.key        ACME account key (EC PRIVATE KEY)
-//! <storage>/<ca>/<first-name>.pem   certificate chain, then its key
+//! <storage>/<ca>/<name>.pem         certificate chain, then its key
 //! ```
 //! `<ca>` is the directory URL's host (and port), so staging and production
-//! certificates never mix. Directories are 0700 and files 0600; files are
+//! certificates never mix. `<name>` is the alphabetically first server name,
+//! so reordering `server_names` keeps the file. Directories are 0700 and files 0600; files are
 //! replaced by rename, so a reader sees the old or the new one whole. Chain and
 //! key share a file so they can't be caught mismatched.
 const std = @import("std");
@@ -28,9 +29,9 @@ pub fn accountKeyPath(a: std.mem.Allocator, acme: config.Acme) ![]u8 {
     return std.fmt.allocPrint(a, "{s}/account.key", .{try caDir(a, acme)});
 }
 
-/// Names are validated as DNS names, so the first one is a safe file name.
+/// Names are validated as DNS names, so any of them is a safe file name.
 pub fn bundlePath(a: std.mem.Allocator, acme: config.Acme, names: []const []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}/{s}.pem", .{ try caDir(a, acme), names[0] });
+    return std.fmt.allocPrint(a, "{s}/{s}.pem", .{ try caDir(a, acme), config.acmeStorageName(names) });
 }
 
 pub const Bundle = struct {
@@ -43,13 +44,58 @@ pub const Bundle = struct {
 /// The stored certificate for `names`, if present, readable, matching its key
 /// and covering every name. Expiry is the caller's call.
 pub fn loadBundle(a: std.mem.Allocator, path: []const u8, names: []const []const u8) !Bundle {
+    const b = try loadAnyBundle(a, path);
+    if (x509.coveredUntil(b.chain[0], names) == null) return error.NamesNotCovered;
+    return b;
+}
+
+/// A stored chain and its matching key, whatever names it covers.
+pub fn loadAnyBundle(a: std.mem.Allocator, path: []const u8) !Bundle {
     const text = try quic.sys.readFileAlloc(a, path, 1024 * 1024);
-    const chain = try quic.tls13.parsePemCertChain(a, text);
-    const key = try x509.parsePrivateKeyPem(text);
-    const not_after = x509.coveredUntil(chain[0], names) orelse return error.NamesNotCovered;
-    const parsed = try (std.crypto.Certificate{ .buffer = chain[0], .index = 0 }).parse();
-    if (!std.mem.eql(u8, parsed.pubKey(), &key.public_key.toUncompressedSec1())) return error.KeyMismatch;
-    return .{ .chain = chain, .key = key, .not_before = parsed.validity.not_before, .not_after = not_after };
+    const chain = quic.tls13.parsePemCertChain(a, text) catch return error.CorruptBundle;
+    const key = x509.parsePrivateKeyPem(text) catch return error.CorruptBundle;
+    const parsed = (std.crypto.Certificate{ .buffer = chain[0], .index = 0 }).parse() catch return error.CorruptBundle;
+    if (!std.mem.eql(u8, parsed.pubKey(), &key.public_key.toUncompressedSec1())) return error.CorruptBundle;
+    return .{ .chain = chain, .key = key, .not_before = parsed.validity.not_before, .not_after = parsed.validity.not_after };
+}
+
+/// How many of `names` a certificate is valid for.
+fn coverage(cert_der: []const u8, names: []const []const u8) usize {
+    var n: usize = 0;
+    for (names) |name| {
+        if (x509.coveredUntil(cert_der, &.{name}) != null) n += 1;
+    }
+    return n;
+}
+
+pub const Stored = struct { path: []const u8, bundle: Bundle, covered: usize };
+
+/// The unexpired stored certificate under this CA that covers the most of
+/// `names`: the exact one if it exists, else one kept from before the names
+/// changed, which still serves the names it has while the new one is ordered.
+pub fn bestBundle(a: std.mem.Allocator, io: std.Io, acme: config.Acme, names: []const []const u8, now: i64) !?Stored {
+    const exact = try bundlePath(a, acme, names);
+    if (loadBundle(a, exact, names)) |b| {
+        if (b.not_after > now) return .{ .path = exact, .bundle = b, .covered = names.len };
+    } else |_| {}
+    const dir_path = try caDir(a, acme);
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var best: ?Stored = null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pem")) continue;
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir_path, entry.name });
+        const b = loadAnyBundle(a, path) catch continue;
+        if (b.not_after <= now) continue;
+        const covered = coverage(b.chain[0], names);
+        if (covered == 0) continue;
+        if (best) |cur| {
+            if (covered < cur.covered or (covered == cur.covered and b.not_after <= cur.bundle.not_after)) continue;
+        }
+        best = .{ .path = path, .bundle = b, .covered = covered };
+    }
+    return best;
 }
 
 /// Renew once fewer than `renew_days` remain, or half the lifetime, whichever
@@ -108,20 +154,17 @@ pub fn placeholder(a: std.mem.Allocator, io: std.Io, names: []const []const u8) 
     return .{ .cert_chain_der = chain, .private_key_bytes = try a.dupe(u8, &kp.secret_key.toBytes()), .private_key_algorithm = .ecdsa_p256_sha256 };
 }
 
-/// What a TLS listener serves for an ACME server: the stored certificate
-/// while it's valid, else a placeholder (the ACME thread is fetching one).
+/// What a TLS listener serves for an ACME server: the best stored
+/// certificate still valid, else a placeholder (the ACME thread is fetching one).
 pub fn servingCertificate(a: std.mem.Allocator, io: std.Io, acme: config.Acme, names: []const []const u8) !quic.tls_server.Certificate {
-    const path = try bundlePath(a, acme, names);
-    if (loadBundle(a, path, names)) |b| {
-        if (b.not_after > quic.sys.realtimeSeconds()) {
-            return .{ .cert_chain_der = b.chain, .private_key_bytes = try a.dupe(u8, &b.key.secret_key.toBytes()), .private_key_algorithm = .ecdsa_p256_sha256 };
+    if (try bestBundle(a, io, acme, names, quic.sys.realtimeSeconds())) |best| {
+        if (best.covered < names.len) {
+            log.warn("{s}: serving {s}, which covers {d} of {d} names, until ACME issues one for all of them", .{ names[0], best.path, best.covered, names.len });
         }
-        log.warn("{s} has expired", .{path});
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => log.warn("{s}: {s}", .{ path, @errorName(err) }),
+        const b = best.bundle;
+        return .{ .cert_chain_der = b.chain, .private_key_bytes = try a.dupe(u8, &b.key.secret_key.toBytes()), .private_key_algorithm = .ecdsa_p256_sha256 };
     }
-    log.warn("{s}: no certificate yet; serving a self-signed placeholder until ACME provides one", .{names[0]});
+    log.warn("{s}: no usable certificate stored; serving a self-signed placeholder until ACME provides one", .{names[0]});
     return placeholder(a, io, names);
 }
 
@@ -131,6 +174,8 @@ test "paths are per CA" {
     const a = arena_state.allocator();
     const names = [_][]const u8{"example.com"};
     try std.testing.expectEqualStrings("/s/acme-v02.api.letsencrypt.org/example.com.pem", try bundlePath(a, .{ .storage = "/s" }, &names));
+    // Independent of order.
+    try std.testing.expectEqualStrings("/s/acme-v02.api.letsencrypt.org/a.example.pem", try bundlePath(a, .{ .storage = "/s" }, &.{ "b.example", "a.example" }));
     try std.testing.expectEqualStrings("/s/localhost_14000/account.key", try accountKeyPath(a, .{ .storage = "/s", .directory = "https://localhost:14000/dir" }));
 }
 
@@ -169,4 +214,28 @@ test "bundle round trip through writeAtomic" {
     const b = try loadBundle(a, path, &names);
     try std.testing.expectEqual(@as(u64, 4_000_000_000), b.not_after);
     try std.testing.expectError(error.NamesNotCovered, loadBundle(a, path, &.{"other.example"}));
+}
+
+test "a stored certificate for fewer names keeps serving them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const acme: config.Acme = .{ .storage = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)] };
+
+    const old_names = [_][]const u8{"b.example"};
+    const kp = x509.KeyPair.generate(io);
+    const now: i64 = 1_800_000_000;
+    const cert = try x509.selfSigned(a, kp, &old_names, now - 86400, now + 86400, @splat(2));
+    try writeAtomic(io, try bundlePath(a, acme, &old_names), try std.mem.concat(a, u8, &.{ try @import("der.zig").pem(a, "CERTIFICATE", cert), try x509.privateKeyPem(a, kp) }));
+
+    // "a.example" sorts first, so the new set has its own file, not written yet.
+    const best = (try bestBundle(a, io, acme, &.{ "b.example", "a.example" }, now)).?;
+    try std.testing.expectEqual(@as(usize, 1), best.covered);
+    try std.testing.expect(try bestBundle(a, io, acme, &.{"c.example"}, now) == null);
+    // Expired: not served.
+    try std.testing.expect(try bestBundle(a, io, acme, &old_names, now + 2 * 86400) == null);
 }

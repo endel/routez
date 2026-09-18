@@ -65,8 +65,7 @@ pub const Job = struct {
     acme: config.Acme,
 
     fn eql(a: Job, b: Job) bool {
-        if (a.names.len != b.names.len) return false;
-        for (a.names, b.names) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+        if (!config.sameNames(a.names, b.names)) return false;
         return std.mem.eql(u8, a.acme.directory, b.acme.directory) and std.mem.eql(u8, a.acme.storage, b.acme.storage);
     }
 

@@ -324,18 +324,37 @@ fn checkTls(cfg: *const Config, srv: *const Server, t: Tls) error{InvalidConfig}
     if (!has_port_80 and !@import("builtin").is_test) {
         std.log.scoped(.config).warn("acme for '{s}': no plain-HTTP listener on port 80, where CAs validate HTTP-01", .{srv.server_names[0]});
     }
-    // Certificates are stored under the first name; a second server using the
-    // same one must ask for the same thing.
+    // Certificates are stored under one name; a second server using the same
+    // one must ask for the same set.
+    const key = acmeStorageName(srv.server_names);
     for (cfg.servers) |*other| {
         if (other == srv) break;
         const oa = (other.tls orelse continue).acme orelse continue;
-        if (!std.mem.eql(u8, other.server_names[0], srv.server_names[0])) continue;
+        if (!std.mem.eql(u8, acmeStorageName(other.server_names), key)) continue;
         if (!std.mem.eql(u8, oa.directory, acme.directory) or !std.mem.eql(u8, oa.storage, acme.storage)) continue;
-        const same = other.server_names.len == srv.server_names.len and for (other.server_names, srv.server_names) |a, b| {
-            if (!std.mem.eql(u8, a, b)) break false;
-        } else true;
-        if (!same) return fail("acme: two servers starting with '{s}' need the same server_names", .{srv.server_names[0]});
+        if (!sameNames(other.server_names, srv.server_names)) return fail("acme: two servers with '{s}' need the same server_names", .{key});
     }
+}
+
+/// The name an ACME certificate is stored under: the alphabetically first,
+/// so the order of `server_names` doesn't matter.
+pub fn acmeStorageName(names: []const []const u8) []const u8 {
+    var first = names[0];
+    for (names[1..]) |n| if (std.mem.lessThan(u8, n, first)) {
+        first = n;
+    };
+    return first;
+}
+
+/// The same set of names, in any order.
+pub fn sameNames(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a) |x| {
+        for (b) |y| {
+            if (std.mem.eql(u8, x, y)) break;
+        } else return false;
+    }
+    return true;
 }
 
 /// Letters, digits and hyphens in dot-separated labels, and not an IP address.
