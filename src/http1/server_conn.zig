@@ -446,9 +446,11 @@ pub const Conn = struct {
         }
     }
 
-    /// Close an idle keep-alive connection during shutdown.
+    /// Close an idle keep-alive connection during shutdown. One that hasn't
+    /// had a request yet is kept for it: it may be mid-TLS-handshake, or its
+    /// request still in the socket buffer.
     pub fn closeIfIdle(self: *Conn) void {
-        if (self.phase == .head and self.in.items.len == 0) self.sock.abort();
+        if (self.phase == .head and self.in.items.len == 0 and self.requests > 0) self.sock.abort();
         self.keep_alive = false;
     }
 
