@@ -7,6 +7,9 @@
 //! them. When one side's stream backs up (unsent bytes past `high_water`),
 //! reading the paired stream on the other side pauses, so the sender is held
 //! by QUIC flow control; `checkPaused` resumes it once the backlog drains.
+//! A write past the peer's WebTransport session credit (WT_MAX_DATA) is
+//! refused rather than buffered, so the relay holds what was refused, keeps
+//! the source paused and sends it from `onWritable` once the peer grants more.
 //! Datagrams are unreliable and simply forwarded.
 const std = @import("std");
 const quic = @import("quic");
@@ -58,8 +61,7 @@ pub fn Relay(comptime Listener: type) type {
             }
 
             fn upSession(self: *RSession) event_loop.ClientSession {
-                const c = &self.up.client;
-                return .{ .conn = c.conn, .h3_conn = c.h3_conn, .wt_conn = c.wt_conn, .stopping = &c.stopping };
+                return self.up.client.clientSession();
             }
 
             fn pair(self: *RSession, down_stream: u64, up_stream: u64) void {
@@ -79,7 +81,7 @@ pub fn Relay(comptime Listener: type) type {
             fn unpair(self: *RSession, p: *Pair) void {
                 _ = self.relay.down_streams.remove(.{ .conn = self.down_conn, .id = p.down_stream });
                 _ = self.by_up.remove(p.up_stream);
-                self.worker.alloc.destroy(p);
+                p.deinit(self.worker.alloc);
             }
 
             /// Tear the relay down. `from_down`/`from_up` name the side that
@@ -103,7 +105,7 @@ pub fn Relay(comptime Listener: type) type {
                 var it = self.by_up.valueIterator();
                 while (it.next()) |p| {
                     _ = self.relay.down_streams.remove(.{ .conn = self.down_conn, .id = p.*.down_stream });
-                    a.destroy(p.*);
+                    p.*.deinit(a);
                 }
                 self.by_up.deinit(a);
                 _ = self.relay.sessions.remove(.{ .conn = self.down_conn, .id = self.down_sid });
@@ -122,6 +124,16 @@ pub fn Relay(comptime Listener: type) type {
             down_paused: bool = false,
             /// We stopped reading the upstream's stream: the client is behind.
             up_paused: bool = false,
+            /// What the upstream's session credit refused, bound for it.
+            to_up: Held = .{},
+            /// What the client's session credit refused, bound for it.
+            to_down: Held = .{},
+
+            fn deinit(p: *Pair, a: std.mem.Allocator) void {
+                p.to_up.bytes.deinit(a);
+                p.to_down.bytes.deinit(a);
+                a.destroy(p);
+            }
 
             fn upBacklog(p: *const Pair) u64 {
                 return p.rs.up.client.conn.streamBufferedBytes(p.up_stream) orelse 0;
@@ -132,6 +144,74 @@ pub fn Relay(comptime Listener: type) type {
                 return d.streamBufferedBytes(p.down_stream) orelse 0;
             }
         };
+
+        /// Bytes, and the FIN behind them, that the destination's session
+        /// credit refused. The source stays paused while any are held.
+        const Held = struct {
+            bytes: std.ArrayListUnmanaged(u8) = .empty,
+            fin: bool = false,
+
+            fn empty(h: *const Held) bool {
+                return h.bytes.items.len == 0;
+            }
+        };
+
+        /// Largest wait `onWritable` is asked for, so a big held chunk drains
+        /// as credit trickles in instead of waiting for all of it at once.
+        const writable_chunk = 16 * 1024;
+
+        /// Forward `data` to `dst`, holding whatever its session credit
+        /// refuses. False when bytes are held and the source must pause.
+        fn forward(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held, data: []const u8, fin: bool) bool {
+            var rest = data;
+            if (held.empty()) {
+                if (data.len > 0) rest = data[sendSome(dst, stream, data)..];
+                if (rest.len == 0) {
+                    if (fin) dst.closeStream(stream);
+                    return true;
+                }
+            }
+            held.bytes.appendSlice(a, rest) catch {
+                dst.resetStream(stream, relay_error);
+                return true;
+            };
+            if (fin) held.fin = true;
+            dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};
+            return false;
+        }
+
+        /// Send what `dst` now admits of `held`. True once it is all gone.
+        fn drain(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held) bool {
+            if (held.empty()) return true;
+            const items = held.bytes.items;
+            const n = sendSome(dst, stream, items);
+            std.mem.copyForwards(u8, items[0 .. items.len - n], items[n..]);
+            held.bytes.items.len -= n;
+            if (!held.empty()) {
+                dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};
+                return false;
+            }
+            held.bytes.clearAndFree(a);
+            if (held.fin) dst.closeStream(stream);
+            held.fin = false;
+            return true;
+        }
+
+        /// Write as much of `data` as `dst` takes; the count taken. QUIC
+        /// buffers past its own flow control, so only WT_MAX_DATA refuses.
+        fn sendSome(dst: anytype, stream: u64, data: []const u8) usize {
+            dst.sendStreamData(stream, data) catch |err| switch (err) {
+                error.WtDataLimitReached => {
+                    // Gone streams report no capacity: nothing left to hold for.
+                    const n = @min(dst.streamSendCapacity(stream) orelse return data.len, data.len);
+                    if (n == 0) return 0;
+                    dst.sendStreamData(stream, data[0..n]) catch return data.len;
+                    return n;
+                },
+                else => return data.len,
+            };
+            return data.len;
+        }
 
         /// The upstream client and its handler; outlives its session until
         /// the client is off the loop.
@@ -218,13 +298,20 @@ pub fn Relay(comptime Listener: type) type {
                 const r = self.rs() orelse return;
                 const p = r.by_up.get(stream_id) orelse return;
                 var d = r.down();
-                if (data.len > 0) d.sendStreamData(p.down_stream, data) catch {};
-                if (fin) return d.closeStream(p.down_stream);
-                if (!p.up_paused and p.downBacklog() > high_water) {
+                const sent = forward(r.worker.alloc, &d, r.down_sid, p.down_stream, &p.to_down, data, fin);
+                if (fin) return;
+                if (!p.up_paused and (!sent or p.downBacklog() > high_water)) {
                     var u = r.upSession();
                     u.pauseStream(p.up_stream) catch return;
                     p.up_paused = true;
                 }
+            }
+
+            pub fn onWritable(self: *UpHandler, _: *event_loop.ClientSession, _: u64, stream_id: ?u64) void {
+                const r = self.rs() orelse return;
+                const p = r.by_up.get(stream_id orelse return) orelse return;
+                var u = r.upSession();
+                if (drain(r.worker.alloc, &u, r.up_sid orelse return, p.up_stream, &p.to_up)) resumeCaughtUp(p);
             }
 
             pub fn onDatagram(self: *UpHandler, _: *event_loop.ClientSession, _: u64, data: []const u8) void {
@@ -350,10 +437,10 @@ pub fn Relay(comptime Listener: type) type {
             const p = self.down_streams.get(.{ .conn = session.id(), .id = stream_id }) orelse return;
             const r = p.rs;
             var u = r.upSession();
-            if (data.len > 0) u.sendStreamData(p.up_stream, data) catch {};
-            if (fin) u.closeStream(p.up_stream);
+            const sid = r.up_sid orelse return;
+            const sent = forward(r.worker.alloc, &u, sid, p.up_stream, &p.to_up, data, fin);
             r.up.flush();
-            if (!fin and !p.down_paused and p.upBacklog() > high_water) {
+            if (!fin and !p.down_paused and (!sent or p.upBacklog() > high_water)) {
                 session.pauseStream(stream_id) catch return;
                 p.down_paused = true;
             }
@@ -363,19 +450,19 @@ pub fn Relay(comptime Listener: type) type {
         /// worker tick.
         pub fn checkPaused(self: *Self) void {
             var it = self.down_streams.valueIterator();
-            while (it.next()) |pp| {
-                const p = pp.*;
-                if (p.down_paused and p.upBacklog() < low_water) {
-                    p.down_paused = false;
-                    var d = p.rs.down();
-                    d.resumeStream(p.down_stream);
-                }
-                if (p.up_paused and p.downBacklog() < low_water) {
-                    p.up_paused = false;
-                    var u = p.rs.upSession();
-                    u.resumeStream(p.up_stream);
-                    p.rs.up.flush();
-                }
+            while (it.next()) |pp| resumeCaughtUp(pp.*);
+        }
+
+        fn resumeCaughtUp(p: *Pair) void {
+            if (p.down_paused and p.to_up.empty() and p.upBacklog() < low_water) {
+                p.down_paused = false;
+                var d = p.rs.down();
+                d.resumeStream(p.down_stream);
+            }
+            if (p.up_paused and p.to_down.empty() and p.downBacklog() < low_water) {
+                p.up_paused = false;
+                var u = p.rs.upSession();
+                u.resumeStream(p.up_stream);
             }
         }
 
@@ -406,7 +493,10 @@ pub fn Relay(comptime Listener: type) type {
             r.close(error_code, reason, true, false);
         }
 
-        pub fn onWritable(_: *Self, _: *event_loop.Session, _: u64, _: ?u64) void {}
+        pub fn onWritable(self: *Self, session: *event_loop.Session, _: u64, stream_id: ?u64) void {
+            const p = self.down_streams.get(.{ .conn = session.id(), .id = stream_id orelse return }) orelse return;
+            if (drain(p.rs.worker.alloc, session, p.rs.down_sid, p.down_stream, &p.to_down)) resumeCaughtUp(p);
+        }
 
         pub fn onConnectionClosed(self: *Self, session: *event_loop.Session) void {
             const conn = session.id();
