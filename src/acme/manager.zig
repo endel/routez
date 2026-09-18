@@ -201,9 +201,7 @@ pub const Manager = struct {
         const a = arena_state.allocator();
         const path = storage.bundlePath(a, job.acme, job.names) catch return true;
         const b = storage.loadBundle(a, path, job.names) catch return true;
-        const now = quic.sys.realtimeSeconds();
-        const left = @as(i64, @intCast(b.not_after)) - now;
-        return left < @as(i64, job.acme.renew_days) * 86400;
+        return storage.renewalDue(b, quic.sys.realtimeSeconds(), job.acme.renew_days);
     }
 
     fn challengeSink(self: *Manager) ChallengeSink {

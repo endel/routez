@@ -80,7 +80,8 @@ pub const Acme = struct {
     /// PEM bundle trusted for the directory's HTTPS instead of the system
     /// store; for test CAs such as Pebble.
     ca_file: ?[]const u8 = null,
-    /// Renew when the certificate has fewer days than this left.
+    /// Renew when the certificate has fewer days than this left (or less
+    /// than half its lifetime, for certificates shorter than twice this).
     renew_days: u16 = 30,
     /// How often stored certificates are checked for renewal.
     check_interval_s: u32 = 12 * 3600,

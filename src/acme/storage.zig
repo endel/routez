@@ -36,6 +36,7 @@ pub fn bundlePath(a: std.mem.Allocator, acme: config.Acme, names: []const []cons
 pub const Bundle = struct {
     chain: []const []const u8,
     key: x509.KeyPair,
+    not_before: u64,
     not_after: u64,
 };
 
@@ -48,7 +49,16 @@ pub fn loadBundle(a: std.mem.Allocator, path: []const u8, names: []const []const
     const not_after = x509.coveredUntil(chain[0], names) orelse return error.NamesNotCovered;
     const parsed = try (std.crypto.Certificate{ .buffer = chain[0], .index = 0 }).parse();
     if (!std.mem.eql(u8, parsed.pubKey(), &key.public_key.toUncompressedSec1())) return error.KeyMismatch;
-    return .{ .chain = chain, .key = key, .not_after = not_after };
+    return .{ .chain = chain, .key = key, .not_before = parsed.validity.not_before, .not_after = not_after };
+}
+
+/// Renew once fewer than `renew_days` remain, or half the lifetime, whichever
+/// comes later: a certificate shorter-lived than the window would otherwise be
+/// renewed again as soon as it arrives.
+pub fn renewalDue(b: Bundle, now: i64, renew_days: u16) bool {
+    const lifetime: i64 = @as(i64, @intCast(b.not_after)) - @as(i64, @intCast(b.not_before));
+    const window = @min(@as(i64, renew_days) * 86400, @divTrunc(lifetime, 2));
+    return @as(i64, @intCast(b.not_after)) - now < window;
 }
 
 /// Write `bytes` to `path` with mode 0600, atomically replacing any old file.
@@ -122,6 +132,17 @@ test "paths are per CA" {
     const names = [_][]const u8{"example.com"};
     try std.testing.expectEqualStrings("/s/acme-v02.api.letsencrypt.org/example.com.pem", try bundlePath(a, .{ .storage = "/s" }, &names));
     try std.testing.expectEqualStrings("/s/localhost_14000/account.key", try accountKeyPath(a, .{ .storage = "/s", .directory = "https://localhost:14000/dir" }));
+}
+
+test "renewal window" {
+    const day = 86400;
+    const b: Bundle = .{ .chain = &.{}, .key = undefined, .not_before = 0, .not_after = 90 * day };
+    try std.testing.expect(!renewalDue(b, 59 * day, 30));
+    try std.testing.expect(renewalDue(b, 61 * day, 30));
+    // A 6-day certificate renews at half-life, not straight away.
+    const short: Bundle = .{ .chain = &.{}, .key = undefined, .not_before = 0, .not_after = 6 * day };
+    try std.testing.expect(!renewalDue(short, 1 * day, 30));
+    try std.testing.expect(renewalDue(short, 4 * day, 30));
 }
 
 test "bundle round trip through writeAtomic" {
