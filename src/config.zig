@@ -85,6 +85,9 @@ pub const Acme = struct {
     renew_days: u16 = 30,
     /// How often stored certificates are checked for renewal.
     check_interval_s: u32 = 12 * 3600,
+    /// Longest one attempt at a certificate may take, network waits
+    /// included, before it is abandoned and retried later.
+    order_timeout_s: u32 = 300,
 };
 
 pub const Server = struct {
@@ -312,6 +315,7 @@ fn checkTls(cfg: *const Config, srv: *const Server, t: Tls) error{InvalidConfig}
     if (acme.storage.len == 0) return fail("acme storage must be set", .{});
     if (acme.renew_days == 0) return fail("acme renew_days must be > 0", .{});
     if (acme.check_interval_s == 0) return fail("acme check_interval_s must be > 0", .{});
+    if (acme.order_timeout_s == 0) return fail("acme order_timeout_s must be > 0", .{});
     // HTTP-01 is answered on plain-HTTP listeners; the CA connects to port 80.
     var has_plain = false;
     var has_port_80 = false;

@@ -210,6 +210,7 @@ pub const Manager = struct {
             const a = arena_state.allocator();
             const jobs = self.snapshot(a) catch &.{};
 
+            const round_start = self.nowSeconds();
             var next_s: i64 = 3600;
             var renewed = false;
             for (jobs, 0..) |job, i| {
@@ -224,7 +225,7 @@ pub const Manager = struct {
                 // Work in hand (an order or a certificate) goes on regardless.
                 if (st.order_url == null and st.bundle == null and !self.due(job)) continue;
                 var retry_after: ?u32 = null;
-                self.attempt(job, path, st, &retry_after) catch |err| {
+                self.attemptWithDeadline(job, path, st, &retry_after) catch |err| {
                     st.failures = @min(st.failures + 1, 6);
                     const backoff = backoffFor(st.failures, retry_after, err == error.CertificateMismatch, job.acme.check_interval_s);
                     st.retry_at_s = self.nowSeconds() + backoff;
@@ -236,6 +237,8 @@ pub const Manager = struct {
                 // A job dropped by a reload meanwhile mustn't reload again.
                 if (self.stillWanted(job)) renewed = true;
             }
+            const took = self.nowSeconds() - round_start;
+            if (took > 60) log.warn("certificate round took {d} s", .{took});
             // One reload for the whole round.
             if (renewed) self.on_renewed();
 
@@ -276,6 +279,36 @@ pub const Manager = struct {
             }
         };
         return .{ .ptr = self, .put = S.put, .remove = S.remove };
+    }
+
+    /// `attempt` bounded by `order_timeout_s`: a CA that stops answering
+    /// would otherwise hold the thread, and every other certificate, forever.
+    fn attemptWithDeadline(self: *Manager, job: Job, path: []const u8, st: *State, retry_after: *?u32) anyerror!void {
+        var done: std.atomic.Value(bool) = .init(false);
+        var future = self.io.concurrent(attemptTask, .{ self, job, path, st, retry_after, &done }) catch {
+            return self.attempt(job, path, st, retry_after);
+        };
+        const deadline = self.nowSeconds() + job.acme.order_timeout_s;
+        while (!done.load(.acquire)) {
+            if (self.nowSeconds() >= deadline) {
+                // Interrupts the blocked socket call; the task unwinds.
+                future.cancel(self.io) catch |err| {
+                    if (err == error.Canceled) {
+                        log.err("{s}: no result from the CA within {d} s; attempt abandoned", .{ job.names[0], job.acme.order_timeout_s });
+                        return error.AcmeTimeout;
+                    }
+                    return err;
+                };
+                return;
+            }
+            self.io.sleep(.fromMilliseconds(200), .awake) catch {};
+        }
+        return future.await(self.io);
+    }
+
+    fn attemptTask(self: *Manager, job: Job, path: []const u8, st: *State, retry_after: *?u32, done: *std.atomic.Value(bool)) anyerror!void {
+        defer done.store(true, .release);
+        return self.attempt(job, path, st, retry_after);
     }
 
     /// Order (or resume the order for) `job`'s certificate and store it.
