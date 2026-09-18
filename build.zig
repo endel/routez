@@ -33,6 +33,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "quic", .module = quic_mod }},
     }) });
     b.step("wt-test-client", "Build the WebTransport e2e client").dependOn(&b.addInstallArtifact(wt_client, .{}).step);
+    const wt_slow = b.addExecutable(.{ .name = "wt-slow-server", .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/e2e/wt_slow_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "quic", .module = quic_mod }},
+    }) });
+    b.step("wt-slow-server", "Build the slow WebTransport upstream").dependOn(&b.addInstallArtifact(wt_slow, .{}).step);
 
     // Certificates and CSRs for tests/acme/run.sh.
     const test_cert = b.addExecutable(.{ .name = "acme-test-tool", .root_module = b.createModule(.{

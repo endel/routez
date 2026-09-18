@@ -23,6 +23,7 @@
             .{ .prefix = "/slow/", .proxy_pass = "slow", .strip_prefix = true },
             .{ .prefix = "/slowup/", .proxy_pass = "127.0.0.1:19004", .strip_prefix = true },
             .{ .prefix = "/.well-known/webtransport", .webtransport_pass = "127.0.0.1:4450" },
+            .{ .prefix = "/wt-slow", .webtransport_pass = "127.0.0.1:4451" },
         },
     }},
     .upstreams = .{
