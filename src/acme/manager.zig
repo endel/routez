@@ -94,6 +94,35 @@ pub fn jobsFor(a: std.mem.Allocator, cfg: *const config.Config) ![]Job {
     return jobs.items;
 }
 
+/// What the thread remembers about one certificate between rounds.
+const State = struct {
+    /// Leave the CA alone until then (awake-clock seconds).
+    retry_at_s: i64 = 0,
+    failures: u6 = 0,
+    /// Finalized, not downloaded yet: the order and the key its CSR used.
+    order_url: ?[]u8 = null,
+    cert_key: ?x509.KeyPair = null,
+    /// Issued but not stored yet: chain then key, ready to write.
+    bundle: ?[]u8 = null,
+
+    fn clearOrder(st: *State, gpa: std.mem.Allocator) void {
+        if (st.order_url) |u| gpa.free(u);
+        st.order_url = null;
+        st.cert_key = null;
+    }
+};
+
+/// Seconds before trying a certificate again after `failures` failures in a
+/// row: 1 min doubling to 32 min, since CAs rate-limit failed validations,
+/// but never sooner than the CA's Retry-After. A certificate the CA got wrong
+/// would come back the same, so that waits for the next check.
+fn backoffFor(failures: u6, retry_after_s: ?u32, mismatch: bool, check_interval_s: u32) i64 {
+    var backoff: i64 = @as(i64, 60) << (@max(failures, 1) - 1);
+    if (retry_after_s) |r| backoff = @max(backoff, r);
+    if (mismatch) backoff = @max(backoff, check_interval_s);
+    return backoff;
+}
+
 pub const Manager = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -107,6 +136,8 @@ pub const Manager = struct {
     jobs: []const Job = &.{},
     wake: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// Only touched by the thread.
+    states: std.StringHashMapUnmanaged(State) = .empty,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, on_renewed: *const fn () void) !*Manager {
         const m = try gpa.create(Manager);
@@ -155,51 +186,81 @@ pub const Manager = struct {
         return false;
     }
 
+    fn nowSeconds(self: *Manager) i64 {
+        return std.Io.Clock.awake.now(self.io).toSeconds();
+    }
+
+    fn stateFor(self: *Manager, path: []const u8) !*State {
+        const gop = try self.states.getOrPut(self.gpa, path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, path) catch |err| {
+                self.states.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
     fn run(self: *Manager) void {
-        var failures: u6 = 0;
         while (true) {
             self.wake.store(false, .release);
             var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena_state.deinit();
-            const jobs = self.snapshot(arena_state.allocator()) catch &.{};
+            const a = arena_state.allocator();
+            const jobs = self.snapshot(a) catch &.{};
 
-            var next_s: u64 = 3600;
-            var failed = false;
+            var next_s: i64 = 3600;
             var renewed = false;
             for (jobs, 0..) |job, i| {
                 if (i == 0 or job.acme.check_interval_s < next_s) next_s = job.acme.check_interval_s;
-                if (!self.due(job)) continue;
-                self.obtain(job) catch |err| {
-                    log.err("certificate for {s}: {s}", .{ job.names[0], @errorName(err) });
-                    failed = true;
+                const path = storage.bundlePath(a, job.acme, job.names) catch continue;
+                const st = self.stateFor(path) catch continue;
+                const now = self.nowSeconds();
+                if (now < st.retry_at_s) {
+                    next_s = @min(next_s, st.retry_at_s - now);
+                    continue;
+                }
+                // Work in hand (an order or a certificate) goes on regardless.
+                if (st.order_url == null and st.bundle == null and !self.due(job)) continue;
+                var retry_after: ?u32 = null;
+                self.attempt(job, path, st, &retry_after) catch |err| {
+                    st.failures = @min(st.failures + 1, 6);
+                    const backoff = backoffFor(st.failures, retry_after, err == error.CertificateMismatch, job.acme.check_interval_s);
+                    st.retry_at_s = self.nowSeconds() + backoff;
+                    next_s = @min(next_s, backoff);
+                    log.err("certificate for {s}: {s}; retrying in {d} s", .{ job.names[0], @errorName(err), backoff });
                     continue;
                 };
+                st.failures = 0;
                 // A job dropped by a reload meanwhile mustn't reload again.
                 if (self.stillWanted(job)) renewed = true;
             }
             // One reload for the whole round.
             if (renewed) self.on_renewed();
-            if (failed) {
-                // 1 min doubling to 32 min: CAs rate-limit failed validations.
-                failures = @min(failures + 1, 6);
-                next_s = @min(next_s, @as(u64, 60) << (failures - 1));
-            } else failures = 0;
 
-            var waited: u64 = 0;
+            var waited: i64 = 0;
             while (waited < next_s and !self.wake.load(.acquire)) : (waited += 1) {
                 self.io.sleep(.fromSeconds(1), .awake) catch {};
             }
         }
     }
 
-    /// Whether `job` needs a certificate now: none stored, or one that is
-    /// unusable or inside the renewal window.
+    /// Whether `job` needs a certificate now: none stored for these names, or
+    /// one inside the renewal window. A file that can't be read for other
+    /// reasons is left alone: ordering wouldn't help and costs CA limits.
     fn due(self: *Manager, job: Job) bool {
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const path = storage.bundlePath(a, job.acme, job.names) catch return true;
-        const b = storage.loadBundle(a, path, job.names) catch return true;
+        const path = storage.bundlePath(a, job.acme, job.names) catch return false;
+        const b = storage.loadBundle(a, path, job.names) catch |err| switch (err) {
+            error.FileNotFound, error.NamesNotCovered, error.CorruptBundle => return true,
+            else => {
+                log.err("{s}: {s}; not renewing until it can be read", .{ path, @errorName(err) });
+                return false;
+            },
+        };
         return storage.renewalDue(b, quic.sys.realtimeSeconds(), job.acme.renew_days);
     }
 
@@ -217,30 +278,52 @@ pub const Manager = struct {
         return .{ .ptr = self, .put = S.put, .remove = S.remove };
     }
 
-    fn obtain(self: *Manager, job: Job) !void {
-        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena_state.deinit();
-        const a = arena_state.allocator();
-        log.info("requesting a certificate for {s} from {s}", .{ job.names[0], job.acme.directory });
+    /// Order (or resume the order for) `job`'s certificate and store it.
+    /// Progress is kept in `st`, so a failure after issuance neither loses
+    /// the certificate nor orders another.
+    fn attempt(self: *Manager, job: Job, path: []const u8, st: *State, retry_after: *?u32) anyerror!void {
+        if (st.bundle == null) {
+            try storage.probeWritable(self.io, job.acme);
+            const account = try storage.loadOrCreateAccountKey(self.gpa, self.io, job.acme);
+            var client = try Client.init(self.gpa, self.io, job.acme.directory, job.acme.ca_file, account);
+            defer client.deinit();
+            errdefer retry_after.* = client.retry_after_s;
+            try client.register(job.acme.email);
 
-        const account = try storage.loadOrCreateAccountKey(self.gpa, self.io, job.acme);
-        var client = try Client.init(self.gpa, self.io, job.acme.directory, job.acme.ca_file, account);
-        defer client.deinit();
-        try client.register(job.acme.email);
+            const chain_pem = if (st.order_url) |url| blk: {
+                log.info("resuming the order for {s}", .{job.names[0]});
+                break :blk client.resumeOrder(url) catch |err| {
+                    // Gone or failed at the CA: next time, a new order.
+                    if (err == error.AcmeOrderFailed or err == error.AcmeRequestFailed) st.clearOrder(self.gpa);
+                    return err;
+                };
+            } else blk: {
+                log.info("requesting a certificate for {s} from {s}", .{ job.names[0], job.acme.directory });
+                st.cert_key = x509.KeyPair.generate(self.io);
+                break :blk client.issue(job.names, st.cert_key.?, self.challengeSink(), &st.order_url) catch |err| {
+                    if (st.order_url == null) st.cert_key = null;
+                    return err;
+                };
+            };
+            defer self.gpa.free(chain_pem);
+            const cert_key = st.cert_key.?;
+            st.clearOrder(self.gpa);
 
-        const cert_key = x509.KeyPair.generate(self.io);
-        const chain_pem = try client.issue(job.names, cert_key, self.challengeSink());
-        defer self.gpa.free(chain_pem);
-
-        const chain = try quic.tls13.parsePemCertChain(a, chain_pem);
-        const not_after = x509.coveredUntil(chain[0], job.names) orelse return error.CertificateMismatch;
-        const key_pem = try x509.privateKeyPem(a, cert_key);
-        defer std.crypto.secureZero(u8, key_pem);
-        const bundle = try std.mem.concat(a, u8, &.{ chain_pem, if (std.mem.endsWith(u8, chain_pem, "\n")) "" else "\n", key_pem });
-        defer std.crypto.secureZero(u8, bundle);
-        const path = try storage.bundlePath(a, job.acme, job.names);
+            var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            const chain = quic.tls13.parsePemCertChain(a, chain_pem) catch return error.CertificateMismatch;
+            if (x509.coveredUntil(chain[0], job.names) == null) return error.CertificateMismatch;
+            const key_pem = try x509.privateKeyPem(a, cert_key);
+            defer std.crypto.secureZero(u8, key_pem);
+            st.bundle = try std.mem.concat(self.gpa, u8, &.{ chain_pem, if (std.mem.endsWith(u8, chain_pem, "\n")) "" else "\n", key_pem });
+        }
+        const bundle = st.bundle.?;
         try storage.writeAtomic(self.io, path, bundle);
-        log.info("certificate for {s} stored in {s}, valid for {d} days", .{ job.names[0], path, @divTrunc(@as(i64, @intCast(not_after)) - quic.sys.realtimeSeconds(), 86400) });
+        std.crypto.secureZero(u8, bundle);
+        self.gpa.free(bundle);
+        st.bundle = null;
+        log.info("certificate for {s} stored in {s}", .{ job.names[0], path });
     }
 };
 
@@ -274,4 +357,13 @@ test "jobs are deduplicated by names and CA" {
         \\} }
     , "test");
     try std.testing.expectEqual(@as(usize, 2), (try jobsFor(a, &cfg)).len);
+}
+
+test "backoff honours Retry-After" {
+    try std.testing.expectEqual(@as(i64, 60), backoffFor(1, null, false, 43200));
+    try std.testing.expectEqual(@as(i64, 1920), backoffFor(6, null, false, 43200));
+    // A rate limit's Retry-After outlasts the exponential backoff.
+    try std.testing.expectEqual(@as(i64, 7200), backoffFor(1, 7200, false, 43200));
+    try std.testing.expectEqual(@as(i64, 120), backoffFor(2, 30, false, 43200));
+    try std.testing.expectEqual(@as(i64, 43200), backoffFor(1, null, true, 43200));
 }
