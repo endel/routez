@@ -281,6 +281,20 @@ pub fn Socket(comptime Owner: type) type {
     };
 }
 
+/// Accept one queued connection without waiting; null when none is queued.
+pub fn acceptNow(listen_fd: std.posix.socket_t) ?std.posix.socket_t {
+    if (comptime builtin.os.tag == .linux) {
+        const fd = std.c.accept4(listen_fd, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC);
+        return if (fd < 0) null else fd;
+    }
+    const fd = std.c.accept(listen_fd, null, null);
+    if (fd < 0) return null;
+    const nonblock: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
+    _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(nonblock)));
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+    return fd;
+}
+
 pub fn setNoDelay(fd: std.posix.socket_t) void {
     const one: c_int = 1;
     _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));

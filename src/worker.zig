@@ -497,6 +497,14 @@ pub const Listener = struct {
         if (self.closed) return;
         self.closed = true;
         self.worker.timers.clear(&self.retry);
+        // Serve what is already queued: closing a listener resets the
+        // connections in its backlog, which a reload shouldn't do.
+        while (socket.acceptNow(self.tcp.fd)) |fd| {
+            stats.inc(&stats.accepted);
+            _ = H1Conn.create(self.worker, self, xev.TCP.initFd(fd)) catch {
+                _ = std.c.close(fd);
+            };
+        }
         if (!self.accepting) {
             _ = std.c.close(self.tcp.fd);
             return;
@@ -511,6 +519,16 @@ pub const Listener = struct {
 
     fn onAcceptCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
         const self: *Listener = @ptrCast(@alignCast(ud.?));
+        // libxev's epoll backend accepts on a dup of the fd and doesn't close
+        // it when the accept is cancelled; left open, it keeps the socket in
+        // the SO_REUSEPORT group, taking connections nobody will accept.
+        const flags = &self.accept_c.flags;
+        if (comptime @hasField(@TypeOf(flags.*), "dup_fd")) {
+            if (flags.dup and flags.dup_fd > 0) {
+                _ = std.c.close(flags.dup_fd);
+                flags.dup_fd = 0;
+            }
+        }
         _ = std.c.close(self.tcp.fd);
         return .disarm;
     }
