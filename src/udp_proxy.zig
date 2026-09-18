@@ -221,6 +221,7 @@ const Flow = struct {
     cancelling: bool = false,
     closing: bool = false,
     idle: timers.Deadline = .{ .callback = onIdle },
+    free_cb: timers.Deferred = .{ .callback = onFree },
 
     fn create(proxy: *UdpProxy, key: AddrKey, client: *const posix.sockaddr.storage, peer: *upstream.Peer) !*Flow {
         const w = proxy.worker;
@@ -332,6 +333,13 @@ const Flow = struct {
 
     fn maybeFree(self: *Flow) void {
         if (!self.closing or self.polling or self.cancelling) return;
+        // Deferred: this can run inside the poll callback, and epoll
+        // deregisters the fd after that callback returns.
+        self.proxy.worker.timers.defer_(&self.free_cb);
+    }
+
+    fn onFree(d: *timers.Deferred) void {
+        const self: *Flow = @fieldParentPtr("free_cb", d);
         sys.close(self.fd);
         self.proxy.worker.alloc.destroy(self);
     }

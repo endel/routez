@@ -51,6 +51,7 @@ pub fn Socket(comptime Owner: type) type {
         pending: std.ArrayListUnmanaged(u8) = .empty,
 
         state: State = .open,
+        fd_closed: bool = false,
         read_buf: [read_buffer_size]u8 = undefined,
 
         pub const State = enum {
@@ -261,7 +262,9 @@ pub fn Socket(comptime Owner: type) type {
             if (self.state != .closing) return;
             if (self.reading or self.writing or self.connecting) return;
             self.state = .closed;
-            _ = std.c.close(self.tcp.fd);
+            // The fd is closed from the deferred callback, not here: this
+            // may run inside a completion's callback, and libxev's epoll
+            // backend deregisters that fd after the callback returns.
             self.active.clearAndFree(self.alloc);
             self.pending.clearAndFree(self.alloc);
             self.timers.defer_(&self.closed_cb);
@@ -269,6 +272,10 @@ pub fn Socket(comptime Owner: type) type {
 
         fn onDeferredClose(d: *timers.Deferred) void {
             const self: *Self = @fieldParentPtr("closed_cb", d);
+            if (!self.fd_closed) {
+                self.fd_closed = true;
+                _ = std.c.close(self.tcp.fd);
+            }
             Owner.onSocketClosed(self.owner);
         }
     };
