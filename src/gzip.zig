@@ -84,9 +84,9 @@ pub fn compressible(content_type: ?[]const u8) bool {
     const base = std.mem.trim(u8, ct[0 .. std.mem.indexOfScalar(u8, ct, ';') orelse ct.len], " \t");
     if (std.ascii.startsWithIgnoreCase(base, "text/")) return !std.ascii.eqlIgnoreCase(base, "text/event-stream");
     const types = [_][]const u8{
-        "application/json",       "application/javascript", "application/xml",
-        "application/wasm",       "image/svg+xml",          "application/manifest+json",
-        "application/x-javascript", "application/ld+json",  "application/rss+xml",
+        "application/json",         "application/javascript", "application/xml",
+        "application/wasm",         "image/svg+xml",          "application/manifest+json",
+        "application/x-javascript", "application/ld+json",    "application/rss+xml",
     };
     for (types) |t| if (std.ascii.eqlIgnoreCase(base, t)) return true;
     return std.ascii.endsWithIgnoreCase(base, "+json") or std.ascii.endsWithIgnoreCase(base, "+xml");

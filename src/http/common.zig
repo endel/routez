@@ -10,9 +10,9 @@ pub const Header = struct {
 /// (RFC 9110 §7.6.1), plus framing headers each hop recomputes.
 pub fn isHopByHop(name: []const u8) bool {
     const list = [_][]const u8{
-        "connection",        "keep-alive",          "proxy-connection",
-        "te",                "trailer",             "transfer-encoding",
-        "upgrade",           "proxy-authenticate",  "proxy-authorization",
+        "connection",     "keep-alive",         "proxy-connection",
+        "te",             "trailer",            "transfer-encoding",
+        "upgrade",        "proxy-authenticate", "proxy-authorization",
         "content-length",
     };
     for (list) |h| {

@@ -34,6 +34,10 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Format
+        working-directory: routez
+        run: zig fmt --check src tests build.zig
+
       - name: Build
         working-directory: routez
         run: zig build && zig build -Doptimize=ReleaseSafe
