@@ -1,0 +1,12 @@
+# wrk's TLS client: offer only X25519. OpenSSL 3.5 also sends an ML-KEM key
+# share by default, which the servers don't pick but wrk still has to make.
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+Groups = X25519
