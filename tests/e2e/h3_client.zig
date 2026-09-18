@@ -1,6 +1,8 @@
 //! Sequential HTTP/3 GETs over one connection, for the migration check:
 //! exits 0 once `count` responses of 200 came back, 1 on failure or after
-//! 15 s. Usage: h3-test-client PORT CA_FILE COUNT
+//! 15 s. Usage: h3-test-client PORT CA_FILE COUNT [idle]
+//! With `idle` the connection is left open after the last response, for
+//! checking the server's idle timeout.
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -9,6 +11,7 @@ const qpack = quic.qpack;
 const Client = struct {
     pub const protocol: event_loop.Protocol = .h3;
     want: u32,
+    idle: bool = false,
     done: u32 = 0,
     ok: bool = true,
 
@@ -42,7 +45,11 @@ const Client = struct {
 
     pub fn onFinished(self: *Client, session: *event_loop.ClientSession, _: u64) void {
         self.done += 1;
-        if (!self.ok or self.done >= self.want) return session.closeConnection();
+        if (!self.ok) return session.closeConnection();
+        if (self.done >= self.want) {
+            if (self.idle) return std.debug.print("h3-idle\n", .{});
+            return session.closeConnection();
+        }
         self.send(session);
     }
 };
@@ -59,7 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
     const want = try std.fmt.parseInt(u32, args[3], 10);
     (try std.Thread.spawn(.{}, watchdog, .{})).detach();
 
-    var handler: Client = .{ .want = want };
+    var handler: Client = .{ .want = want, .idle = args.len > 4 and std.mem.eql(u8, args[4], "idle") };
     var client = try event_loop.Client(Client).init(std.heap.page_allocator, &handler, .{
         .port = port,
         .server_name = "localhost",

@@ -186,6 +186,10 @@ Relative numbers only; a VM is not a benchmark machine.
 - During a reload, new QUIC connections that the kernel hands to the old
   generation's sockets are refused until it finishes draining (up to 10 s);
   browsers fall back to TCP meanwhile.
+- QUIC connections close after `limits.quic_idle_timeout_ms` of silence
+  (30 s by default). Each end uses the smaller of the two advertised values,
+  so raising it only helps clients that advertise more; a client that
+  vanishes holds its connection slot until the timeout.
 - `limit_req` and per-IP limits count per worker, so the effective limit is
   multiplied by the number of workers.
 - With several workers, a QUIC client that changes address can land on a

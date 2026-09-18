@@ -78,7 +78,14 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             self.handler.listener = self;
             const certs = tc.certs;
             const is_v6 = std.mem.indexOfScalar(u8, l.address, ':') != null;
+            // An explicit conn_config replaces quic-zig's defaults, so restate them.
+            var conn_config: quic.connection.ConnectionConfig = .{
+                .token_key = w.shared.quic_keys.retry,
+                .max_idle_timeout = w.cfg.limits.quic_idle_timeout_ms,
+            };
+            if (proto != .h3) conn_config.max_datagram_frame_size = (event_loop.Config{}).max_datagram_frame_size;
             self.server = try Server.init(w.alloc, &self.handler, .{
+                .conn_config = conn_config,
                 .address = l.address,
                 .port = l.port,
                 .ipv6 = is_v6,

@@ -41,6 +41,10 @@ pub const Limits = struct {
     header_timeout_ms: u32 = 30_000,
     /// Time a connection may go without any socket progress mid-request.
     io_timeout_ms: u32 = 60_000,
+    /// Silence after which a QUIC connection closes (RFC 9000 §10.1); the
+    /// shorter of this and the client's value applies. Raise it for clients
+    /// that ride out long outages; a vanished peer then holds its slot longer.
+    quic_idle_timeout_ms: u32 = 30_000,
     max_connections: u32 = 10_000,
     /// TCP connections one client address may hold per worker. 0 disables it.
     max_connections_per_ip: u32 = 0,
@@ -247,6 +251,8 @@ fn fail(comptime fmt: []const u8, args: anytype) error{InvalidConfig} {
 
 pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
     if (cfg.workers == 0) return fail("workers must be at least 1", .{});
+    // 0 would disable the idle timeout: dead peers would never be dropped.
+    if (cfg.limits.quic_idle_timeout_ms == 0) return fail("limits.quic_idle_timeout_ms must be at least 1", .{});
     if (cfg.servers.len == 0 and cfg.udp_proxies.len == 0) return fail("nothing to serve: no servers or udp_proxies", .{});
     for (cfg.udp_proxies) |u| {
         try checkTarget(cfg, u.proxy_pass);
@@ -433,6 +439,19 @@ test "reject location with two actions" {
     defer arena_state.deinit();
     try std.testing.expectError(error.InvalidConfig, parse(arena_state.allocator(),
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .proxy_pass = "a:1" }} }} }
+    , "test"));
+}
+
+test "quic idle timeout" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .limits = .{ .quic_idle_timeout_ms = 120000 }, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test");
+    try std.testing.expectEqual(@as(u32, 120_000), cfg.limits.quic_idle_timeout_ms);
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .limits = .{ .quic_idle_timeout_ms = 0 }, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
     , "test"));
 }
 
