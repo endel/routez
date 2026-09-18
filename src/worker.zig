@@ -354,6 +354,10 @@ pub const Worker = struct {
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
         self.sweepRateBuckets();
+        for (self.quic_listeners.items) |q| switch (q) {
+            .wt => |l| l.relay.checkPaused(),
+            .h3 => {},
+        };
         if (self.finishing) return self.pollFinish();
         if (self.stopping and !self.fresh_closed and self.timers.now_ms - self.stop_started_ms >= fresh_grace_ms) {
             // A connection that stays silent mustn't hold up the stop.
