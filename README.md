@@ -1,4 +1,4 @@
-# routez
+![routez](./routez.svg)
 
 An nginx-style edge server in Zig 0.16, on [libxev](https://github.com/mitchellh/libxev)
 and [quic-zig](../quic-zig). No C dependencies beyond libc.
