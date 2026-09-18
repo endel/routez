@@ -123,12 +123,15 @@ fn backoffFor(failures: u6, retry_after_s: ?u32, mismatch: bool, check_interval_
     return backoff;
 }
 
+/// How often an unapplied certificate reload is asked for again.
+const reload_retry_s = 10;
+
 pub const Manager = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     challenges: Challenges,
-    /// Called on the ACME thread once a certificate the current
-    /// configuration uses has been written.
+    /// Asks the supervisor to reload; may be called again if the reload
+    /// doesn't happen.
     on_renewed: *const fn () void,
 
     mutex: std.Io.Mutex = .init,
@@ -136,6 +139,10 @@ pub const Manager = struct {
     jobs: []const Job = &.{},
     wake: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// Certificates written, and how many of them a started generation has
+    /// loaded; while they differ the reload is asked for again.
+    written: std.atomic.Value(u64) = .init(0),
+    applied: std.atomic.Value(u64) = .init(0),
     /// Only touched by the thread.
     states: std.StringHashMapUnmanaged(State) = .empty,
 
@@ -143,6 +150,16 @@ pub const Manager = struct {
         const m = try gpa.create(Manager);
         m.* = .{ .gpa = gpa, .io = io, .challenges = .{ .gpa = gpa }, .on_renewed = on_renewed, .jobs_arena = .init(gpa) };
         return m;
+    }
+
+    /// Call before a generation loads certificates; pass the result to
+    /// `reloadApplied` once it has started.
+    pub fn reloadStarting(self: *Manager) u64 {
+        return self.written.load(.acquire);
+    }
+
+    pub fn reloadApplied(self: *Manager, seen: u64) void {
+        _ = self.applied.fetchMax(seen, .acq_rel);
     }
 
     /// Adopt the certificate list of a newly started generation. Starts the
@@ -203,6 +220,7 @@ pub const Manager = struct {
     }
 
     fn run(self: *Manager) void {
+        var last_signal_s: i64 = 0;
         while (true) {
             self.wake.store(false, .release);
             var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
@@ -240,11 +258,22 @@ pub const Manager = struct {
             const took = self.nowSeconds() - round_start;
             if (took > 60) log.warn("certificate round took {d} s", .{took});
             // One reload for the whole round.
-            if (renewed) self.on_renewed();
+            if (renewed) {
+                _ = self.written.fetchAdd(1, .acq_rel);
+                self.on_renewed();
+                last_signal_s = self.nowSeconds();
+            }
 
             var waited: i64 = 0;
             while (waited < next_s and !self.wake.load(.acquire)) : (waited += 1) {
                 self.io.sleep(.fromSeconds(1), .awake) catch {};
+                // A certificate-triggered reload that failed would leave the
+                // new certificate unserved; ask again.
+                if (self.written.load(.acquire) != self.applied.load(.acquire) and self.nowSeconds() - last_signal_s >= reload_retry_s) {
+                    log.warn("new certificate not loaded yet; asking for the reload again", .{});
+                    self.on_renewed();
+                    last_signal_s = self.nowSeconds();
+                }
             }
         }
     }
