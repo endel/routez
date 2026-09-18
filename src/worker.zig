@@ -136,10 +136,21 @@ pub const Worker = struct {
         /// Same in every worker and generation: a Retry token or stateless
         /// reset from one worker must hold up at any other.
         quic_keys: QuicKeys,
+        /// Trust anchors for each verified TLS upstream, by upstream name.
+        upstream_cas: []const UpstreamCa = &.{},
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
         pub const TlsListener = struct { address: []const u8, port: u16, cfg: *const tls.ServerConfig };
+
+        pub const UpstreamCa = struct { upstream: []const u8, bundle: *const std.crypto.Certificate.Bundle };
+
+        pub fn upstreamCa(self: *const Shared, upstream_name: []const u8) ?*const std.crypto.Certificate.Bundle {
+            for (self.upstream_cas) |u| {
+                if (std.mem.eql(u8, u.upstream, upstream_name)) return u.bundle;
+            }
+            return null;
+        }
 
         pub fn tlsFor(self: *const Shared, address: []const u8, port: u16) ?*const tls.ServerConfig {
             for (self.tls_listeners) |l| {

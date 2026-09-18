@@ -17,9 +17,11 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Static files: ranges, ETag / Last-Modified conditional requests, index
   files, directory redirects, path normalization, `try_files` fallbacks for
   single-page apps.
-- Reverse proxy to HTTP/1.1 upstreams: streaming in both directions with
-  backpressure, keep-alive connection pools, retries of replayable requests,
-  connect/read timeouts, WebSocket (Upgrade) tunnels, X-Forwarded-* headers.
+- Reverse proxy to HTTP/1.1 upstreams, plain or over TLS 1.3 (quic-zig's
+  sans-IO `tls_client`, with optional certificate verification): streaming
+  in both directions with backpressure, keep-alive connection pools, retries
+  of replayable requests, connect/read timeouts, WebSocket (Upgrade)
+  tunnels, X-Forwarded-* headers.
 - Load balancing: round robin, least connections, IP hash; passive failure
   tracking and active HTTP health checks.
 - Layer-4 UDP proxy for QUIC traffic, with QUIC-LB connection-ID routing.
@@ -95,6 +97,20 @@ A ZON file; see `src/config.zig` for every field and default.
 - `webtransport_pass` applies to WebTransport CONNECTs over HTTP/3. QUIC
   upstream certificates are not verified unless the upstream sets
   `tls_verify` or `tls_ca`.
+- An upstream with `.tls = true` is reached over HTTPS (TLS 1.3 only). As
+  with nginx's `proxy_ssl_verify off`, its certificate is not checked unless
+  the upstream sets `tls_verify = true` (system CA store) or
+  `tls_ca = "ca.pem"`. Verification checks the chain, the host name and the
+  handshake signature; `tls_server_name` overrides the name used for SNI and
+  the check, which is otherwise each server's host. A server given as an IP
+  address is matched against the certificate's IP addresses and gets no
+  SNI. A failed handshake counts as a failed connect: the request moves to
+  the next server, or gets a 502. Health checks use TLS too.
+
+  ```zig
+  .{ .name = "api", .servers = .{"10.0.0.7:443"}, .tls = true,
+     .tls_verify = true, .tls_server_name = "api.internal.example" },
+  ```
 - `root` follows nginx semantics: the full request path is appended.
 - `try_files = .{ "$uri", "$uri/", "/index.html" }` on a `root` location
   serves the first entry that is a file: `$uri` is the request path, an
@@ -255,5 +271,9 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   slow disks stall that worker.
 - Upstream pools and health state are per worker, so health checks run once
   per worker per interval.
+- TLS to upstreams: TLS 1.3 only, no session resumption (pooled keep-alive
+  connections avoid most handshakes), no client certificates and no
+  revocation checks. A literal `proxy_pass` target is always plain HTTP;
+  declare an upstream to use TLS.
 - macOS does not spread TCP connections across SO_REUSEPORT listeners, so
   extra workers only help on Linux.

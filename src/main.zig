@@ -139,7 +139,31 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
             try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
         }
     }
-    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys };
+    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys, .upstream_cas = try loadUpstreamCas(arena, cfg) };
+}
+
+/// One bundle per `tls_ca` file, and the system store at most once.
+fn loadUpstreamCas(arena: std.mem.Allocator, cfg: *const config.Config) ![]const Worker.Shared.UpstreamCa {
+    const Bundle = std.crypto.Certificate.Bundle;
+    var out: std.ArrayListUnmanaged(Worker.Shared.UpstreamCa) = .empty;
+    var loaded: std.ArrayListUnmanaged(struct { path: ?[]const u8, bundle: *const Bundle }) = .empty;
+    for (cfg.upstreams) |up| {
+        if (!up.tls or (!up.tls_verify and up.tls_ca == null)) continue;
+        const bundle = for (loaded.items) |l| {
+            const same = if (l.path) |p| up.tls_ca != null and std.mem.eql(u8, p, up.tls_ca.?) else up.tls_ca == null;
+            if (same) break l.bundle;
+        } else blk: {
+            const b = try arena.create(Bundle);
+            b.* = (if (up.tls_ca) |path| quic.ca_bundle.loadFile(arena, path) else quic.ca_bundle.loadSystem(arena)) catch |err| {
+                log.err("upstream '{s}': loading {s}: {s}", .{ up.name, up.tls_ca orelse "system CA store", @errorName(err) });
+                return err;
+            };
+            try loaded.append(arena, .{ .path = up.tls_ca, .bundle = b });
+            break :blk b;
+        };
+        try out.append(arena, .{ .upstream = up.name, .bundle = bundle });
+    }
+    return out.items;
 }
 
 pub fn main(init: std.process.Init) !u8 {

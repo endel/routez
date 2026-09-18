@@ -403,7 +403,7 @@ pub fn Relay(comptime Listener: type) type {
             up.client = try UpClient.init(a, &up.handler, .{
                 .address = addr_text,
                 .port = peer.addr.getPort(),
-                .server_name = try arena.dupe(u8, peer.host),
+                .server_name = try arena.dupe(u8, cfg.tls_server_name orelse peer.host),
                 .path = try arena.dupe(u8, path),
                 .connect_headers = fwd.items,
                 .ipv6 = peer.addr == .ip6,

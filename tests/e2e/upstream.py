@@ -1,4 +1,4 @@
-import http.server, sys, json
+import http.server, sys, json, ssl
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _reply(self, code, body, ctype="application/json", chunked=False):
@@ -19,9 +19,12 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/chunked"):
             return self._reply(200, b"x" * 5000, "text/plain", chunked=True)
+        if self.path.startswith("/bytes/"):
+            n = int(self.path[len("/bytes/"):])
+            return self._reply(200, bytes(i % 251 for i in range(n)), "application/octet-stream")
         if self.path == "/healthz":
             return self._reply(200, b"ok", "text/plain")
-        body = json.dumps({"path": self.path, "headers": dict(self.headers), "port": self.server.server_port}).encode()
+        body = json.dumps({"path": self.path, "headers": dict(self.headers), "port": self.server.server_port, "peer_port": self.client_address[1]}).encode()
         self._reply(200, body)
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -36,4 +39,9 @@ class H(http.server.BaseHTTPRequestHandler):
             data = self.rfile.read(n)
         self._reply(200, json.dumps({"received": len(data), "port": self.server.server_port}).encode())
     def log_message(self, *a): pass
-http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+if len(sys.argv) > 3:  # HTTPS: upstream.py PORT CERT KEY
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(sys.argv[2], sys.argv[3])
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()

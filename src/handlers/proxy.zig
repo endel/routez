@@ -199,14 +199,14 @@ pub const Proxy = struct {
             self.replay_ok = false;
             self.replay.clearAndFree(a);
         }
-        c.sock.write(bytes);
+        c.send(bytes);
         return true;
     }
 
     pub fn onRequestBody(self: *Proxy, data: []const u8) void {
         if (self.phase == .done) return;
         if (self.phase == .tunnel) {
-            if (self.conn) |c| c.sock.write(data);
+            if (self.conn) |c| c.send(data);
             return self.checkRequestBackpressure();
         }
         if (self.framing == .pending) {
@@ -273,9 +273,9 @@ pub const Proxy = struct {
         self.phase = if (c.reused) .waiting_head else .connecting;
         if (!c.reused) self.t().set(&self.deadline, self.group.cfg.connect_timeout_ms);
         if (self.replay_ok) {
-            c.sock.write(self.replay.items);
+            c.send(self.replay.items);
         } else {
-            c.sock.write(self.unsent.items);
+            c.send(self.unsent.items);
             self.unsent.clearAndFree(self.alloc());
         }
         if (c.reused) {

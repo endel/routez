@@ -26,6 +26,12 @@ sed "s|WWW|$WORK/www|; s|CERTS|$CERTS|g" "$HERE/routez.zon" > "$WORK/routez.zon"
 python3 "$HERE/upstream.py" 19001 & PIDS+=($!)
 python3 "$HERE/upstream.py" 19002 & PIDS+=($!)
 python3 "$HERE/slow_upstream.py" "$WORK/www" & PIDS+=($!)
+# The HTTPS upstream needs a Python whose ssl has TLS 1.3 (not Xcode's LibreSSL one).
+for PY_TLS in python3 /opt/homebrew/bin/python3 ""; do
+    [ -n "$PY_TLS" ] && "$PY_TLS" -c 'import ssl, sys; sys.exit(not ssl.HAS_TLSv1_3)' 2>/dev/null && break
+done
+[ -n "$PY_TLS" ] || { echo "no python3 with TLS 1.3 for the HTTPS upstream"; exit 1; }
+"$PY_TLS" "$HERE/upstream.py" 19005 "$CERTS/server.crt" "$CERTS/server.key" & PIDS+=($!)
 bun "$HERE/ws_upstream.ts" & PIDS+=($!)
 QZ="$ROOT/../quic-zig"
 (cd "$ROOT" && zig build wt-slow-server) || exit 1
@@ -41,7 +47,7 @@ wait_port() {
     done
     echo "port $1 never came up"; exit 1
 }
-for p in 19001 19002 19003 19004; do wait_port $p; done
+for p in 19001 19002 19003 19004 19005; do wait_port $p; done
 "$ROOT/zig-out/bin/routez" "$WORK/routez.zon" 2> "$WORK/server.log" & SERVER=$!; PIDS+=($SERVER)
 wait_port 18080
 # Health checks start optimistic; wait out one probe round so a slow
@@ -122,6 +128,19 @@ SUITE=features check set-header-host "$($CURL_BIN -s http://127.0.0.1:18080/api2
 SUITE=features check set-header-add "$($CURL_BIN -s http://127.0.0.1:18080/api2/h | json '["headers"]["x-custom"]')" "v1"
 SUITE=features check set-header-remove "$($CURL_BIN -s http://127.0.0.1:18080/api2/h | json '.get("headers").get("User-Agent")')" "None"
 SUITE=features check rate-limit "$(for i in 1 2 3 4 5 6; do $CURL_BIN -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:18080/limited; done)" "200 200 200 429 429 429 "
+
+# HTTPS upstreams. The health checks (TLS too) have had two rounds by now,
+# enough to take the upstream down if they failed.
+SUITE=tls-upstream
+B=http://127.0.0.1:18080
+check verified "$($CURL_BIN -s "$B/tls/hello?x=1" | json '["path"]')" "/hello?x=1"
+check post "$($CURL_BIN -s -X POST --data-binary @"$WORK/www/big.bin" $B/tls/up | json '["received"]')" 3000000
+check download "$($CURL_BIN -s --limit-rate 4M $B/tls/bytes/3000000 | sha)" "$(python3 -c 'import sys; sys.stdout.buffer.write(bytes(i % 251 for i in range(3000000)))' | sha)"
+check keepalive "$(for i in 1 2 3; do $CURL_BIN -s $B/tls/k | json '["peer_port"]'; done | sort -u | wc -l | tr -d ' ')" 1
+check unverified "$($CURL_BIN -s -o /dev/null -w '%{http_code}' $B/tls-insecure/x)" 200
+check wrong-ca "$($CURL_BIN -s -o /dev/null -w '%{http_code}' $B/tls-wrong-ca/x)" 502
+check wrong-name "$($CURL_BIN -s -o /dev/null -w '%{http_code}' $B/tls-wrong-name/x)" 502
+check health "$(grep -c '19005 is unhealthy' "$WORK/server.log")" 0
 
 # Reload: edit the config, SIGHUP, keep serving throughout.
 (for i in $(seq 1 100); do $CURL_BIN -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/ping; done > "$WORK/reload_codes.txt") & LOOP=$!

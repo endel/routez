@@ -180,11 +180,18 @@ pub const Upstream = struct {
     read_timeout_ms: u32 = 60_000,
     /// Upstream speaks HTTP/3 (QUIC) instead of HTTP/1.1. Used for WebTransport relays.
     h3: bool = false,
-    /// For QUIC upstreams: verify the upstream certificate against the system
-    /// store (or `tls_ca`). Off by default, for self-signed internal backends.
+    /// Upstream speaks HTTPS: HTTP/1.1 over TLS 1.3.
+    tls: bool = false,
+    /// For TLS and QUIC upstreams: verify the certificate against the system
+    /// store (or `tls_ca`). Off by default, like nginx's `proxy_ssl_verify`,
+    /// for self-signed internal backends.
     tls_verify: bool = false,
-    /// PEM CA bundle for verifying QUIC upstreams; implies `tls_verify`.
+    /// PEM CA bundle for verifying TLS and QUIC upstreams; implies `tls_verify`.
     tls_ca: ?[]const u8 = null,
+    /// Name sent as SNI and matched against the certificate, for TLS and
+    /// QUIC upstreams. Defaults to each server's host; an IP address is
+    /// matched against the certificate's IP addresses and not sent as SNI.
+    tls_server_name: ?[]const u8 = null,
     health: ?Health = null,
 
     pub const Balance = enum { round_robin, least_conn, ip_hash };
@@ -285,6 +292,8 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
 
     for (cfg.upstreams, 0..) |up, i| {
         if (up.servers.len == 0) return fail("upstream '{s}' has no servers", .{up.name});
+        if (up.tls and up.h3) return fail("upstream '{s}': tls and h3 are exclusive (h3 is always encrypted)", .{up.name});
+        if (up.tls_server_name) |n| if (n.len == 0 or n.len > 255) return fail("upstream '{s}': bad tls_server_name", .{up.name});
         for (up.servers) |s| _ = parseHostPort(s) catch return fail("upstream '{s}': bad server '{s}'", .{ up.name, s });
         for (cfg.upstreams[0..i]) |prev| {
             if (std.mem.eql(u8, prev.name, up.name)) return fail("duplicate upstream '{s}'", .{up.name});
@@ -494,6 +503,22 @@ test "quic idle timeout" {
     try std.testing.expectEqual(@as(u32, 120_000), cfg.limits.quic_idle_timeout_ms);
     try std.testing.expectError(error.InvalidConfig, parse(a,
         \\.{ .limits = .{ .quic_idle_timeout_ms = 0 }, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test"));
+}
+
+test "tls upstreams" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "b" }} }},
+        \\   .upstreams = .{.{ .name = "b", .servers = .{"10.0.0.1:443"}, .tls = true, .tls_server_name = "api.internal" }} }
+    , "test");
+    try std.testing.expect(cfg.upstreams[0].tls);
+    try std.testing.expectEqualStrings("api.internal", cfg.upstreams[0].tls_server_name.?);
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "b" }} }},
+        \\   .upstreams = .{.{ .name = "b", .servers = .{"10.0.0.1:443"}, .tls = true, .h3 = true }} }
     , "test"));
 }
 

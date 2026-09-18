@@ -9,6 +9,7 @@ const xev = quic.event_loop.Xev;
 const config = @import("config.zig");
 const addr = @import("net/addr.zig");
 const socket = @import("net/socket.zig");
+const tls = @import("net/tls.zig");
 const timers = @import("timers.zig");
 const parser = @import("http1/parser.zig");
 const Worker = @import("worker.zig").Worker;
@@ -37,6 +38,11 @@ pub const Group = struct {
                 return err;
             };
             p.* = .{ .group = g, .addr = ip, .label = text, .host = hp.host };
+            if (cfg.tls) p.tls = .{
+                .server_name = cfg.tls_server_name orelse hp.host,
+                .alpn = &.{"http/1.1"},
+                .ca_bundle = worker.shared.upstreamCa(cfg.name),
+            };
         }
         if (cfg.health != null) worker.timers.set(&g.health_tick, 0);
         return g;
@@ -122,6 +128,8 @@ pub const Peer = struct {
     health_ok: bool = true,
     health_streak: u16 = 0,
     probe: ?*Probe = null,
+    /// Set for TLS upstreams.
+    tls: ?quic.tls_client.Config = null,
 
     pub fn recordFailure(self: *Peer) void {
         self.fails += 1;
@@ -151,11 +159,12 @@ pub const Peer = struct {
         }
         const w = self.group.worker;
         const c = try w.alloc.create(UpConn);
+        errdefer w.alloc.destroy(c);
         c.* = .{ .peer = self, .sock = undefined, .user = user };
-        c.sock.connect(c, &w.loop, &w.timers, w.alloc, self.addr) catch |err| {
-            w.alloc.destroy(c);
-            return err;
-        };
+        if (self.tls) |*cfg| c.tls = try tls.Client.create(w.alloc, cfg);
+        errdefer if (c.tls) |t| t.destroy();
+        try c.sock.connect(c, &w.loop, &w.timers, w.alloc, self.addr);
+        if (c.tls) |t| t.flush(&c.sock);
         return c;
     }
 
@@ -227,6 +236,7 @@ pub const Peer = struct {
 pub const UpConn = struct {
     peer: *Peer,
     sock: socket.Socket(UpConn),
+    tls: ?*tls.Client = null,
     user: ?*Proxy,
     state: enum { busy, idle, closing } = .busy,
     reused: bool = false,
@@ -234,17 +244,45 @@ pub const UpConn = struct {
     idle_prev: ?*UpConn = null,
     idle_deadline: timers.Deadline = .{ .callback = onIdleTimeout },
 
+    /// Request bytes for the upstream; over TLS, held until the handshake is done.
+    pub fn send(self: *UpConn, bytes: []const u8) void {
+        if (self.tls) |t| return t.write(&self.sock, bytes);
+        self.sock.write(bytes);
+    }
+
     pub fn onSocketConnect(self: *UpConn, err: ?anyerror) void {
+        // Over TLS the user hears about it once the handshake is done.
+        if (err == null and self.tls != null) return;
         if (self.user) |u| u.onUpstreamConnected(err);
     }
 
     pub fn onSocketData(self: *UpConn, data: []const u8) void {
+        if (self.tls) |t| return t.onData(&self.sock, self, data);
+        self.onTlsData(data);
+    }
+
+    pub fn onSocketEof(self: *UpConn) void {
+        if (self.tls) |t| {
+            // Already reported: close_notify or a failed record came first.
+            if (t.ended) return;
+            t.ended = true;
+        }
+        self.onTlsEof();
+    }
+
+    pub fn onTlsHandshake(self: *UpConn, err: ?anyerror) void {
+        if (self.user) |u| return u.onUpstreamConnected(err);
+        self.dropIdle();
+    }
+
+    /// Response bytes (plaintext, whether or not TLS carried them).
+    pub fn onTlsData(self: *UpConn, data: []const u8) void {
         if (self.user) |u| return u.onUpstreamData(data);
         // Bytes on an idle connection are a protocol error; drop it.
         self.dropIdle();
     }
 
-    pub fn onSocketEof(self: *UpConn) void {
+    pub fn onTlsEof(self: *UpConn) void {
         if (self.user) |u| return u.onUpstreamEof();
         self.dropIdle();
     }
@@ -258,6 +296,7 @@ pub const UpConn = struct {
         self.peer.unlinkIdle(self);
         const w = self.peer.group.worker;
         w.timers.clear(&self.idle_deadline);
+        if (self.tls) |t| t.destroy();
         w.alloc.destroy(self);
     }
 
@@ -279,6 +318,7 @@ pub const UpConn = struct {
 pub const Probe = struct {
     peer: *Peer,
     sock: socket.Socket(Probe),
+    tls: ?*tls.Client = null,
     deadline: timers.Deadline = .{ .callback = onTimeout },
     in: std.ArrayListUnmanaged(u8) = .empty,
     finished: bool = false,
@@ -287,15 +327,20 @@ pub const Probe = struct {
         const w = peer.group.worker;
         const p = try w.alloc.create(Probe);
         p.* = .{ .peer = peer, .sock = undefined };
-        p.sock.connect(p, &w.loop, &w.timers, w.alloc, peer.addr) catch |err| {
+        errdefer {
+            if (p.tls) |t| t.destroy();
             w.alloc.destroy(p);
             peer.healthResult(false);
-            return err;
-        };
+        }
+        if (peer.tls) |*cfg| p.tls = try tls.Client.create(w.alloc, cfg);
+        try p.sock.connect(p, &w.loop, &w.timers, w.alloc, peer.addr);
         peer.probe = p;
         var buf: [1024]u8 = undefined;
         const req = std.fmt.bufPrint(&buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: routez-health\r\nConnection: close\r\n\r\n", .{ h.path, peer.host }) catch "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
-        p.sock.write(req);
+        if (p.tls) |t| {
+            t.flush(&p.sock);
+            t.write(&p.sock, req);
+        } else p.sock.write(req);
         w.timers.set(&p.deadline, h.timeout_ms);
     }
 
@@ -313,6 +358,19 @@ pub const Probe = struct {
     }
 
     pub fn onSocketData(self: *Probe, data: []const u8) void {
+        if (self.tls) |t| return t.onData(&self.sock, self, data);
+        self.onTlsData(data);
+    }
+
+    pub fn onTlsHandshake(self: *Probe, err: ?anyerror) void {
+        if (err != null) self.done(false);
+    }
+
+    pub fn onTlsEof(self: *Probe) void {
+        self.done(false);
+    }
+
+    pub fn onTlsData(self: *Probe, data: []const u8) void {
         const alloc = self.peer.group.worker.alloc;
         self.in.appendSlice(alloc, data) catch return self.done(false);
         const line_end = std.mem.indexOf(u8, self.in.items, "\r\n") orelse {
@@ -335,6 +393,7 @@ pub const Probe = struct {
 
     pub fn onSocketClosed(self: *Probe) void {
         const w = self.peer.group.worker;
+        if (self.tls) |t| t.destroy();
         if (!self.finished) {
             self.finished = true;
             self.peer.probe = null;

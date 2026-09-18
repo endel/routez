@@ -25,6 +25,10 @@
             .{ .prefix = "/sub/", .root = "WWW", .try_files = .{ "$uri", "=404" } },
             .{ .prefix = "/limited", .@"return" = .{ .body = "ok\n" }, .limit_req = .{ .rate = 1, .burst = 2 } },
             .{ .prefix = "/api/", .proxy_pass = "backend", .strip_prefix = true },
+            .{ .prefix = "/tls/", .proxy_pass = "tls_backend", .strip_prefix = true },
+            .{ .prefix = "/tls-insecure/", .proxy_pass = "tls_insecure", .strip_prefix = true },
+            .{ .prefix = "/tls-wrong-ca/", .proxy_pass = "tls_wrong_ca", .strip_prefix = true },
+            .{ .prefix = "/tls-wrong-name/", .proxy_pass = "tls_wrong_name", .strip_prefix = true },
             .{ .prefix = "/ws/", .proxy_pass = "127.0.0.1:19003" },
             .{ .prefix = "/slow/", .proxy_pass = "slow", .strip_prefix = true },
             .{ .prefix = "/slowup/", .proxy_pass = "127.0.0.1:19004", .strip_prefix = true },
@@ -40,5 +44,17 @@
             .health = .{ .path = "/healthz", .interval_ms = 500, .fall = 2, .rise = 2 },
         },
         .{ .name = "slow", .servers = .{"127.0.0.1:19004"}, .read_timeout_ms = 1000 },
+        // HTTPS upstream; 127.0.0.1 is verified against the certificate's IP SAN.
+        .{
+            .name = "tls_backend",
+            .servers = .{"127.0.0.1:19005"},
+            .tls = true,
+            .tls_ca = "CERTS/ca.crt",
+            .health = .{ .path = "/healthz", .interval_ms = 500, .fall = 2, .rise = 2 },
+        },
+        .{ .name = "tls_insecure", .servers = .{"127.0.0.1:19005"}, .tls = true, .tls_server_name = "other.example" },
+        // The leaf itself is no CA: its issuer is unknown.
+        .{ .name = "tls_wrong_ca", .servers = .{"127.0.0.1:19005"}, .tls = true, .tls_ca = "CERTS/server.crt" },
+        .{ .name = "tls_wrong_name", .servers = .{"127.0.0.1:19005"}, .tls = true, .tls_ca = "CERTS/ca.crt", .tls_server_name = "other.example" },
     },
 }

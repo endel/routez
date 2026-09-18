@@ -1,9 +1,12 @@
-//! TLS 1.3 for TCP listeners, on quic-zig's sans-IO `tls_server`.
+//! TLS 1.3 over TCP, on quic-zig's sans-IO `tls_server` (listeners) and
+//! `tls_client` (upstreams).
 const std = @import("std");
 const quic = @import("quic");
 const config = @import("../config.zig");
 const acme = @import("../acme.zig");
 const tls_server = quic.tls_server;
+const tls_client = quic.tls_client;
+const socket = @import("socket.zig");
 const tls13 = quic.tls13;
 
 /// Certificates and TLS settings for one listener, shared read-only by all
@@ -110,5 +113,71 @@ pub const Transport = struct {
 
     pub fn handshakeComplete(self: *Transport) bool {
         return self.conn.handshakeComplete();
+    }
+};
+
+/// TLS to an upstream, between its socket and its owner (`UpConn`, `Probe`).
+///
+/// The owner hears `onTlsHandshake(?anyerror)` once, then plaintext through
+/// `onTlsData`, and `onTlsEof` when the server closes the TLS session or a
+/// record fails after the handshake.
+pub const Client = struct {
+    conn: tls_client.Conn,
+    alloc: std.mem.Allocator,
+    handshake_done: bool = false,
+    ended: bool = false,
+
+    /// The ClientHello is queued; `flush` it into the socket.
+    pub fn create(alloc: std.mem.Allocator, cfg: *const tls_client.Config) !*Client {
+        const c = try alloc.create(Client);
+        errdefer alloc.destroy(c);
+        c.* = .{ .conn = try tls_client.Conn.init(alloc, cfg), .alloc = alloc };
+        return c;
+    }
+
+    pub fn destroy(self: *Client) void {
+        self.conn.deinit();
+        self.alloc.destroy(self);
+    }
+
+    /// Before the handshake completes, the bytes are held and sent after it.
+    pub fn write(self: *Client, sock: anytype, bytes: []const u8) void {
+        // Fails only after a TLS failure the owner has already heard about,
+        // or out of memory.
+        self.conn.write(bytes) catch return;
+        self.flush(sock);
+    }
+
+    pub fn flush(self: *Client, sock: anytype) void {
+        const pending = self.conn.pendingOutput();
+        if (pending.len == 0) return;
+        sock.write(pending);
+        self.conn.consumeOutput(pending.len);
+    }
+
+    /// Ciphertext from the socket.
+    pub fn onData(self: *Client, sock: anytype, owner: anytype, data: []const u8) void {
+        if (self.ended) return;
+        self.conn.feed(data) catch |err| {
+            self.flush(sock); // the alert
+            self.ended = true;
+            if (!self.handshake_done) return owner.onTlsHandshake(err);
+            return owner.onTlsEof();
+        };
+        self.flush(sock);
+        if (!self.handshake_done and self.conn.handshakeComplete()) {
+            self.handshake_done = true;
+            owner.onTlsHandshake(null);
+        }
+        var buf: [socket.read_buffer_size]u8 = undefined;
+        while (sock.isOpen()) {
+            const n = self.conn.read(&buf);
+            if (n == 0) break;
+            owner.onTlsData(buf[0..n]);
+        }
+        if (sock.isOpen() and self.conn.peerClosed()) {
+            self.ended = true;
+            owner.onTlsEof();
+        }
     }
 };
