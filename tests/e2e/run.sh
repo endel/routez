@@ -206,6 +206,46 @@ kill $IC 2>/dev/null; wait $IC 2>/dev/null
 SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 700 ] && [ $waited -lt 12000 ] && echo in-time || echo "after ${waited}ms")" "1 in-time"
 kill $IDLE; wait $IDLE 2>/dev/null
 
+# An RSA certificate next to an EC one on the same listener, chosen by SNI;
+# its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").
+$OPENSSL req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/rsa8.key" -out "$WORK/rsa.crt" -days 2 \
+    -subj /CN=rsa.test -addext subjectAltName=DNS:rsa.test 2>/dev/null
+$OPENSSL rsa -in "$WORK/rsa8.key" -traditional -out "$WORK/rsa.key" 2>/dev/null
+cat > "$WORK/rsa.zon" <<EOF2
+.{ .access_log = false, .servers = .{
+    .{
+        .server_names = .{"localhost"},
+        .listen = .{.{ .address = "127.0.0.1", .port = 18447, .tls = true, .quic = true }},
+        .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+        .locations = .{.{ .prefix = "/", .@"return" = .{ .body = "ec" } }},
+    },
+    .{
+        .server_names = .{"rsa.test"},
+        .listen = .{.{ .address = "127.0.0.1", .port = 18447, .tls = true, .quic = true }},
+        .tls = .{ .cert = "$WORK/rsa.crt", .key = "$WORK/rsa.key" },
+        .locations = .{.{ .prefix = "/", .@"return" = .{ .body = "rsa" } }},
+    },
+} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/rsa.zon" 2> "$WORK/rsa.log" & RSA=$!; PIDS+=($RSA)
+wait_port 18447
+RSA_CURL="$CURL_BIN -s --max-time 10 --cacert $WORK/rsa.crt --resolve rsa.test:18447:127.0.0.1"
+# OpenSSL 3.0 prints "RSA-PSS", later versions "rsa_pss_rsae_sha256"; both give the digest.
+sig_type() {
+    local out t
+    out=$(echo | $OPENSSL s_client -connect 127.0.0.1:18447 -tls1_3 -servername "$1" ${2:+-sigalgs $2} 2>/dev/null)
+    t=$(grep -o 'Peer signature type: [A-Za-z0-9_-]*' <<< "$out" | cut -d' ' -f4 | tr A-Z a-z)
+    case $t in *pss*) t=pss ;; *ecdsa*) t=ecdsa ;; esac
+    echo "$t-$(grep -o 'Peer signing digest: [A-Za-z0-9]*' <<< "$out" | cut -d' ' -f4)"
+}
+SUITE=rsa check https "$($RSA_CURL https://rsa.test:18447/)" "rsa"
+if $CURL_BIN --version | grep -q HTTP3; then
+    SUITE=rsa check h3 "$($RSA_CURL --http3-only https://rsa.test:18447/)" "rsa"
+fi
+SUITE=rsa check pss-schemes "$(sig_type rsa.test) $(sig_type rsa.test rsa_pss_rsae_sha512)" "pss-SHA256 pss-SHA512"
+SUITE=rsa check ec-alongside "$(sig_type localhost)" "ecdsa-SHA256"
+kill $RSA; wait $RSA 2>/dev/null
+
 # WebTransport through the relay: a stream and a datagram, echoed.
 (cd "$ROOT" && zig build wt-test-client) || exit 1
 "$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" > "$WORK/wt.log" 2>&1 & WT=$!

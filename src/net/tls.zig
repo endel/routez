@@ -52,17 +52,14 @@ pub fn loadCertificate(arena: std.mem.Allocator, cert_path: []const u8, key_path
     if (chain.len == 0) return error.NoCertificate;
     const der_buf = try arena.alloc(u8, key_pem.len);
     const key_der = try tls13.parsePemPrivateKey(key_pem, der_buf);
-    if (tls13.extractEcPrivateKey(key_der)) |k| {
-        return .{ .cert_chain_der = chain, .private_key_bytes = try arena.dupe(u8, k), .private_key_algorithm = .ecdsa_p256_sha256 };
-    } else |_| {}
-    if (tls13.extractPkcs8EcPrivateKey(key_der)) |k| {
-        return .{ .cert_chain_der = chain, .private_key_bytes = try arena.dupe(u8, k), .private_key_algorithm = .ecdsa_p256_sha256 };
-    } else |_| {}
-    if (tls13.extractEd25519PrivateKey(key_der)) |k| {
-        return .{ .cert_chain_der = chain, .private_key_bytes = try arena.dupe(u8, k), .private_key_algorithm = .ed25519 };
-    } else |_| {}
-    std.log.err("{s}: only EC P-256 and Ed25519 keys are supported", .{key_path});
-    return error.UnsupportedKey;
+    const key = tls13.extractPrivateKey(key_der) catch |err| {
+        switch (err) {
+            error.InvalidKey => std.log.err("{s}: the RSA key's numbers do not fit together", .{key_path}),
+            error.UnsupportedKey => std.log.err("{s}: only EC P-256, Ed25519 and 2048 to 4096-bit RSA keys are supported", .{key_path}),
+        }
+        return err;
+    };
+    return .{ .cert_chain_der = chain, .private_key_bytes = try arena.dupe(u8, key.bytes), .private_key_algorithm = key.algorithm };
 }
 
 /// One TLS connection's state, between the socket and the HTTP parser.

@@ -120,7 +120,8 @@ A ZON file; see `src/config.zig` for every field and default.
   routed through the locations.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
-- TLS keys must be EC P-256 or Ed25519. TLS 1.2 is not supported.
+- TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
+  not supported.
 
 ### Redirects and variables
 

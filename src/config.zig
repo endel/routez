@@ -66,7 +66,8 @@ pub const Listen = struct {
 pub const Tls = struct {
     /// PEM certificate chain (leaf first).
     cert: ?[]const u8 = null,
-    /// PEM private key: EC P-256 or Ed25519.
+    /// PEM private key: EC P-256, Ed25519, or RSA of 2048 to 4096 bits
+    /// (PKCS#1 or PKCS#8). RSA signs with RSA-PSS.
     key: ?[]const u8 = null,
     /// Obtain and renew the certificate for `server_names` automatically.
     acme: ?Acme = null,
