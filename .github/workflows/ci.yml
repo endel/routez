@@ -69,3 +69,10 @@ jobs:
       - name: End-to-end
         working-directory: routez
         run: tests/e2e/run.sh
+
+      # Pebble (Let's Encrypt's test CA) in Docker, validating HTTP-01
+      # against routez over the host network.
+      - name: ACME against Pebble (Linux)
+        if: runner.os == 'Linux'
+        working-directory: routez
+        run: tests/acme/run.sh
