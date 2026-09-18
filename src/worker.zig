@@ -81,6 +81,8 @@ const log = std.log.scoped(.worker);
 
 /// How long a stopping worker waits for in-flight requests.
 const drain_timeout_ms = 10_000;
+/// How long a stopping worker waits for the first request on a connection.
+const fresh_grace_ms = 1_000;
 
 pub const Worker = struct {
     alloc: std.mem.Allocator,
@@ -113,6 +115,9 @@ pub const Worker = struct {
     finishing: bool = false,
     finish_started_ms: i64 = 0,
     stop_deadline: timers.Deadline = .{ .callback = onDrainTimeout },
+    stop_started_ms: i64 = 0,
+    /// Connections that never sent a request have been closed.
+    fresh_closed: bool = false,
 
     /// Built once in main and shared read-only by all workers.
     pub const Shared = struct {
@@ -297,13 +302,14 @@ pub const Worker = struct {
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
-            conn.closeIfIdle();
+            conn.closeIfIdle(false);
         }
         for (self.groups.items) |g| {
             for (g.peers) |*p| p.closeIdle();
         }
         // GOAWAY: in-flight HTTP/3 requests finish, new ones go elsewhere.
         for (self.quic_listeners.items) |q| q.drain();
+        self.stop_started_ms = self.timers.now_ms;
         self.timers.set(&self.stop_deadline, drain_timeout_ms);
         return .disarm;
     }
@@ -312,6 +318,15 @@ pub const Worker = struct {
         const self: *Worker = @fieldParentPtr("timers", t);
         self.sweepRateBuckets();
         if (self.finishing) return self.pollFinish();
+        if (self.stopping and !self.fresh_closed and self.timers.now_ms - self.stop_started_ms >= fresh_grace_ms) {
+            // A connection that stays silent mustn't hold up the stop.
+            self.fresh_closed = true;
+            var c = self.conns_head;
+            while (c) |conn| {
+                c = conn.next;
+                conn.closeIfIdle(true);
+            }
+        }
         if (self.stopping and self.conn_count == 0 and self.quicDrained()) self.finishStop();
     }
 
