@@ -12,6 +12,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   upstream, with streams and datagrams paired one to one.
 - TLS 1.3 on TCP (quic-zig's sans-IO `tls_server`): SNI certificate
   selection, ALPN, session resumption.
+- Automatic certificates from Let's Encrypt or any ACME CA (RFC 8555,
+  HTTP-01), renewed and swapped in without dropping connections.
 - Static files: ranges, ETag / Last-Modified conditional requests, index
   files, directory redirects, path normalization.
 - Reverse proxy to HTTP/1.1 upstreams: streaming in both directions with
@@ -90,16 +92,66 @@ A ZON file; see `src/config.zig` for every field and default.
   (exact name, then one-label wildcard, then the first server).
 - TLS keys must be EC P-256 or Ed25519. TLS 1.2 is not supported.
 
+### Automatic certificates (ACME)
+
+Instead of `cert` and `key`, a server can ask an ACME CA for its certificate:
+
+```zig
+.{
+    .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true, .quic = true } },
+    .server_names = .{ "example.com", "www.example.com" },
+    .tls = .{ .acme = .{
+        .email = "ops@example.com",
+        // Default: Let's Encrypt production. Try staging first:
+        // .directory = "https://acme-staging-v02.api.letsencrypt.org/directory",
+        .storage = "/var/lib/routez/acme",
+    } },
+    .locations = .{ .{ .prefix = "/", .root = "/var/www" } },
+}
+```
+
+| field | default | |
+|---|---|---|
+| `email` | none | contact for the CA's expiry and policy notices |
+| `directory` | Let's Encrypt production | the CA's directory URL (https) |
+| `storage` | `/var/lib/routez/acme` | account key and certificates |
+| `ca_file` | system roots | PEM bundle to trust for the directory's HTTPS (test CAs such as Pebble) |
+| `renew_days` | 30 | renew when fewer days than this remain (or half the lifetime, if that is shorter) |
+| `check_interval_s` | 43200 | how often stored certificates are checked |
+
+- The certificate covers every name in `server_names`; the first also names
+  the file. Configuring `acme` means agreeing to the CA's terms of service.
+- Validation is HTTP-01: while an order is pending, every plain-HTTP listener
+  answers `/.well-known/acme-challenge/<token>` ahead of its locations. The
+  CA connects to port 80 of each name, so one must reach a plain listener.
+- One thread per process talks to the CA, off the worker event loops.
+- At startup a stored certificate is used as long as it hasn't expired and
+  covers the names. Otherwise the TLS listeners come up at once with a
+  self-signed placeholder (clients see a certificate error, not a refused
+  connection) while the certificate is obtained.
+- A new certificate is written to storage, then the running configuration is
+  reloaded as for SIGHUP: new workers load it, old ones drain. That reload
+  reuses the configuration text already running, so edits to the file
+  still wait for a SIGHUP.
+- Failures are logged and retried after 1 minute, doubling to 32 minutes.
+- Storage layout, directories 0700 and files 0600, replaced atomically:
+  `<storage>/<ca-host>/account.key` and `<storage>/<ca-host>/<first-name>.pem`
+  (the chain, then its key). Keeping them per CA host means staging
+  certificates are never served once `directory` points at production.
+
 ## Tests
 
 ```sh
 zig build test          # unit tests
 tests/e2e/run.sh        # end-to-end over HTTP/1.1, TLS, HTTP/3 and WebTransport
+tests/acme/run.sh       # ACME against Pebble in Docker (skipped without Docker)
 ```
 
 The end-to-end script needs python3, bun, node >= 22, a curl built with
 HTTP/3 (Homebrew's), and a built `../quic-zig` (its WebTransport echo server
-is the relay's upstream).
+is the relay's upstream). The ACME script needs Docker, python3, curl and
+openssl; it runs Pebble, Let's Encrypt's test CA, with real HTTP-01
+validation against routez.
 
 ## Performance
 
@@ -114,6 +166,13 @@ Relative numbers only; a VM is not a benchmark machine.
 | Reverse proxy to a keep-alive upstream | 195k req/s | 186k req/s |
 
 ## Limitations
+
+- ACME: HTTP-01 only, so no wildcard names (they need DNS-01) and port 80
+  must be reachable from the internet. No certificate revocation, ARI or
+  external account binding. Every change of certificate reloads all workers.
+- Let's Encrypt rate-limits issuance (for example 5 certificates per exact
+  set of names per week, and failed validations per hour); test against
+  the staging directory before production.
 
 - The WebTransport relay has no backpressure between its two sides.
 - During a reload, new QUIC connections that the kernel hands to the old
