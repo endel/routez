@@ -23,9 +23,24 @@ python3 "$HERE/slow_upstream.py" "$WORK/www" & PIDS+=($!)
 bun "$HERE/ws_upstream.ts" & PIDS+=($!)
 QZ="$ROOT/../quic-zig"
 (cd "$QZ" && exec ./zig-out/bin/wt-echo-server --cert interop/certs/server.crt --key interop/certs/server.key --port 4450 >/dev/null 2>&1) & PIDS+=($!)
-sleep 0.7
+
+# Wait until a TCP port accepts connections (slow CI machines start slowly).
+wait_port() {
+    for _ in $(seq 1 100); do
+        python3 -c "import socket; socket.create_connection(('127.0.0.1', $1), 0.2).close()" 2>/dev/null && return 0
+        perl -e 'select(undef,undef,undef,0.1)'
+    done
+    echo "port $1 never came up"; exit 1
+}
+for p in 19001 19002 19003 19004; do wait_port $p; done
 "$ROOT/zig-out/bin/routez" "$WORK/routez.zon" 2> "$WORK/server.log" & SERVER=$!; PIDS+=($SERVER)
-sleep 0.7
+wait_port 18080
+# Health checks start optimistic; wait out one probe round so a slow
+# upstream start can't flip them mid-suite.
+for _ in $(seq 1 50); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/ready)" == 200 ] && break
+    perl -e 'select(undef,undef,undef,0.1)'
+done
 
 # Homebrew curl: TLS 1.3 and HTTP/3 support.
 CURL_BIN=$(command -v /opt/homebrew/opt/curl/bin/curl || command -v curl)
@@ -99,4 +114,5 @@ if grep -qiE "panic|segmentation" "$WORK/server.log"; then fail=$((fail+1)); ech
 kill -TERM $SERVER; sleep 1.5
 if kill -0 $SERVER 2>/dev/null; then fail=$((fail+1)); echo "FAIL graceful stop"; else pass=$((pass+1)); fi
 echo "passed=$pass failed=$fail"
+if [ $fail -ne 0 ]; then echo "--- routez log (tail)"; tail -50 "$WORK/server.log"; fi
 [ $fail -eq 0 ]
