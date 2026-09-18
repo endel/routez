@@ -90,6 +90,10 @@ pub const Worker = struct {
     conns_head: ?*H1Conn = null,
     conn_count: u32 = 0,
     per_ip: std.AutoHashMapUnmanaged([16]u8, u32) = .empty,
+    /// limit_req token buckets, keyed by location and client address.
+    rate_buckets: std.AutoHashMapUnmanaged(u64, RateBucket) = .empty,
+    rate_sweep_ms: i64 = 0,
+    gzip_active: u32 = 0,
 
     stop_async: xev.Async,
     stop_c: xev.Completion = .{},
@@ -286,6 +290,7 @@ pub const Worker = struct {
 
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
+        self.sweepRateBuckets();
         if (self.stopping and self.conn_count == 0 and self.quicDrained()) self.finishStop();
     }
 
@@ -338,6 +343,39 @@ pub const Worker = struct {
         const v = self.per_ip.getPtr(key) orelse return;
         v.* -= 1;
         if (v.* == 0) _ = self.per_ip.remove(key);
+    }
+
+    const RateBucket = struct { milli_tokens: i64, last_ms: i64 };
+
+    /// Token bucket check for `limit_req`: `rate` tokens per second, holding
+    /// at most `burst + 1`. Counted per worker.
+    pub fn allowRequest(self: *Worker, loc: *const config.Location, lim: config.Location.LimitReq, client: []const u8) bool {
+        const now = self.timers.now_ms;
+        const key = std.hash.Wyhash.hash(@intFromPtr(loc), client);
+        const cap: i64 = (@as(i64, lim.burst) + 1) * 1000;
+        const gop = self.rate_buckets.getOrPut(self.alloc, key) catch return true;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .milli_tokens = cap, .last_ms = now };
+        const b = gop.value_ptr;
+        // `rate` tokens per second is `rate` milli-tokens per millisecond.
+        b.milli_tokens = @min(cap, b.milli_tokens + (now - b.last_ms) * @as(i64, lim.rate));
+        b.last_ms = now;
+        if (b.milli_tokens < 1000) return false;
+        b.milli_tokens -= 1000;
+        return true;
+    }
+
+    /// Forget buckets idle long enough to have refilled.
+    fn sweepRateBuckets(self: *Worker) void {
+        const now = self.timers.now_ms;
+        if (now - self.rate_sweep_ms < 10_000) return;
+        self.rate_sweep_ms = now;
+        var stale: std.ArrayListUnmanaged(u64) = .empty;
+        defer stale.deinit(self.alloc);
+        var it = self.rate_buckets.iterator();
+        while (it.next()) |e| {
+            if (now - e.value_ptr.last_ms > 60_000) stale.append(self.alloc, e.key_ptr.*) catch break;
+        }
+        for (stale.items) |k| _ = self.rate_buckets.remove(k);
     }
 
     /// Live QUIC connections on this worker.

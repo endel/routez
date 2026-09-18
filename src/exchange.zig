@@ -17,6 +17,7 @@ const static = @import("handlers/static.zig");
 const proxy = @import("handlers/proxy.zig");
 const Header = common.Header;
 const stats = @import("stats.zig");
+const gzip = @import("gzip.zig");
 
 pub const Response = struct {
     status: u16,
@@ -139,6 +140,8 @@ pub const Exchange = struct {
     /// Set when the response ended by abort rather than finish.
     failed: bool = false,
     upstream_addr: ?[]const u8 = null,
+    /// Set when this response is being gzip-compressed.
+    gz: ?*gzip.Encoder = null,
 
     pub fn create(worker: *Worker, down: Downstream, init: RequestInit) !*Exchange {
         const ex = try worker.alloc.create(Exchange);
@@ -191,6 +194,13 @@ pub const Exchange = struct {
         if (self.req.path.len == 0) return self.sendError(400);
         const loc = router.matchLocation(self.server, self.req.path) orelse return self.sendError(404);
         self.location = loc;
+        if (loc.limit_req) |lim| {
+            if (!self.worker.allowRequest(loc, lim, self.req.client_addr)) {
+                const headers = [_]Header{ .{ .name = "retry-after", .value = "1" }, .{ .name = "content-type", .value = "text/plain" } };
+                self.respondHead(&.{ .status = 429, .headers = &headers, .content_length = 0 });
+                return self.respondEnd();
+            }
+        }
         const max_body = self.worker.cfg.limits.max_body_bytes;
         if (max_body != 0 and (self.req.content_length orelse 0) > max_body) return self.sendError(413);
 
@@ -252,24 +262,94 @@ pub const Exchange = struct {
 
     // ---- response side, used by handlers ----
 
-    pub fn respondHead(self: *Exchange, resp: *const Response) void {
-        if (resp.status >= 200 or resp.status == 101) {
-            self.status = resp.status;
+    pub fn respondHead(self: *Exchange, resp_in: *const Response) void {
+        const final = resp_in.status >= 200 or resp_in.status == 101;
+        if (final) {
+            self.status = resp_in.status;
             self.head_sent = true;
         }
         const d = self.down orelse return;
-        d.vtable.sendHead(d.ptr, resp);
+        const loc = self.location orelse return d.vtable.sendHead(d.ptr, resp_in);
+        if (!final or (loc.add_headers.len == 0 and !loc.gzip)) return d.vtable.sendHead(d.ptr, resp_in);
+
+        // Rebuild the header list: add_headers, then gzip's changes.
+        var resp = resp_in.*;
+        const a = self.arena();
+        var list: std.ArrayListUnmanaged(Header) = .empty;
+        list.ensureTotalCapacity(a, resp.headers.len + loc.add_headers.len + 2) catch return d.vtable.sendHead(d.ptr, resp_in);
+        list.appendSliceAssumeCapacity(resp.headers);
+        for (loc.add_headers) |h| list.appendAssumeCapacity(.{ .name = h.name, .value = h.value });
+        if (loc.gzip and self.startGzip(&resp, list.items)) {
+            for (list.items) |*h| {
+                // The compressed body is a different representation.
+                if (std.ascii.eqlIgnoreCase(h.name, "etag") and !std.mem.startsWith(u8, h.value, "W/")) {
+                    h.value = std.fmt.allocPrint(a, "W/{s}", .{h.value}) catch h.value;
+                }
+            }
+            list.appendAssumeCapacity(.{ .name = "content-encoding", .value = "gzip" });
+            if (gzip.findHeader(list.items, "vary")) |v| {
+                for (list.items) |*h| if (std.ascii.eqlIgnoreCase(h.name, "vary")) {
+                    h.value = std.fmt.allocPrint(a, "{s}, Accept-Encoding", .{v}) catch v;
+                };
+            } else {
+                list.appendAssumeCapacity(.{ .name = "vary", .value = "Accept-Encoding" });
+            }
+            resp.content_length = null;
+        }
+        resp.headers = list.items;
+        d.vtable.sendHead(d.ptr, &resp);
+    }
+
+    /// Start compressing this response if it qualifies.
+    fn startGzip(self: *Exchange, resp: *const Response, headers: []const Header) bool {
+        if (self.req.isHead()) return false;
+        if (resp.status < 200 or resp.status >= 300 or resp.status == 204 or resp.status == 206) return false;
+        if (resp.content_length) |n| if (n < gzip.min_length) return false;
+        if (gzip.findHeader(headers, "content-encoding") != null) return false;
+        if (!gzip.compressible(gzip.findHeader(headers, "content-type"))) return false;
+        if (!gzip.clientAccepts(self.req.get("accept-encoding"))) return false;
+        if (self.worker.gzip_active >= gzip.max_active) return false;
+        self.gz = gzip.Encoder.create(self.worker.alloc) catch return false;
+        self.worker.gzip_active += 1;
+        return true;
+    }
+
+    fn releaseGzip(self: *Exchange) void {
+        const e = self.gz orelse return;
+        e.destroy();
+        self.gz = null;
+        self.worker.gzip_active -= 1;
     }
 
     pub fn respondBody(self: *Exchange, data: []const u8) void {
-        self.bytes_sent += data.len;
         const d = self.down orelse return;
+        if (self.gz) |e| {
+            e.write(data) catch return self.respondAbort();
+            const out = e.output();
+            self.bytes_sent += out.len;
+            if (out.len > 0) d.vtable.sendBody(d.ptr, out);
+            e.consume();
+            return;
+        }
+        self.bytes_sent += data.len;
         d.vtable.sendBody(d.ptr, data);
     }
 
     /// Response complete. Frees the exchange if no handler holds it.
     pub fn respondEnd(self: *Exchange) void {
         if (self.done) return;
+        if (self.gz) |e| {
+            if (self.down) |d| {
+                e.finish() catch {
+                    self.releaseGzip();
+                    return self.respondAbort();
+                };
+                const out = e.output();
+                self.bytes_sent += out.len;
+                if (out.len > 0) d.vtable.sendBody(d.ptr, out);
+            }
+            self.releaseGzip();
+        }
         self.done = true;
         self.logAccess();
         if (self.down) |d| {
@@ -335,6 +415,7 @@ pub const Exchange = struct {
 
     fn destroy(self: *Exchange) void {
         std.debug.assert(self.done and self.down == null and self.handler == .none);
+        self.releaseGzip();
         self.arena_state.deinit();
         self.worker.alloc.destroy(self);
     }

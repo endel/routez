@@ -132,4 +132,5 @@ test {
     _ = @import("worker.zig");
     _ = @import("udp_proxy.zig");
     _ = @import("h3/server.zig");
+    _ = @import("gzip.zig");
 }

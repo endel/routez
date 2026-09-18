@@ -92,8 +92,26 @@ pub const Location = struct {
     /// Answer with a fixed status and body.
     @"return": ?Return = null,
 
+    /// Request headers set on proxied requests, replacing any the client
+    /// sent under the same name. An empty value removes the header; `host`
+    /// overrides the Host sent upstream.
+    proxy_set_headers: []const HeaderKV = &.{},
+    /// Headers added to every response from this location.
+    add_headers: []const HeaderKV = &.{},
+    /// Compress text-like responses with gzip for clients that accept it.
+    gzip: bool = false,
+    /// Per-client request rate limit, counted per worker.
+    limit_req: ?LimitReq = null,
+
     /// Serve connection and request counters as plain text.
     stub_status: bool = false,
+
+    pub const LimitReq = struct {
+        /// Sustained requests per second.
+        rate: u32,
+        /// Extra requests allowed in a burst above the rate.
+        burst: u32 = 0,
+    };
 
     pub const Return = struct {
         status: u16 = 200,
@@ -101,6 +119,8 @@ pub const Location = struct {
         content_type: []const u8 = "text/plain; charset=utf-8",
     };
 };
+
+pub const HeaderKV = struct { name: []const u8, value: []const u8 };
 
 pub const Upstream = struct {
     name: []const u8,
@@ -241,9 +261,18 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, return, stub_status", .{loc.prefix});
             if (loc.prefix.len == 0 or loc.prefix[0] != '/') return fail("location prefix '{s}' must start with '/'", .{loc.prefix});
             if (loc.proxy_pass) |p| try checkTarget(cfg, p);
+            for (loc.proxy_set_headers) |h| try checkHeader(h);
+            for (loc.add_headers) |h| try checkHeader(h);
+            if (loc.limit_req) |l| if (l.rate == 0) return fail("location '{s}': limit_req.rate must be > 0", .{loc.prefix});
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkHeader(h: HeaderKV) error{InvalidConfig}!void {
+    const common = @import("http/common.zig");
+    if (!common.isToken(h.name)) return fail("bad header name '{s}'", .{h.name});
+    if (!common.isFieldValue(h.value)) return fail("bad value for header '{s}'", .{h.name});
 }
 
 fn checkTarget(cfg: *const Config, target: []const u8) error{InvalidConfig}!void {
