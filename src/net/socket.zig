@@ -21,6 +21,8 @@ const xev = quic.event_loop.Xev;
 const timers = @import("../timers.zig");
 
 pub const read_buffer_size = 16 * 1024;
+/// SIGPIPE is ignored process-wide; MSG_NOSIGNAL covers Linux regardless.
+const send_flags: c_int = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
 /// Owners stop producing output above this.
 pub const high_water = 256 * 1024;
 pub const low_water = 64 * 1024;
@@ -154,9 +156,22 @@ pub fn Socket(comptime Owner: type) type {
         }
 
         /// Queue bytes for sending. Dropped silently once the socket is closing.
-        pub fn write(self: *Self, data: []const u8) void {
+        pub fn write(self: *Self, data_in: []const u8) void {
             if (self.state != .open) return;
-            if (data.len == 0) return;
+            if (data_in.len == 0) return;
+            var data = data_in;
+            // Nothing queued: try the kernel directly. A write completion
+            // costs an epoll registration round trip (and on epoll a dup of
+            // the fd), which most writes to a healthy socket don't need.
+            if (!self.writing and !self.connecting and self.buffered() == 0) {
+                const rc = std.c.send(self.tcp.fd, data.ptr, data.len, send_flags);
+                if (rc > 0) {
+                    const n: usize = @intCast(rc);
+                    if (n == data.len) return;
+                    data = data[n..];
+                }
+                // An error (not EAGAIN) resurfaces on the queued write below.
+            }
             self.pending.appendSlice(self.alloc, data) catch {
                 self.abort();
                 return;
