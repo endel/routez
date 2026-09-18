@@ -61,6 +61,8 @@ const Generation = struct {
             alloc.destroy(g);
         }
         const arena = g.arena_state.allocator();
+        // Certificates written up to here are the ones this generation loads.
+        const certificates_seen = manager.reloadStarting();
         g.source = if (source) |s| try arena.dupeZ(u8, s) else config.readSource(io, arena, path) catch |err| {
             log.err("{s}: {s}", .{ path, @errorName(err) });
             return err;
@@ -86,6 +88,7 @@ const Generation = struct {
         g.threads = try arena.alloc(std.Thread, workers.len);
         for (g.threads, workers) |*t, w| t.* = try std.Thread.spawn(.{}, runWorker, .{w});
         // After the listeners are up, so HTTP-01 challenges can be answered.
+        manager.reloadApplied(certificates_seen);
         manager.setJobs(&g.cfg) catch |err| log.err("acme: {s}", .{@errorName(err)});
         return g;
     }
