@@ -134,7 +134,7 @@ pub const Conn = struct {
         if (self.tls) |t| {
             t.write(bytes) catch {
                 // Not connected (handshake unfinished or already closed).
-                return self.clientGone();
+                return self.failDeferred();
             };
             self.flushTls();
         } else {
@@ -198,6 +198,14 @@ pub const Conn = struct {
 
     fn fatal(self: *Conn) void {
         self.clientGone();
+    }
+
+    /// Like `fatal`, but safe inside an exchange call (`output`, the
+    /// Downstream vtable): the exchange hears about it from the deferred
+    /// `onSocketClosed`, not while its own frame is still on the stack.
+    fn failDeferred(self: *Conn) void {
+        self.phase = .closing;
+        self.sock.abort();
     }
 
     fn closeGracefully(self: *Conn) void {
@@ -490,7 +498,7 @@ pub const Conn = struct {
         self.out.clearRetainingCapacity();
         self.writeHead(r, interim) catch {
             self.out.clearRetainingCapacity();
-            return self.fatal();
+            return self.failDeferred();
         };
         self.output(self.out.items);
     }
