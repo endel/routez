@@ -57,10 +57,33 @@ pub const Listen = struct {
     tcp: bool = true,
 };
 
+/// Either `cert` and `key`, or `acme`.
 pub const Tls = struct {
-    /// PEM certificate chain (leaf first). EC P-256 keys only.
-    cert: []const u8,
-    key: []const u8,
+    /// PEM certificate chain (leaf first).
+    cert: ?[]const u8 = null,
+    /// PEM private key: EC P-256 or Ed25519.
+    key: ?[]const u8 = null,
+    /// Obtain and renew the certificate for `server_names` automatically.
+    acme: ?Acme = null,
+};
+
+/// Automatic certificates from an ACME CA (RFC 8555), validated with HTTP-01
+/// on the plain-HTTP listeners.
+pub const Acme = struct {
+    /// Contact address given to the CA for expiry and policy notices.
+    email: ?[]const u8 = null,
+    /// Directory URL. Let's Encrypt staging is
+    /// `https://acme-staging-v02.api.letsencrypt.org/directory`.
+    directory: []const u8 = "https://acme-v02.api.letsencrypt.org/directory",
+    /// Account key and certificates, kept per CA. Created with mode 0700.
+    storage: []const u8 = "/var/lib/routez/acme",
+    /// PEM bundle trusted for the directory's HTTPS instead of the system
+    /// store; for test CAs such as Pebble.
+    ca_file: ?[]const u8 = null,
+    /// Renew when the certificate has fewer days than this left.
+    renew_days: u16 = 30,
+    /// How often stored certificates are checked for renewal.
+    check_interval_s: u32 = 12 * 3600,
 };
 
 pub const Server = struct {
@@ -192,8 +215,11 @@ pub const LoadError = error{ InvalidConfig, OutOfMemory } || std.Io.Dir.ReadFile
 /// Parse and validate `path`. Everything is allocated in `arena` and lives as
 /// long as the process.
 pub fn load(io: std.Io, arena: std.mem.Allocator, path: []const u8) LoadError!Config {
-    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .limited(1024 * 1024), .of(u8), 0);
-    return parse(arena, source, path);
+    return parse(arena, try readSource(io, arena, path), path);
+}
+
+pub fn readSource(io: std.Io, arena: std.mem.Allocator, path: []const u8) std.Io.Dir.ReadFileAllocError![:0]u8 {
+    return std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .limited(1024 * 1024), .of(u8), 0);
 }
 
 pub fn parse(arena: std.mem.Allocator, source: [:0]const u8, name: []const u8) error{ InvalidConfig, OutOfMemory }!Config {
@@ -244,13 +270,14 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
         }
     }
 
-    for (cfg.servers) |srv| {
+    for (cfg.servers) |*srv| {
         if (srv.listen.len == 0) return fail("server without listen", .{});
         for (srv.listen) |l| {
             if ((l.tls or l.quic) and srv.tls == null) return fail("listen :{d} needs server tls", .{l.port});
             if (!l.tcp and !l.quic) return fail("listen :{d} has neither tcp nor quic", .{l.port});
             if (!l.tcp and l.tls) return fail("listen :{d}: tls without tcp", .{l.port});
         }
+        if (srv.tls) |t| try checkTls(cfg, srv, t);
         for (srv.locations) |loc| {
             var actions: u8 = 0;
             if (loc.root != null) actions += 1;
@@ -267,6 +294,54 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkTls(cfg: *const Config, srv: *const Server, t: Tls) error{InvalidConfig}!void {
+    const acme = t.acme orelse {
+        if (t.cert == null or t.key == null) return fail("server tls needs cert and key, or acme", .{});
+        return;
+    };
+    if (t.cert != null or t.key != null) return fail("server tls: acme replaces cert and key; give one or the other", .{});
+    if (srv.server_names.len == 0) return fail("acme needs server_names", .{});
+    for (srv.server_names) |n| {
+        if (std.mem.indexOfScalar(u8, n, '*') != null) return fail("acme: '{s}': wildcard names need DNS-01, which isn't supported", .{n});
+        if (!isDnsName(n)) return fail("acme: '{s}' is not a DNS name", .{n});
+    }
+    if (!std.mem.startsWith(u8, acme.directory, "https://")) return fail("acme directory must be an https:// URL", .{});
+    if (acme.storage.len == 0) return fail("acme storage must be set", .{});
+    if (acme.renew_days == 0) return fail("acme renew_days must be > 0", .{});
+    if (acme.check_interval_s == 0) return fail("acme check_interval_s must be > 0", .{});
+    // HTTP-01 is answered on plain-HTTP listeners; the CA connects to port 80.
+    const has_plain = plain: {
+        for (cfg.servers) |other| for (other.listen) |l| if (l.tcp and !l.tls) break :plain true;
+        break :plain false;
+    };
+    if (!has_plain) return fail("acme needs a plain-HTTP listener for HTTP-01 challenges", .{});
+    // Certificates are stored under the first name; a second server using the
+    // same one must ask for the same thing.
+    for (cfg.servers) |*other| {
+        if (other == srv) break;
+        const oa = (other.tls orelse continue).acme orelse continue;
+        if (!std.mem.eql(u8, other.server_names[0], srv.server_names[0])) continue;
+        if (!std.mem.eql(u8, oa.directory, acme.directory) or !std.mem.eql(u8, oa.storage, acme.storage)) continue;
+        const same = other.server_names.len == srv.server_names.len and for (other.server_names, srv.server_names) |a, b| {
+            if (!std.mem.eql(u8, a, b)) break false;
+        } else true;
+        if (!same) return fail("acme: two servers starting with '{s}' need the same server_names", .{srv.server_names[0]});
+    }
+}
+
+/// Letters, digits and hyphens in dot-separated labels, and not an IP address.
+fn isDnsName(n: []const u8) bool {
+    if (n.len == 0 or n.len > 253) return false;
+    if (std.Io.net.IpAddress.parse(n, 0)) |_| return false else |_| {}
+    var it = std.mem.splitScalar(u8, n, '.');
+    while (it.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    }
+    return true;
 }
 
 fn checkHeader(h: HeaderKV) error{InvalidConfig}!void {
@@ -336,4 +411,46 @@ test "host:port parsing" {
     try std.testing.expectEqualStrings("::1", hp.host);
     try std.testing.expectEqual(@as(u16, 9001), hp.port);
     try std.testing.expectError(error.InvalidAddress, parseHostPort("nohost"));
+}
+
+test "acme tls: exactly one form, no wildcards, needs plain http" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const ok = try parse(a,
+        \\.{ .servers = .{.{
+        \\    .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true } },
+        \\    .server_names = .{ "example.com", "www.example.com" },
+        \\    .tls = .{ .acme = .{ .email = "ops@example.com", .storage = "/tmp/acme" } },
+        \\    .locations = .{.{ .prefix = "/", .root = "x" }},
+        \\}} }
+    , "test");
+    try std.testing.expectEqual(@as(u16, 30), ok.servers[0].tls.?.acme.?.renew_days);
+
+    const bad = [_][:0]const u8{
+        // wildcard
+        \\.{ .servers = .{.{ .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true } }, .server_names = .{"*.example.com"},
+        \\    .tls = .{ .acme = .{} }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        // no plain listener
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 443, .tls = true }}, .server_names = .{"example.com"},
+        \\    .tls = .{ .acme = .{} }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        // acme and cert together
+        \\.{ .servers = .{.{ .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true } }, .server_names = .{"example.com"},
+        \\    .tls = .{ .cert = "c", .key = "k", .acme = .{} }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        // no names
+        \\.{ .servers = .{.{ .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true } },
+        \\    .tls = .{ .acme = .{} }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        // IP address
+        \\.{ .servers = .{.{ .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true } }, .server_names = .{"192.0.2.1"},
+        \\    .tls = .{ .acme = .{} }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        // cert without key
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 443, .tls = true }}, .tls = .{ .cert = "c" }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
 }

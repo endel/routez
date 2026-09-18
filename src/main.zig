@@ -2,6 +2,7 @@ const std = @import("std");
 const quic = @import("quic");
 const config = @import("config.zig");
 const tls = @import("net/tls.zig");
+const acme = @import("acme.zig");
 const worker_mod = @import("worker.zig");
 const Worker = worker_mod.Worker;
 
@@ -23,12 +24,18 @@ const usage =
     \\
 ;
 
-/// Written by the signal handler, read by `main`: the one thing a handler
-/// can safely do.
+/// Written by the signal handler and the ACME thread, read by `main`: the
+/// one thing a handler can safely do.
 var signal_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
 fn onSignal(sig: std.posix.SIG) callconv(.c) void {
     const b: u8 = if (sig == .HUP) 'r' else 's';
+    _ = std.c.write(signal_pipe[1], @ptrCast(&b), 1);
+}
+
+/// A certificate changed on disk: reload the running configuration.
+fn onCertificateRenewed() void {
+    const b: u8 = 'c';
     _ = std.c.write(signal_pipe[1], @ptrCast(&b), 1);
 }
 
@@ -37,25 +44,33 @@ fn onSignal(sig: std.posix.SIG) callconv(.c) void {
 /// the old one.
 const Generation = struct {
     arena_state: std.heap.ArenaAllocator,
+    /// The config text this generation runs, reused when only certificates change.
+    source: [:0]const u8,
     cfg: config.Config,
     shared: Worker.Shared,
     workers: []*Worker,
     threads: []std.Thread,
 
-    fn start(io: std.Io, path: []const u8, first_id: usize) !*Generation {
+    /// Start workers on `source` if given, else on the file at `path`.
+    fn start(io: std.Io, path: []const u8, source: ?[:0]const u8, first_id: usize, manager: *acme.Manager) !*Generation {
         const alloc = std.heap.smp_allocator;
         const g = try alloc.create(Generation);
-        g.* = .{ .arena_state = .init(alloc), .cfg = undefined, .shared = undefined, .workers = &.{}, .threads = &.{} };
+        g.* = .{ .arena_state = .init(alloc), .source = undefined, .cfg = undefined, .shared = undefined, .workers = &.{}, .threads = &.{} };
         errdefer {
             g.arena_state.deinit();
             alloc.destroy(g);
         }
         const arena = g.arena_state.allocator();
-        g.cfg = config.load(io, arena, path) catch |err| {
+        g.source = if (source) |s| try arena.dupeZ(u8, s) else config.readSource(io, arena, path) catch |err| {
             log.err("{s}: {s}", .{ path, @errorName(err) });
             return err;
         };
-        g.shared = try loadShared(arena, &g.cfg);
+        g.cfg = config.parse(arena, g.source, path) catch |err| {
+            log.err("{s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        g.shared = try loadShared(arena, io, &g.cfg);
+        g.shared.challenges = &manager.challenges;
 
         const workers = try arena.alloc(*Worker, g.cfg.workers);
         var created: usize = 0;
@@ -70,6 +85,8 @@ const Generation = struct {
         g.workers = workers;
         g.threads = try arena.alloc(std.Thread, workers.len);
         for (g.threads, workers) |*t, w| t.* = try std.Thread.spawn(.{}, runWorker, .{w});
+        // After the listeners are up, so HTTP-01 challenges can be answered.
+        manager.setJobs(&g.cfg) catch |err| log.err("acme: {s}", .{@errorName(err)});
         return g;
     }
 
@@ -89,7 +106,7 @@ const Generation = struct {
 
 /// TLS material per listener, loaded once and shared read-only by the
 /// workers. One ticket key per generation lets any worker resume a session.
-fn loadShared(arena: std.mem.Allocator, cfg: *const config.Config) !Worker.Shared {
+fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !Worker.Shared {
     var ticket_key: [16]u8 = undefined;
     quic.sys.randomBytes(&ticket_key);
     var tls_listeners: std.ArrayListUnmanaged(Worker.Shared.TlsListener) = .empty;
@@ -106,7 +123,7 @@ fn loadShared(arena: std.mem.Allocator, cfg: *const config.Config) !Worker.Share
                     }
                 }
             }
-            const tc = tls.ServerConfig.load(arena, on_listener.items, ticket_key, &.{"http/1.1"}) catch |err| {
+            const tc = tls.ServerConfig.load(arena, io, on_listener.items, ticket_key, &.{"http/1.1"}) catch |err| {
                 log.err("tls for {s}:{d}: {s}", .{ l.address, l.port, @errorName(err) });
                 return err;
             };
@@ -140,7 +157,7 @@ pub fn main(init: std.process.Init) !u8 {
             log.err("{s}: {s}", .{ path, @errorName(err) });
             return 1;
         };
-        _ = loadShared(check_arena.allocator(), &cfg) catch return 1;
+        _ = loadShared(check_arena.allocator(), init.io, &cfg) catch return 1;
         log.info("{s}: configuration ok", .{path});
         return 0;
     }
@@ -153,8 +170,9 @@ pub fn main(init: std.process.Init) !u8 {
     std.posix.sigaction(.TERM, &act, null);
     std.posix.sigaction(.HUP, &act, null);
 
+    const manager = try acme.Manager.create(std.heap.smp_allocator, init.io, onCertificateRenewed);
     var next_id: usize = 0;
-    var gen = Generation.start(init.io, path, next_id) catch return 1;
+    var gen = Generation.start(init.io, path, null, next_id, manager) catch return 1;
     next_id += gen.workers.len;
     log.info("{d} worker(s) running, config {s}", .{ gen.workers.len, path });
 
@@ -162,9 +180,11 @@ pub fn main(init: std.process.Init) !u8 {
         var b: u8 = 0;
         const n = std.c.read(signal_pipe[0], @ptrCast(&b), 1);
         if (n != 1) continue; // EINTR
-        if (b == 'r') {
-            log.info("reloading {s}", .{path});
-            const fresh = Generation.start(init.io, path, next_id) catch {
+        if (b == 'r' or b == 'c') {
+            // A new certificate reloads the same config text, not whatever
+            // the file holds now: edits wait for their SIGHUP.
+            if (b == 'r') log.info("reloading {s}", .{path}) else log.info("reloading for a new certificate", .{});
+            const fresh = Generation.start(init.io, path, if (b == 'c') gen.source else null, next_id, manager) catch {
                 log.err("reload failed; keeping the running configuration", .{});
                 continue;
             };
