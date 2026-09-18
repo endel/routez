@@ -26,6 +26,7 @@ bun "$HERE/ws_upstream.ts" & PIDS+=($!)
 QZ="$ROOT/../quic-zig"
 (cd "$ROOT" && zig build wt-slow-server) || exit 1
 "$ROOT/zig-out/bin/wt-slow-server" 4451 "$CERTS/server.crt" "$CERTS/server.key" >/dev/null 2>&1 & PIDS+=($!)
+"$ROOT/zig-out/bin/wt-slow-server" 4452 "$CERTS/server.crt" "$CERTS/server.key" 64 >/dev/null 2>&1 & PIDS+=($!)
 (cd "$QZ" && exec ./zig-out/bin/wt-echo-server --cert interop/certs/server.crt --key interop/certs/server.key --port 4450 >/dev/null 2>&1) & PIDS+=($!)
 
 # Wait until a TCP port accepts connections (slow CI machines start slowly).
@@ -168,6 +169,13 @@ kill $WT 2>/dev/null; wait $WT 2>/dev/null
 SUITE=wt check webtransport-flood "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wtflood.log")" "wt-ok"
 grep -q wt-ok "$WORK/wtflood.log" || tail -5 "$WORK/wtflood.log"
 SUITE=wt check webtransport-backpressure "$([ $((peak - base)) -lt 16384 ] && echo bounded || echo "grew $((peak - base)) KB")" bounded
+
+# An upstream granting 64 KiB of session credit (WT_MAX_DATA): a write past
+# it is refused, not buffered, so the relay must hold it rather than drop it.
+"$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" 4 /wt-credit > "$WORK/wtcredit.log" 2>&1 & WT=$!
+for _ in $(seq 1 300); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+kill $WT 2>/dev/null; wait $WT 2>/dev/null
+SUITE=wt check webtransport-session-credit "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wtcredit.log")" "wt-ok"
 
 B=http://127.0.0.1:18080
 CURL="$CURL_BIN -s --max-time 10"

@@ -2,6 +2,8 @@
 //! 100 ms per stream, pausing the stream in between. When a stream ends it
 //! answers "got <n>" with the byte count. Used to check that the relay
 //! holds a fast client back instead of buffering. Usage: PORT CERT KEY
+//! [CREDIT_KIB], the last granting each session only that much WebTransport
+//! session credit (WT_MAX_DATA), so a sender runs into it.
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -66,10 +68,13 @@ var timer: xev.Timer = undefined;
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const port = try std.fmt.parseInt(u16, args[1], 10);
+    var credits: quic.webtransport_flow_control.Credits = .default;
+    if (args.len > 4) credits.max_data = try std.fmt.parseInt(u64, args[4], 10) * 1024;
     var server = try event_loop.Server(Handler).init(std.heap.page_allocator, &handler, .{
         .port = port,
         .cert_path = args[2],
         .key_path = args[3],
+        .wt_credits = credits,
     });
     defer server.deinit();
     timer = try xev.Timer.init();
