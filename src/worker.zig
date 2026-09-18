@@ -14,6 +14,7 @@ const tls = @import("net/tls.zig");
 const acme = @import("acme.zig");
 const H1Conn = @import("http1/server_conn.zig").Conn;
 const stats = @import("stats.zig");
+const steering = @import("steering.zig");
 const socket = @import("net/socket.zig");
 const UdpProxy = @import("udp_proxy.zig").UdpProxy;
 const h3_server = @import("h3/server.zig");
@@ -59,6 +60,11 @@ pub const QuicListener = union(enum) {
         return switch (self) {
             inline else => |l| l.server.isDrained(),
         };
+    }
+    fn inject(self: QuicListener, d: *const steering.Datagram) void {
+        switch (self) {
+            inline else => |l| l.server.injectDatagram(d.bytes, d.peer, d.local, d.ecn),
+        }
     }
     fn isStopped(self: QuicListener) bool {
         return switch (self) {
@@ -109,6 +115,9 @@ pub const Worker = struct {
     gzip_active: u32 = 0,
 
     stop_async: xev.Async,
+    /// QUIC datagrams other workers received for our connections.
+    inbox: steering.Inbox,
+    inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
     /// Drain is over; waiting for QUIC servers to get off the loop.
@@ -124,6 +133,11 @@ pub const Worker = struct {
         tls_listeners: []const TlsListener,
         /// Pending HTTP-01 challenges, answered on plain-HTTP listeners.
         challenges: ?*acme.Challenges = null,
+        /// Same in every worker and generation: a Retry token or stateless
+        /// reset from one worker must hold up at any other.
+        quic_keys: QuicKeys,
+
+        pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
         pub const TlsListener = struct { address: []const u8, port: u16, cfg: *const tls.ServerConfig };
 
@@ -147,6 +161,7 @@ pub const Worker = struct {
             .loop = try xev.Loop.init(.{}),
             .timers = undefined,
             .stop_async = try xev.Async.init(),
+            .inbox = try steering.Inbox.init(io, alloc),
         };
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
@@ -278,11 +293,33 @@ pub const Worker = struct {
     pub fn run(self: *Worker) !void {
         self.timers.start();
         self.stop_async.wait(&self.loop, &self.stop_c, Worker, self, onStopSignal);
+        self.inbox.wake.wait(&self.loop, &self.inbox.wake_c, Worker, self, onInbox);
+        steering.registry.register(self.io, self.alloc, steering.serverId(self.id), &self.inbox) catch {};
+        defer steering.registry.unregister(self.io, steering.serverId(self.id));
         for (self.listeners.items) |l| l.start();
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
         try self.loop.run(.until_done);
         log.info("worker {d} stopped", .{self.id});
+    }
+
+    fn onInbox(ud: ?*Worker, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        _ = r catch {};
+        const self = ud.?;
+        self.inbox_drain.clearRetainingCapacity();
+        self.inbox.drain(&self.inbox_drain);
+        for (self.inbox_drain.items) |*d| {
+            stats.inc(&stats.quic_steered);
+            const port = std.mem.bigToNative(u16, @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&d.local))).port);
+            for (self.quic_listeners.items) |q| {
+                if (q.port() == port) {
+                    q.inject(d);
+                    break;
+                }
+            }
+            self.alloc.free(d.bytes);
+        }
+        return .rearm;
     }
 
     /// Ask the worker to drain and exit. Safe from any thread or a signal handler.

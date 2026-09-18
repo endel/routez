@@ -109,6 +109,9 @@ const Generation = struct {
 
 /// TLS material per listener, loaded once and shared read-only by the
 /// workers. One ticket key per generation lets any worker resume a session.
+/// Generated once per process, so they survive reloads.
+var quic_keys: Worker.Shared.QuicKeys = undefined;
+
 fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !Worker.Shared {
     var ticket_key: [16]u8 = undefined;
     quic.sys.randomBytes(&ticket_key);
@@ -133,7 +136,7 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
             try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
         }
     }
-    return .{ .tls_listeners = tls_listeners.items };
+    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys };
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -165,6 +168,8 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
+    quic.sys.randomBytes(&quic_keys.retry);
+    quic.sys.randomBytes(&quic_keys.reset);
     if (std.c.pipe(&signal_pipe) != 0) return error.PipeFailed;
     const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(.PIPE, &ignore, null);
@@ -206,7 +211,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         gen.stop();
         gen.join();
-        log.info("stopped", .{});
+        log.info("stopped (quic steered: {d})", .{@import("stats.zig").quic_steered.load(.monotonic)});
         return 0;
     }
 }
@@ -235,4 +240,5 @@ test {
     _ = @import("h3/server.zig");
     _ = @import("gzip.zig");
     _ = @import("acme.zig");
+    _ = @import("steering.zig");
 }

@@ -60,6 +60,16 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("fuzz", "Run fuzz targets under a mutation loop").dependOn(&b.addRunArtifact(fuzz).step);
 
+    // HTTP/3 client used by the connection-migration check in tests/e2e/run.sh.
+    const h3_client = b.addExecutable(.{ .name = "h3-test-client", .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/e2e/h3_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "quic", .module = quic_mod }},
+    }) });
+    b.step("h3-test-client", "Build the HTTP/3 e2e client").dependOn(&b.addInstallArtifact(h3_client, .{}).step);
+
     const tests = b.addTest(.{ .root_module = root_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
