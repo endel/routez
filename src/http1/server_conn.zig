@@ -64,6 +64,12 @@ pub const Conn = struct {
     /// Waiting for the PROXY protocol header, ahead of anything else.
     proxy_pending: bool = false,
 
+    /// `sock.queued_total` when the current request began.
+    resp_start: u64 = 0,
+    /// Finished exchanges whose responses are still queued, oldest first.
+    flush_head: ?*Exchange = null,
+    flush_tail: ?*Exchange = null,
+
     next: ?*Conn = null,
     prev: ?*Conn = null,
     /// Set when counted against a per-IP limit.
@@ -222,8 +228,42 @@ pub const Conn = struct {
     }
 
     pub fn onSocketSent(self: *Conn) void {
+        while (self.flush_head) |ex| {
+            if (ex.flush_mark > self.sock.sent_total) break;
+            self.popFlushed().onFlushed(0);
+        }
         // Closing after a flush: a client still taking the output isn't idle.
         if (self.phase == .closing) self.armClosingDeadline();
+    }
+
+    fn popFlushed(self: *Conn) *Exchange {
+        const ex = self.flush_head.?;
+        self.flush_head = ex.flush_next;
+        if (self.flush_head == null) self.flush_tail = null;
+        ex.flush_next = null;
+        return ex;
+    }
+
+    /// The connection is closing: whatever is still queued is lost.
+    pub fn abandonFlushes(self: *Conn) void {
+        while (self.flush_head != null) {
+            const ex = self.popFlushed();
+            ex.onFlushed(ex.flush_mark - @max(self.sock.sent_total, ex.flush_start));
+        }
+    }
+
+    /// Bytes queued for the current request and not yet sent.
+    fn unsent(self: *const Conn) u64 {
+        const q = self.sock.queued_total;
+        return q - @max(self.sock.sent_total, self.resp_start);
+    }
+
+    /// Hand the exchange its client's departure.
+    fn detachGone(self: *Conn) void {
+        const ex = self.ex orelse return;
+        self.ex = null;
+        ex.unsent = self.unsent();
+        ex.onDownstreamGone();
     }
 
     pub fn onSocketConnect(_: *Conn, _: ?anyerror) void {}
@@ -231,10 +271,8 @@ pub const Conn = struct {
     pub fn onSocketClosed(self: *Conn) void {
         // A queued process callback still points at us; free after it runs.
         if (self.process_cb.queued) return self.worker.timers.defer_(&self.sock.closed_cb);
-        if (self.ex) |ex| {
-            self.ex = null;
-            ex.onDownstreamGone();
-        }
+        self.abandonFlushes();
+        self.detachGone();
         const w = self.worker;
         w.timers.clear(&self.deadline);
         if (self.tls) |t| t.destroy();
@@ -247,10 +285,8 @@ pub const Conn = struct {
     /// The client vanished mid-request.
     fn clientGone(self: *Conn) void {
         self.phase = .closing;
-        if (self.ex) |ex| {
-            self.ex = null;
-            ex.onDownstreamGone();
-        }
+        self.abandonFlushes();
+        self.detachGone();
         self.sock.abort();
     }
 
@@ -363,6 +399,7 @@ pub const Conn = struct {
         const head = parsed.head;
 
         self.requests += 1;
+        self.resp_start = self.sock.queued_total;
         // Test hook: a small send buffer keeps output queued on our side.
         if (build_options.fault_injection and std.mem.indexOf(u8, head.target, "small-sndbuf") != null) {
             socket.setSendBuffer(self.sock.fd(), 16 * 1024);
@@ -478,8 +515,7 @@ pub const Conn = struct {
                 ex.sendError(status);
                 return;
             }
-            self.ex = null;
-            ex.onDownstreamGone();
+            self.detachGone();
         }
         self.sock.abort();
         self.phase = .closing;
@@ -556,6 +592,8 @@ pub const Conn = struct {
         .sendHead = dsSendHead,
         .sendBody = dsSendBody,
         .finish = dsFinish,
+        .finishTracked = dsFinishTracked,
+        .unsent = dsUnsent,
         .abort = dsAbort,
         .buffered = dsBuffered,
         .setRequestBodyPaused = dsSetPaused,
@@ -683,6 +721,29 @@ pub const Conn = struct {
             self.keep_alive = false;
         }
         self.nextRequest();
+    }
+
+    fn dsFinishTracked(ptr: *anyopaque, ex: *Exchange) bool {
+        const self = cast(ptr);
+        dsFinish(ptr);
+        const lost = self.sock.state == .closing or self.sock.state == .closed;
+        if (lost or self.sock.sent_total >= self.sock.queued_total) {
+            // A short body aborts the connection: not a complete response.
+            if (lost) {
+                ex.failed = true;
+                ex.unsent = self.unsent();
+            }
+            return false;
+        }
+        ex.flush_start = self.resp_start;
+        ex.flush_mark = self.sock.queued_total;
+        if (self.flush_tail) |t| t.flush_next = ex else self.flush_head = ex;
+        self.flush_tail = ex;
+        return true;
+    }
+
+    fn dsUnsent(ptr: *anyopaque) u64 {
+        return cast(ptr).unsent();
     }
 
     fn dsAbort(ptr: *anyopaque) void {

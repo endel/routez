@@ -508,7 +508,11 @@ which proxies to believe:
   `$body_bytes_sent`, `$request_time`, `$request`, `$request_method`,
   `$protocol`, `$upstream_addr`, `$request_completion`, `$time_iso8601`,
   `$time_local`, `$msec` and any request header as `$http_<name>`
-  (`$http_user_agent`); see `src/access_log.zig`. Values are escaped as
+  (`$http_user_agent`); see `src/access_log.zig`. Over HTTP/1.1, as in
+  nginx, a request is logged once its response has been handed to the
+  kernel, and `$body_bytes_sent` counts only what was: a client that drops
+  the connection before then is logged with the bytes it got and no
+  `$request_completion`. Values are escaped as
   nginx does (`\xHH`), or for JSON with `.access_log_escape = .json`; the
   `json` preset always is. Times are in UTC. `main`, the default, is
   `client "GET /path HTTP/1.1" status bytes time host= upstream=`.
@@ -680,6 +684,9 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   set of names per week, and failed validations per hour); test against
   the staging directory before production.
 
+- HTTP/3 requests are logged when their response is produced, not when
+  the client has acknowledged it: a stream reset or lost connection after
+  that isn't reflected in `$body_bytes_sent` or `$request_completion`.
 - During a reload, new QUIC connections that the kernel hands to the old
   generation's sockets are refused until it finishes draining (up to 10 s);
   browsers fall back to TCP meanwhile.

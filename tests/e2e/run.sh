@@ -761,7 +761,7 @@ fi
 SUITE=drain
 DR="$WORK/drain"; mkdir -p "$DR"
 cat > "$DR/routez.zon" <<EOF2
-.{ .access_log = false, .servers = .{.{
+.{ .access_log_path = "$DR/access.log", .access_log_format = "\$request \$status \$body_bytes_sent [\$request_completion]", .servers = .{.{
     .listen = .{ .{ .address = "127.0.0.1", .port = 18530 }, .{ .address = "127.0.0.1", .port = 18531, .tls = true, .quic = true } },
     .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
     .locations = .{ .{ .prefix = "/", .root = "$WORK/www" }, .{ .prefix = "/drain-sync/", .proxy_pass = "sync" } },
@@ -786,6 +786,15 @@ curls_check() {
     check "$1-curl" "$(sha < "$DR/plain.bin") $(sha < "$DR/tls.bin")" "$want $want"
     [ -n "$CH" ] && check "$1-curl-h3" "$(sha < "$DR/h3.bin")" "$want"
 }
+# The access log counts what reached the socket, and logs once it has: a
+# client dropping the connection with the response still queued shows.
+log_lines() { for _ in $(seq 1 50); do [ "$(wc -l < "$DR/access.log" 2>/dev/null)" -ge $1 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done; }
+check log-client-gone "$(drain_clients none 19010 plain:18530:/small-sndbuf-700k.bin:200000:reset)" "reset"
+log_lines 2
+check log-bytes-sent "$(awk '/small-sndbuf/ {print ($5 < 700000 ? "fewer" : $5), $6}' "$DR/access.log")" "fewer []"
+check log-client-stays "$(drain_clients none 19010 tls:18531:/small-sndbuf-700k.bin:2000000:sync)" ok
+log_lines 4
+check log-bytes-all-sent "$(awk '/small-sndbuf/ {print $5, $6}' "$DR/access.log" | tail -1)" "700000 [OK]"
 curls_start
 check reload "$(drain_clients HUP 19010 plain:18530:/small-sndbuf-700k.bin:200000:sync tls:18531:/small-sndbuf-700k.bin:200000:sync \
     plain:18530:/small-sndbuf-700k.bin:90000:nosync)" "ok ok ok"

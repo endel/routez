@@ -592,6 +592,7 @@ pub const Worker = struct {
         // so a reload doesn't leak them. Their memory goes with the process.
         var c = self.conns_head;
         while (c) |conn| : (c = conn.next) {
+            conn.abandonFlushes();
             _ = std.c.close(conn.sock.fd());
             if (conn.ip_key) |k| self.releaseIp(k);
             conn.ip_key = null;

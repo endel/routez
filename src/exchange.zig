@@ -56,6 +56,13 @@ pub const Downstream = struct {
         sendBody: *const fn (*anyopaque, []const u8) void,
         /// Response complete. The downstream detaches from the exchange.
         finish: *const fn (*anyopaque) void,
+        /// `finish`, for a downstream that can tell when the response has
+        /// gone out: true when some of it is still queued, and the
+        /// downstream then calls `ex.onFlushed` once it is sent or lost.
+        finishTracked: ?*const fn (*anyopaque, *Exchange) bool = null,
+        /// Bytes of the current response queued and never handed to the
+        /// socket, read before `abort` (which drops them).
+        unsent: ?*const fn (*anyopaque) u64 = null,
         /// Response failed after it started; the client must see an error
         /// (connection or stream reset). The downstream detaches.
         abort: *const fn (*anyopaque) void,
@@ -186,8 +193,18 @@ pub const Exchange = struct {
     start_ms: i64,
     head_sent: bool = false,
     done: bool = false,
-    /// Set when the response ended by abort rather than finish.
+    /// Set when the response ended by abort rather than finish, or didn't
+    /// all reach the socket.
     failed: bool = false,
+    /// Finished, and waiting for the downstream's `onFlushed` to log.
+    flushing: bool = false,
+    /// Response bytes (head and framing included) that never reached the
+    /// socket; `$body_bytes_sent` leaves them out.
+    unsent: u64 = 0,
+    /// For the downstream's queue of exchanges awaiting `onFlushed`.
+    flush_next: ?*Exchange = null,
+    flush_start: u64 = 0,
+    flush_mark: u64 = 0,
     upstream_addr: ?[]const u8 = null,
     /// Set when this response is being gzip-compressed.
     gz: ?*gzip.Encoder = null,
@@ -634,11 +651,26 @@ pub const Exchange = struct {
             self.releaseGzip();
         }
         self.done = true;
-        self.finished();
         if (self.down) |d| {
             self.down = null;
-            d.vtable.finish(d.ptr);
+            if (d.vtable.finishTracked) |f| {
+                self.flushing = f(d.ptr, self);
+            } else {
+                d.vtable.finish(d.ptr);
+            }
         }
+        // Logged once sent, like nginx: a client gone meanwhile shows.
+        if (self.flushing) return;
+        self.finished();
+        if (self.handler == .none) self.destroy();
+    }
+
+    /// The downstream sent the rest of a finished response (`unsent` 0), or
+    /// lost `unsent` bytes of it. Frees the exchange if no handler holds it.
+    pub fn onFlushed(self: *Exchange, unsent: u64) void {
+        self.flushing = false;
+        self.unsent = unsent;
+        self.finished();
         if (self.handler == .none) self.destroy();
     }
 
@@ -648,6 +680,9 @@ pub const Exchange = struct {
         if (self.done) return;
         self.done = true;
         self.failed = true;
+        if (self.down) |d| {
+            if (d.vtable.unsent) |u| self.unsent = u(d.ptr);
+        }
         self.finished();
         if (self.down) |d| {
             self.down = null;
@@ -778,11 +813,11 @@ pub const Exchange = struct {
     /// Frees the exchange if the response is over.
     pub fn handlerReleased(self: *Exchange) void {
         self.handler = .none;
-        if (self.done) self.destroy();
+        if (self.done and !self.flushing) self.destroy();
     }
 
     fn destroy(self: *Exchange) void {
-        std.debug.assert(self.done and self.down == null and self.handler == .none);
+        std.debug.assert(self.done and !self.flushing and self.down == null and self.handler == .none);
         self.releaseGzip();
         self.arena_state.deinit();
         self.worker.alloc.destroy(self);
@@ -796,6 +831,10 @@ pub const Exchange = struct {
 
     /// The response is over, sent or not: count it and log it.
     fn finished(self: *Exchange) void {
+        if (self.unsent > 0) {
+            self.failed = true;
+            self.bytes_sent -|= self.unsent;
+        }
         stats.response(self.req.protocol == .http3, self.status);
         stats.add(&stats.response_bytes, self.bytes_sent);
         if (!self.worker.cfg.access_log) return;

@@ -67,6 +67,10 @@ pub fn Socket(comptime Owner: type) type {
         /// `pending` are; bytes queued after it wait for it.
         file: ?FileOut = null,
         file_before: usize = 0,
+        /// Bytes ever queued, and those the kernel took: what was queued up
+        /// to some point has been sent once `sent_total` reaches it.
+        queued_total: u64 = 0,
+        sent_total: u64 = 0,
 
         state: State = .open,
         fd_closed: bool = false,
@@ -175,6 +179,7 @@ pub fn Socket(comptime Owner: type) type {
         pub fn write(self: *Self, data_in: []const u8) void {
             if (self.state != .open) return;
             if (data_in.len == 0) return;
+            self.queued_total += data_in.len;
             var data = data_in;
             // Nothing queued: try the kernel directly. A write completion
             // costs an epoll registration round trip (and on epoll a dup of
@@ -183,6 +188,7 @@ pub fn Socket(comptime Owner: type) type {
                 const rc = std.c.send(self.tcp.fd, data.ptr, data.len, send_flags);
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
+                    self.sent_total += n;
                     if (n == data.len) return;
                     data = data[n..];
                 }
@@ -208,6 +214,7 @@ pub fn Socket(comptime Owner: type) type {
 
         pub fn commit(self: *Self, n: usize) void {
             self.pending.items.len += n;
+            self.queued_total += n;
             self.kickWrite();
         }
 
@@ -225,8 +232,10 @@ pub fn Socket(comptime Owner: type) type {
                 f.release(f.hold);
                 if (!continues) return false;
                 cur.len += f.len;
+                self.queued_total += f.len;
                 return true;
             }
+            self.queued_total += f.len;
             self.file = f;
             self.file_before = self.pending.items.len;
             self.kickWrite();
@@ -286,6 +295,7 @@ pub fn Socket(comptime Owner: type) type {
                 const r = sendfile(self.tcp.fd, f.fd, f.offset, f.len);
                 f.offset += r.sent;
                 f.len -= r.sent;
+                self.sent_total += r.sent;
                 switch (r.status) {
                     .ok => if (r.sent == 0) return .failed, // the file shrank
                     .again => return .blocked,
@@ -329,6 +339,7 @@ pub fn Socket(comptime Owner: type) type {
                 return .disarm;
             };
             self.active_off += n;
+            self.sent_total += n;
             if (self.active_off >= self.active.items.len) {
                 self.active.clearRetainingCapacity();
                 self.active_off = 0;

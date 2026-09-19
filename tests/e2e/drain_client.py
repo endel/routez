@@ -1,6 +1,6 @@
 # Slow clients downloading while the server is told to stop or reload.
 #
-#   drain_client.py <server pid> <HUP|TERM> <sync port> <client>...
+#   drain_client.py <server pid> <HUP|TERM|none> <sync port> <client>...
 #   client = plain|tls : port : path : bytes per second : sync|nosync|reset
 #
 # A "sync" client pipelines a request for /drain-sync/ after its download.
@@ -8,12 +8,12 @@
 # download's response is fully produced, while much of it may still be
 # queued on its side; once every sync client's request has arrived and been
 # answered, the signal is sent. Each client then reads the rest and expects
-# every byte, then the server's close. A "reset" client drops its connection
-# at the sync point instead. Prints one word per client: ok, reset, or what
+# every byte, then the server's close (asked for when there is no signal). A
+# "reset" client drops its connection at the sync point instead. Prints one word per client: ok, reset, or what
 # went wrong.
 import os, signal, socket, ssl, sys, threading, time
 
-pid, sig, sync_port = int(sys.argv[1]), getattr(signal, "SIG" + sys.argv[2]), int(sys.argv[3])
+pid, sig, sync_port = int(sys.argv[1]), getattr(signal, "SIG" + sys.argv[2], None), int(sys.argv[3])
 specs = [a.split(":") for a in sys.argv[4:]]
 syncing = sum(1 for s in specs if s[4] != "nosync")
 arrived = 0
@@ -47,7 +47,8 @@ def upstream():
         if last:
             # Let the server finish these answers, so the connections are idle.
             time.sleep(0.2)
-            os.kill(pid, sig)
+            if sig is not None:
+                os.kill(pid, sig)
             signalled.set()
 
 
@@ -70,7 +71,7 @@ def client(spec, results, i):
         s = ctx.wrap_socket(s)
     req = b"GET %s HTTP/1.1\r\nHost: a\r\n\r\n" % path.encode()
     if mode != "nosync":
-        req += b"GET /drain-sync/ HTTP/1.1\r\nHost: a\r\n\r\n"
+        req += b"GET /drain-sync/ HTTP/1.1\r\nHost: a\r\n%s\r\n" % (b"Connection: close\r\n" if sig is None else b"")
     s.sendall(req)
     s.settimeout(15)
     data = b""
