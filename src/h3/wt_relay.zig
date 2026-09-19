@@ -21,6 +21,7 @@ const router = @import("../router.zig");
 const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
+const stats = @import("../stats.zig");
 const Worker = @import("../worker.zig").Worker;
 
 const log = std.log.scoped(.wt_relay);
@@ -354,6 +355,7 @@ pub fn Relay(comptime Listener: type) type {
             var client_buf: [64]u8 = undefined;
             const client_addr = socket.formatSockaddr(session.entry.conn.peerAddress(), &client_buf);
             const peer = group.pick(client_addr, &.{}) orelse return refuse(session, session_id);
+            stats.inc(&peer.stats.requests);
 
             self.open(w, session, session_id, path, headers, group, peer) catch |err| {
                 log.warn("relay to {s}: {s}", .{ peer.label, @errorName(err) });

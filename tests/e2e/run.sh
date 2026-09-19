@@ -246,6 +246,123 @@ SUITE=rsa check pss-schemes "$(sig_type rsa.test) $(sig_type rsa.test rsa_pss_rs
 SUITE=rsa check ec-alongside "$(sig_type localhost)" "ecdsa-SHA256"
 kill $RSA; wait $RSA 2>/dev/null
 
+# Operations: JSON access log to a file, reopened on SIGUSR1; error log at
+# warn; Prometheus metrics; a key that isn't the certificate's.
+OPS="$WORK/ops"; mkdir -p "$OPS"
+cat > "$OPS/routez.zon" <<EOF2
+.{ .access_log_path = "$OPS/access.log", .access_log_format = "json", .error_log = "$OPS/error.log", .log_level = .warn,
+   .servers = .{.{
+    .listen = .{.{ .address = "127.0.0.1", .port = 18460 }},
+    .locations = .{
+        .{ .prefix = "/", .@"return" = .{ .body = "ok" } },
+        .{ .prefix = "/api/", .proxy_pass = "ops_backend", .strip_prefix = true },
+        .{ .prefix = "/metrics", .metrics = true },
+    },
+  }},
+  .upstreams = .{.{ .name = "ops_backend", .servers = .{"127.0.0.1:19001"}, .health = .{ .path = "/healthz", .interval_ms = 200 } }},
+}
+EOF2
+"$ROOT/zig-out/bin/routez" "$OPS/routez.zon" 2> "$OPS/stderr.log" & OPSD=$!; PIDS+=($OPSD)
+wait_port 18460
+OCURL="$CURL_BIN -s --max-time 10"
+for i in 1 2 3; do $OCURL -o /dev/null "http://127.0.0.1:18460/api/x?i=$i"; done
+$OCURL -o /dev/null -A 'agent "quoted" \ back' "http://127.0.0.1:18460/nope%22"
+jsonl() { python3 -c "import json,sys; ls=[json.loads(l) for l in open(sys.argv[1])]; print($2)" "$1" 2>&1; }
+SUITE=ops check access-log-json "$(jsonl "$OPS/access.log" 'len(ls), ls[0]["status"], ls[0]["upstream_addr"], ls[3]["user_agent"], ls[3]["uri"]')" \
+    "4 200 127.0.0.1:19001 agent \"quoted\" \\ back /nope%22"
+mv "$OPS/access.log" "$OPS/access.log.1"
+kill -USR1 $OPSD
+for _ in $(seq 1 50); do [ -e "$OPS/access.log" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+$OCURL -o /dev/null "http://127.0.0.1:18460/after-rotate"
+SUITE=ops check reopen-on-usr1 "$(jsonl "$OPS/access.log.1" 'len(ls)') $(jsonl "$OPS/access.log" 'len(ls), ls[0]["uri"]')" "4 1 /after-rotate"
+# A broken reload is an error, logged; the info lines around it are not.
+cp "$OPS/routez.zon" "$OPS/good.zon"; echo broken >> "$OPS/routez.zon"
+kill -HUP $OPSD
+for _ in $(seq 1 50); do grep -q "reload failed" "$OPS/error.log" 2>/dev/null && break; perl -e 'select(undef,undef,undef,0.05)'; done
+SUITE=ops check error-log-level "$(grep -c 'reload failed' "$OPS/error.log") $(grep -c '\[info\]' "$OPS/error.log")" "1 0"
+METRICS=$($OCURL -D "$OPS/metrics.head" http://127.0.0.1:18460/metrics)
+SUITE=ops check metrics-content-type "$(grep -i '^content-type' "$OPS/metrics.head" | tr -d '\r')" "content-type: text/plain; version=0.0.4; charset=utf-8"
+# Five 2xx before the scrape; its connection and wait_port's are accepted too.
+SUITE=ops check metrics "$(python3 "$HERE/check_metrics.py" \
+    'routez_http_responses_total{protocol="http1",code="2xx"}' 'routez_http_responses_total{protocol="http1",code="4xx"}' \
+    'routez_upstream_requests_total{upstream="ops_backend",server="127.0.0.1:19001"}' \
+    'routez_upstream_healthy{upstream="ops_backend",server="127.0.0.1:19001"}' 'routez_reload_failures_total' \
+    'routez_connections_accepted_total{protocol="tcp"}' <<< "$METRICS")" "5 0 3 1 1 7"
+if command -v promtool >/dev/null; then
+    SUITE=ops check promtool "$(promtool check metrics <<< "$METRICS" 2>&1 | grep -vc '^$')" 0
+fi
+kill $OPSD; wait $OPSD 2>/dev/null
+$OPENSSL ecparam -genkey -name prime256v1 -noout -out "$OPS/other.key" 2>/dev/null
+sed "s|\.servers = \.{\.{|.servers = .{.{ .tls = .{ .cert = \"$CERTS/server.crt\", .key = \"$OPS/other.key\" },|; s|18460 }|18461, .tls = true }|" "$OPS/good.zon" > "$OPS/mismatch.zon"
+"$ROOT/zig-out/bin/routez" -t "$OPS/mismatch.zon" 2> "$OPS/mismatch.log"
+SUITE=ops check key-mismatch "$? $(grep -c 'is not the key of the first certificate' "$OPS/mismatch.log")" "1 1"
+
+# Dropping root after binding ports below 1024. Needs root: the Linux
+# container, or passwordless sudo on CI.
+if [ "$(id -u)" = 0 ]; then SUDO=""; PRIV_OK=1
+elif [ -n "${CI:-}" ] && sudo -n true 2>/dev/null; then SUDO="sudo -n"; PRIV_OK=1
+else PRIV_OK=; echo "skipping privilege checks: not root"; fi
+if [ -n "$PRIV_OK" ]; then
+SUITE=privileges
+# Under /tmp so that nobody can reach the config and certificates on reload.
+PRIV=$(mktemp -d /tmp/routez-priv.XXXXXX); chmod 755 "$PRIV"; mkdir -m 777 "$PRIV/logs"
+cp "$CERTS/server.crt" "$CERTS/server.key" "$PRIV/"; chmod 644 "$PRIV"/server.*
+priv_conf() {
+cat > "$PRIV/routez.zon" <<EOF2
+.{ .user = "nobody", .workers = 2, .access_log_path = "$PRIV/logs/access.log", .error_log = "$PRIV/logs/error.log",
+   .servers = .{.{
+    .listen = .{ .{ .address = "127.0.0.1", .port = 880, .tls = true, .quic = true }, .{ .address = "127.0.0.1", .port = 881 } $2 },
+    .tls = .{ .cert = "$PRIV/server.crt", .key = "$PRIV/server.key" },
+    .locations = .{.{ .prefix = "/", .@"return" = .{ .body = "$1" } }},
+}} }
+EOF2
+}
+priv_conf priv ""
+$SUDO "$ROOT/zig-out/bin/routez" "$PRIV/routez.zon" 2> "$PRIV/stderr.log" & SPID=$!; PIDS+=($SPID)
+wait_port 881
+PPID_=$SPID; [ -n "$SUDO" ] && PPID_=$(pgrep -P $SPID | head -1)
+psig() { $SUDO kill -"$1" $PPID_; }
+wait_log() { for _ in $(seq 1 100); do grep -q "$1" "$PRIV/logs/error.log" && return; perl -e 'select(undef,undef,undef,0.1)'; done; }
+PCURL="$CURL_BIN -s --max-time 10 --cacert $CERTS/ca.crt"
+NOBODY="$(id -u nobody) $(id -g nobody)"
+if [ -d /proc ]; then
+    ids=$(for f in /proc/$PPID_/task/*/status; do echo "$(awk '/^Uid:/{print $2,$3,$4,$5}' $f) $(awk '/^Gid:/{print $2,$3,$4,$5}' $f)"; done | sort -u)
+    nu=${NOBODY% *}; ng=${NOBODY#* }
+    check all-threads-dropped "$ids" "$nu $nu $nu $nu $ng $ng $ng $ng"
+else
+    check dropped "$(ps -o uid= -o rgid= -p $PPID_ | awk '{print $1, $2}')" "$NOBODY"
+fi
+check serves "$($PCURL http://127.0.0.1:881/) $($PCURL https://127.0.0.1:880/)" "priv priv"
+"$ROOT/zig-out/bin/h3-test-client" 880 "$CERTS/ca.crt" 3 > "$PRIV/h3.log" 2>&1
+check serves-h3 "$(grep -o 'h3-ok' "$PRIV/h3.log")" "h3-ok"
+# A reload as nobody takes the privileged sockets over, QUIC's included.
+priv_conf priv2 ""
+psig HUP
+wait_log "worker 0 stopped"; wait_log "worker 1 stopped"
+check reload "$($PCURL http://127.0.0.1:881/) $($PCURL https://127.0.0.1:880/)" "priv2 priv2"
+"$ROOT/zig-out/bin/h3-test-client" 880 "$CERTS/ca.crt" 3 > "$PRIV/h3.log" 2>&1
+check reload-h3 "$(grep -o 'h3-ok' "$PRIV/h3.log")" "h3-ok"
+# A new privileged port can't be bound any more: the reload is refused.
+# (macOS has no privileged ports, nor has Docker by default.)
+if [ "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 0)" -gt 882 ]; then
+    priv_conf priv3 ', .{ .address = "127.0.0.1", .port = 882 }'
+    psig HUP
+    wait_log "reload failed"
+    check new-port-refused "$(grep -c 'ports below 1024 need root' "$PRIV/logs/error.log") $($PCURL http://127.0.0.1:881/)" "1 priv2"
+else
+    echo "skipping new-port-refused: port 882 is not privileged here"
+fi
+mv "$PRIV/logs/access.log" "$PRIV/logs/access.log.1"
+psig USR1
+for _ in $(seq 1 50); do [ -e "$PRIV/logs/access.log" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+$PCURL -o /dev/null http://127.0.0.1:881/rotated
+check reopen-as-nobody "$(grep -c rotated "$PRIV/logs/access.log")" 1
+psig TERM
+for _ in $(seq 1 50); do kill -0 $SPID 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+if grep -qiE "panic|segmentation" "$PRIV/logs/error.log" "$PRIV/stderr.log"; then fail=$((fail+1)); echo "FAIL privileged server crashed:"; cat "$PRIV/logs/error.log"; fi
+$SUDO rm -rf "$PRIV"
+fi
+
 # WebTransport through the relay: a stream and a datagram, echoed.
 (cd "$ROOT" && zig build wt-test-client) || exit 1
 "$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" > "$WORK/wt.log" 2>&1 & WT=$!

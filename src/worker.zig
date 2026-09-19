@@ -18,6 +18,9 @@ const steering = @import("steering.zig");
 const socket = @import("net/socket.zig");
 const UdpProxy = @import("udp_proxy.zig").UdpProxy;
 const h3_server = @import("h3/server.zig");
+const access_log = @import("access_log.zig");
+const logs = @import("logs.zig");
+const privileges = @import("privileges.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -81,7 +84,66 @@ pub const QuicListener = union(enum) {
             inline else => |l| l.liveConnections(),
         };
     }
+    /// Connections accepted since the server started.
+    fn accepted(self: QuicListener) u64 {
+        return switch (self) {
+            inline else => |l| l.server.conn_mgr.next_entry_id - 1,
+        };
+    }
+    fn socket(self: QuicListener) std.posix.socket_t {
+        return switch (self) {
+            inline else => |l| l.server.sockfd,
+        };
+    }
 };
+
+/// The generation a reload replaces, whose listening sockets the new one
+/// takes over.
+pub const Predecessor = struct {
+    /// The old worker at this one's index, if there was one.
+    same: ?*const Worker = null,
+    all: []const *Worker = &.{},
+
+    /// The TCP listener to share: the same worker's, else, once root is
+    /// dropped and a fresh bind would fail, any worker's.
+    fn tcp(self: Predecessor, address: []const u8, port: u16) ?*const Listener {
+        if (self.same) |w| if (w.findListenerConst(address, port)) |l| return l;
+        if (!privileges.dropped) return null;
+        for (self.all) |w| if (w.findListenerConst(address, port)) |l| return l;
+        return null;
+    }
+
+    /// A dup of the QUIC socket to take over; only once root is dropped,
+    /// before which a fresh one joins the SO_REUSEPORT group.
+    fn quic(self: Predecessor, address: []const u8, port: u16) !?std.posix.socket_t {
+        if (!privileges.dropped) return null;
+        if (self.same) |w| if (w.findQuicListenerConst(address, port)) |q| return try dupFd(q.socket());
+        for (self.all) |w| if (w.findQuicListenerConst(address, port)) |q| return try dupFd(q.socket());
+        return null;
+    }
+
+    fn udp(self: Predecessor, address: []const u8, port: u16) !?std.posix.socket_t {
+        if (!privileges.dropped) return null;
+        if (self.same) |w| if (w.findUdpProxyConst(address, port)) |u| return try dupFd(u.fd);
+        for (self.all) |w| if (w.findUdpProxyConst(address, port)) |u| return try dupFd(u.fd);
+        return null;
+    }
+};
+
+pub fn dupFd(fd: std.posix.fd_t) !std.posix.fd_t {
+    const d = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+    if (d < 0) return error.DupFailed;
+    return d;
+}
+
+/// Log a failed bind, explaining the one a dropped root can't do.
+pub fn bindFailed(what: []const u8, address: []const u8, port: u16, err: anyerror) void {
+    if (privileges.dropped and port < 1024 and err == error.AccessDenied) {
+        log.err("{s} {s}:{d}: ports below 1024 need root, which the server gave up at start; restart it to add this one", .{ what, address, port });
+    } else {
+        log.err("{s} {s}:{d}: {s}", .{ what, address, port, @errorName(err) });
+    }
+}
 
 const log = std.log.scoped(.worker);
 
@@ -127,6 +189,9 @@ pub const Worker = struct {
     stop_started_ms: i64 = 0,
     /// Connections that never sent a request have been closed.
     fresh_closed: bool = false,
+    /// QUIC counts last added to the process-wide stats.
+    quic_accepted_pub: u64 = 0,
+    quic_active_pub: u64 = 0,
 
     /// Built once in main and shared read-only by all workers.
     pub const Shared = struct {
@@ -138,6 +203,9 @@ pub const Worker = struct {
         quic_keys: QuicKeys,
         /// Trust anchors for each verified TLS upstream, by upstream name.
         upstream_cas: []const UpstreamCa = &.{},
+        access_format: access_log.Format = .main,
+        /// Where access log lines go.
+        access_fd: std.posix.fd_t = 2,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -160,9 +228,8 @@ pub const Worker = struct {
         }
     };
 
-    /// `prev` is the worker this one replaces on a reload, if any: its TCP
-    /// listening sockets are shared rather than reopened.
-    pub fn create(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config, shared: *const Shared, id: usize, prev: ?*const Worker) !*Worker {
+    /// On a reload, `prev` has the sockets to share rather than reopen.
+    pub fn create(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config, shared: *const Shared, id: usize, prev: Predecessor) !*Worker {
         const w = try alloc.create(Worker);
         errdefer alloc.destroy(w);
         w.* = .{
@@ -178,10 +245,11 @@ pub const Worker = struct {
         };
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
+        errdefer w.closeSockets();
         try w.setupUpstreams();
         try w.setupListeners(prev);
-        try w.setupQuicListeners();
-        for (cfg.udp_proxies) |*u| try w.udp_proxies.append(alloc, try UdpProxy.create(w, u));
+        try w.setupQuicListeners(prev);
+        for (cfg.udp_proxies) |*u| try w.udp_proxies.append(alloc, try UdpProxy.create(w, u, try prev.udp(u.address, u.port)));
         return w;
     }
 
@@ -189,12 +257,23 @@ pub const Worker = struct {
         for (self.groups.items) |g| g.deinit();
         self.groups.deinit(self.alloc);
         self.group_names.deinit(self.alloc);
-        for (self.listeners.items) |l| l.destroy();
+        self.closeSockets();
         self.listeners.deinit(self.alloc);
         self.timers.deinit();
         self.stop_async.deinit();
         self.loop.deinit();
         self.alloc.destroy(self);
+    }
+
+    /// For a worker that never ran: close what it bound or took over, so a
+    /// failed reload leaves nothing in an SO_REUSEPORT group.
+    fn closeSockets(self: *Worker) void {
+        for (self.listeners.items) |l| l.destroy();
+        self.listeners.clearRetainingCapacity();
+        for (self.quic_listeners.items) |q| q.deinit();
+        self.quic_listeners.clearRetainingCapacity();
+        for (self.udp_proxies.items) |u| _ = std.c.close(u.fd);
+        self.udp_proxies.clearRetainingCapacity();
     }
 
     fn setupUpstreams(self: *Worker) !void {
@@ -231,7 +310,7 @@ pub const Worker = struct {
         return null;
     }
 
-    fn setupListeners(self: *Worker, prev: ?*const Worker) !void {
+    fn setupListeners(self: *Worker, prev: Predecessor) !void {
         // One TCP listener per address:port, shared by the servers naming it.
         for (self.cfg.servers) |*srv| {
             for (srv.listen) |l| {
@@ -245,15 +324,14 @@ pub const Worker = struct {
                     continue;
                 }
                 const tc: ?*const tls.ServerConfig = if (l.tls) self.shared.tlsFor(l.address, l.port) orelse return error.InvalidConfig else null;
-                const inherit = if (prev) |p| p.findListenerConst(l.address, l.port) else null;
-                const lst = try Listener.create(self, l, tc, inherit);
+                const lst = try Listener.create(self, l, tc, prev.tcp(l.address, l.port));
                 try lst.addServer(srv);
                 try self.listeners.append(self.alloc, lst);
             }
         }
     }
 
-    fn setupQuicListeners(self: *Worker) !void {
+    fn setupQuicListeners(self: *Worker, prev: Predecessor) !void {
         for (self.cfg.servers) |*srv| {
             for (srv.listen) |l| {
                 if (!l.quic) continue;
@@ -262,10 +340,11 @@ pub const Worker = struct {
                     continue;
                 }
                 const tc = self.shared.tlsFor(l.address, l.port) orelse return error.InvalidConfig;
+                const sock = try prev.quic(l.address, l.port);
                 const ql: QuicListener = if (self.wantsWebTransport(l.address, l.port))
-                    .{ .wt = try WtListener.create(self, l, tc) }
+                    .{ .wt = try WtListener.create(self, l, tc, sock) }
                 else
-                    .{ .h3 = try H3Listener.create(self, l, tc) };
+                    .{ .h3 = try H3Listener.create(self, l, tc, sock) };
                 try ql.addServer(srv);
                 try self.quic_listeners.append(self.alloc, ql);
             }
@@ -282,6 +361,20 @@ pub const Worker = struct {
             for (srv.locations) |loc| if (loc.webtransport_pass != null) return true;
         }
         return false;
+    }
+
+    fn findQuicListenerConst(self: *const Worker, address: []const u8, port: u16) ?QuicListener {
+        for (self.quic_listeners.items) |l| {
+            if (l.port() == port and std.mem.eql(u8, l.address(), address)) return l;
+        }
+        return null;
+    }
+
+    fn findUdpProxyConst(self: *const Worker, address: []const u8, port: u16) ?*const UdpProxy {
+        for (self.udp_proxies.items) |u| {
+            if (u.cfg.port == port and std.mem.eql(u8, u.cfg.address, address)) return u;
+        }
+        return null;
     }
 
     fn findQuicListener(self: *Worker, address: []const u8, port: u16) ?QuicListener {
@@ -375,6 +468,7 @@ pub const Worker = struct {
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
         self.sweepRateBuckets();
+        self.publishQuicStats();
         for (self.quic_listeners.items) |q| switch (q) {
             .wt => |l| l.relay.checkPaused(),
             .h3 => {},
@@ -420,6 +514,7 @@ pub const Worker = struct {
         } else true;
         if (!all_stopped and self.timers.now_ms - self.finish_started_ms < 1000) return;
         if (all_stopped) {
+            self.publishQuicStats();
             // Closes their sockets; nothing of theirs is left on the loop.
             for (self.quic_listeners.items) |q| q.deinit();
             self.quic_listeners.clearRetainingCapacity();
@@ -428,8 +523,40 @@ pub const Worker = struct {
         // so a reload doesn't leak them. Their memory goes with the process.
         var c = self.conns_head;
         while (c) |conn| : (c = conn.next) _ = std.c.close(conn.sock.fd());
+        _ = stats.active_quic.fetchSub(self.quic_active_pub, .monotonic);
+        self.quic_active_pub = 0;
         self.timers.stop();
         self.loop.stop();
+    }
+
+    /// Bring the process-wide QUIC counts up to date with this worker's.
+    fn publishQuicStats(self: *Worker) void {
+        var accepted: u64 = 0;
+        var active: u64 = 0;
+        for (self.quic_listeners.items) |q| {
+            accepted += q.accepted();
+            active += q.liveConnections();
+        }
+        if (accepted > self.quic_accepted_pub) {
+            stats.add(&stats.accepted_quic, accepted - self.quic_accepted_pub);
+            self.quic_accepted_pub = accepted;
+        }
+        if (active > self.quic_active_pub) {
+            stats.add(&stats.active_quic, active - self.quic_active_pub);
+        } else {
+            _ = stats.active_quic.fetchSub(self.quic_active_pub - active, .monotonic);
+        }
+        self.quic_active_pub = active;
+    }
+
+    /// Prometheus metrics; upstream servers as this worker's config has them.
+    pub fn metrics(self: *Worker, w: *std.Io.Writer) !void {
+        var views: std.ArrayListUnmanaged(stats.UpstreamView) = .empty;
+        defer views.deinit(self.alloc);
+        for (self.groups.items) |g| for (g.peers) |*p| {
+            try views.append(self.alloc, .{ .stats = p.stats, .health_checked = g.cfg.health != null });
+        };
+        try stats.prometheus(w, views.items);
     }
 
     pub fn addConn(self: *Worker, c: *H1Conn) void {
@@ -508,9 +635,9 @@ pub const Worker = struct {
     }
 
     pub fn accessLog(self: *Worker, line: []const u8) void {
-        _ = self;
-        // One write(2) per line keeps lines from different workers whole.
-        _ = std.c.write(2, line.ptr, line.len);
+        // O_APPEND and one write(2) per line keep lines from different
+        // workers whole.
+        logs.writeAll(self.shared.access_fd, line);
     }
 };
 
@@ -535,11 +662,10 @@ pub const Listener = struct {
     /// share its socket: closing a listening socket resets the connections
     /// queued on it, and a SYN racing the close is refused.
     fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig, inherit: ?*const Listener) !*Listener {
-        const tcp = if (inherit) |old| blk: {
-            const fd = std.c.fcntl(old.tcp.fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
-            if (fd < 0) return error.DupFailed;
-            break :blk xev.TCP.initFd(fd);
-        } else try openListener(l);
+        const tcp = if (inherit) |old| xev.TCP.initFd(try dupFd(old.tcp.fd)) else openListener(l) catch |err| {
+            bindFailed("listen", l.address, l.port, err);
+            return err;
+        };
         errdefer _ = std.c.close(tcp.fd);
 
         const self = try w.alloc.create(Listener);

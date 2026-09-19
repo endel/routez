@@ -15,8 +15,10 @@ const quic_lb = quic.quic_lb;
 const config = @import("config.zig");
 const timers = @import("timers.zig");
 const socket = @import("net/socket.zig");
+const stats = @import("stats.zig");
 const upstream = @import("upstream.zig");
-const Worker = @import("worker.zig").Worker;
+const worker_mod = @import("worker.zig");
+const Worker = worker_mod.Worker;
 
 const log = std.log.scoped(.udp_proxy);
 const posix = std.posix;
@@ -83,21 +85,16 @@ pub const UdpProxy = struct {
     lb_ids: [][15]u8 = &.{},
     buf: [65536]u8 = undefined,
 
-    pub fn create(w: *Worker, cfg: *const config.UdpProxy) !*UdpProxy {
+    /// `sock`, when given, is the bound socket of the proxy this one
+    /// replaces; it is ours even if this fails.
+    pub fn create(w: *Worker, cfg: *const config.UdpProxy, sock: ?posix.socket_t) !*UdpProxy {
+        errdefer if (sock) |fd| sys.close(fd);
         const group = w.findGroup(cfg.proxy_pass) orelse return error.UnknownUpstream;
-        const ip = try std.Io.net.IpAddress.parse(cfg.address, cfg.port);
-        const storage = ipToStorage(ip);
-        const family: u32 = if (ip == .ip6) posix.AF.INET6 else posix.AF.INET;
-        const fd = try sys.socket(family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
-        errdefer sys.close(fd);
-        const one: c_int = 1;
-        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
-        // Same port in every worker; the kernel keeps a client's 4-tuple on one.
-        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(c_int));
-        const bufsz: c_int = 4 * 1024 * 1024;
-        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bufsz), @sizeOf(c_int));
-        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&bufsz), @sizeOf(c_int));
-        try sys.bind(fd, @ptrCast(&storage), sockaddrLen(&storage));
+        const fd = sock orelse openSocket(cfg) catch |err| {
+            worker_mod.bindFailed("udp_proxy", cfg.address, cfg.port, err);
+            return err;
+        };
+        errdefer if (sock == null) sys.close(fd);
 
         const self = try w.alloc.create(UdpProxy);
         self.* = .{ .worker = w, .cfg = cfg, .group = group, .fd = fd, .file = xev.File.initFd(fd) };
@@ -117,6 +114,23 @@ pub const UdpProxy = struct {
         }
         if (w.id == 0) log.info("udp proxy on {s}:{d} -> {s}{s}", .{ cfg.address, cfg.port, cfg.proxy_pass, if (self.lb != null) " (quic-lb)" else "" });
         return self;
+    }
+
+    fn openSocket(cfg: *const config.UdpProxy) !posix.socket_t {
+        const ip = try std.Io.net.IpAddress.parse(cfg.address, cfg.port);
+        const storage = ipToStorage(ip);
+        const family: u32 = if (ip == .ip6) posix.AF.INET6 else posix.AF.INET;
+        const fd = try sys.socket(family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+        errdefer sys.close(fd);
+        const one: c_int = 1;
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
+        // Same port in every worker; the kernel keeps a client's 4-tuple on one.
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(c_int));
+        const bufsz: c_int = 4 * 1024 * 1024;
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bufsz), @sizeOf(c_int));
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&bufsz), @sizeOf(c_int));
+        try sys.bind(fd, @ptrCast(&storage), sockaddrLen(&storage));
+        return fd;
     }
 
     pub fn start(self: *UdpProxy) void {
@@ -169,6 +183,7 @@ pub const UdpProxy = struct {
             const text = socket.formatSockaddr(from, &text_buf);
             break :blk self.group.pick(text, &.{}) orelse return;
         };
+        stats.inc(&peer.stats.requests);
         const flow = Flow.create(self, key, from, peer) catch |err| {
             log.warn("new flow to {s}: {s}", .{ peer.label, @errorName(err) });
             return;

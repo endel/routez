@@ -36,7 +36,11 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   (per-client token bucket).
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
-- `stub_status`-style counters and an access log.
+- Operations: drops root after binding (`user`, `group`), access and error
+  log files reopened on SIGUSR1 for rotation, access log formats (nginx's
+  `combined`, JSON lines, or a template of variables), a runtime log level,
+  Prometheus metrics and `stub_status`-style counters.
+- Certificates are checked against their keys at load (`-t` too).
 
 ## Build and run
 
@@ -75,6 +79,7 @@ A ZON file; see `src/config.zig` for every field and default.
                .add_headers = .{.{ .name = "cache-control", .value = "max-age=3600" }} },
             .{ .prefix = "/health", .@"return" = .{ .body = "ok\n" } },
             .{ .prefix = "/status", .stub_status = true },
+            .{ .prefix = "/metrics", .metrics = true },
             .{ .prefix = "/wt/", .webtransport_pass = "10.0.0.5:4433" },
         },
     }},
@@ -93,7 +98,8 @@ A ZON file; see `src/config.zig` for every field and default.
 ```
 
 - A location has exactly one of `root`, `proxy_pass`, `return`,
-  `stub_status` or `webtransport_pass`; the longest matching prefix wins.
+  `stub_status`, `metrics` or `webtransport_pass`; the longest matching
+  prefix wins.
 - `webtransport_pass` applies to WebTransport CONNECTs over HTTP/3. QUIC
   upstream certificates are not verified unless the upstream sets
   `tls_verify` or `tls_ca`.
@@ -121,7 +127,52 @@ A ZON file; see `src/config.zig` for every field and default.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
 - TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
-  not supported.
+  not supported. A key that doesn't belong to the first certificate of its
+  `cert` file fails the load.
+
+### Operations
+
+```zig
+.{
+    .user = "www-data",              // after binding; group defaults to its own
+    .error_log = "/var/log/routez/error.log",
+    .log_level = .warn,              // .err, .warn, .info (default), .debug
+    .access_log_path = "/var/log/routez/access.log",
+    .access_log_format = "json",     // "main" (default), "combined", "json" or a template
+    // .access_log_format = "$remote_addr [$time_iso8601] \"$request\" $status $request_time",
+    .servers = ...,
+}
+```
+
+- Started as root with `user` set, routez binds its listeners, opens its log
+  files, hands ACME storage to that user, then gives up root in every thread
+  before serving. If that fails it exits rather than serve as root. After
+  that a reload takes the listening sockets (TCP, QUIC and UDP) over from
+  the running workers, so it keeps ports below 1024, but it can't bind a new
+  one: such a reload is refused, naming the port, and the old configuration
+  keeps running. The config file, certificates and document roots must be
+  readable by `user`, since reloads read them as that user.
+- Without `access_log_path` and `error_log`, both go to stderr. SIGUSR1
+  reopens both by path, after logrotate has moved them; lines being written
+  meanwhile go to one file or the other, none is lost. The new files are
+  created by `user`, so the log directory must be writable by it, or the
+  rotation must create them (logrotate's `create`); a file that can't be
+  reopened keeps being written where it was.
+- Access log templates take the variables above and `$status`,
+  `$body_bytes_sent`, `$request_time`, `$request`, `$request_method`,
+  `$protocol`, `$upstream_addr`, `$request_completion`, `$time_iso8601`,
+  `$time_local`, `$msec` and any request header as `$http_<name>`
+  (`$http_user_agent`); see `src/access_log.zig`. Values are escaped as
+  nginx does (`\xHH`), or for JSON with `.access_log_escape = .json`; the
+  `json` preset always is. Times are in UTC. `main`, the default, is
+  `client "GET /path HTTP/1.1" status bytes time host= upstream=`.
+- `.metrics = true` on a location serves the Prometheus text format:
+  connections accepted and open (TCP and QUIC), requests by protocol,
+  responses by protocol and status class, body bytes in and out, per
+  upstream server requests, failures and health-check state, reloads,
+  QUIC datagrams steered between workers, workers, start time and version.
+  Counters are process-wide and survive reloads. Restrict it like any
+  location, for instance on a listener bound to a private address.
 
 ### Redirects and variables
 
@@ -271,7 +322,11 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
 - Static files are read on the worker thread; fine for page-cached files,
   slow disks stall that worker.
 - Upstream pools and health state are per worker, so health checks run once
-  per worker per interval.
+  per worker per interval; the `routez_upstream_healthy` metric is the
+  verdict of whichever worker probed last.
+- After dropping root, a reload can't add a listener on a port below 1024
+  or change `user`, and SIGUSR1 can't reopen a log file where `user` can't
+  write: nothing keeps root to do those, unlike nginx's master process.
 - TLS to upstreams: TLS 1.3 only, no session resumption (pooled keep-alive
   connections avoid most handshakes), no client certificates and no
   revocation checks. A literal `proxy_pass` target is always plain HTTP;

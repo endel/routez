@@ -17,6 +17,7 @@
 //! ```
 const std = @import("std");
 const vars = @import("http/vars.zig");
+const access_log = @import("access_log.zig");
 
 pub const Config = struct {
     /// Worker threads, each with its own event loop and SO_REUSEPORT sockets.
@@ -26,9 +27,32 @@ pub const Config = struct {
     /// Layer-4 UDP forwarding, for QUIC traffic we don't terminate.
     udp_proxies: []const UdpProxy = &.{},
     limits: Limits = .{},
-    /// Write one line per completed request to stderr.
+    /// Write one line per completed request.
     access_log: bool = true,
+    /// File the access log goes to, opened for appending; stderr when null.
+    /// Reopened on SIGUSR1, for log rotation.
+    access_log_path: ?[]const u8 = null,
+    /// `"main"` (the default line), `"combined"` (nginx's), `"json"` (one
+    /// object per line), or a template of `$variables`; see `access_log.zig`.
+    access_log_format: []const u8 = "main",
+    /// How a template escapes variable values: `.default` writes `"`, `\`
+    /// and control bytes as `\xHH`, `.json` escapes for a JSON string.
+    access_log_escape: LogEscape = .default,
+    /// File for everything else the server logs (stderr is redirected to
+    /// it); stderr when null. Reopened on SIGUSR1.
+    error_log: ?[]const u8 = null,
+    /// Least severe messages logged: `.err`, `.warn`, `.info` or `.debug`.
+    log_level: std.log.Level = .info,
+    /// Run as this user (a name or a numeric id) once listeners are bound,
+    /// so the server can start as root to bind ports below 1024. Log files
+    /// are opened and ACME storage handed over before the switch.
+    user: ?[]const u8 = null,
+    /// Group to run as (a name or a numeric id); `user`'s primary group
+    /// when null. Needs `user`.
+    group: ?[]const u8 = null,
 };
+
+pub const LogEscape = enum { default, json };
 
 pub const Limits = struct {
     /// Largest request or response head (request line + headers) accepted.
@@ -146,6 +170,8 @@ pub const Location = struct {
 
     /// Serve connection and request counters as plain text.
     stub_status: bool = false,
+    /// Serve counters in the Prometheus text format.
+    metrics: bool = false,
 
     pub const LimitReq = struct {
         /// Sustained requests per second.
@@ -273,6 +299,15 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
     // 0 would disable the idle timeout: dead peers would never be dropped.
     if (cfg.limits.quic_idle_timeout_ms == 0) return fail("limits.quic_idle_timeout_ms must be at least 1", .{});
     if (cfg.servers.len == 0 and cfg.udp_proxies.len == 0) return fail("nothing to serve: no servers or udp_proxies", .{});
+    if (cfg.group != null and cfg.user == null) return fail("group needs user", .{});
+    if (cfg.user) |u| if (u.len == 0) return fail("user is empty", .{});
+    if (cfg.access_log_path) |p| if (p.len == 0) return fail("access_log_path is empty", .{});
+    if (cfg.error_log) |p| if (p.len == 0) return fail("error_log is empty", .{});
+    access_log.validate(cfg.access_log_format) catch |err| return fail("access_log_format: {s}", .{switch (err) {
+        error.UnknownVariable => "unknown variable",
+        error.BadVariable => "bad variable syntax",
+        error.NoVariable => "not a preset (main, combined, json) and has no $variable",
+    }});
     for (cfg.udp_proxies) |u| {
         try checkTarget(cfg, u.proxy_pass);
         if (u.quic_lb) |lb| {
@@ -316,7 +351,8 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (loc.webtransport_pass != null) actions += 1;
             if (loc.@"return" != null) actions += 1;
             if (loc.stub_status) actions += 1;
-            if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, return, stub_status", .{loc.prefix});
+            if (loc.metrics) actions += 1;
+            if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, return, stub_status, metrics", .{loc.prefix});
             if (loc.prefix.len == 0 or loc.prefix[0] != '/') return fail("location prefix '{s}' must start with '/'", .{loc.prefix});
             if (loc.proxy_pass) |p| try checkTarget(cfg, p);
             for (loc.proxy_set_headers) |h| try checkHeader(h);

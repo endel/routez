@@ -42,11 +42,15 @@ pub fn has(template: []const u8) bool {
 /// One piece of a template: literal text or a variable.
 const Part = union(enum) { text: []const u8, variable: Var };
 
-const Iterator = struct {
+/// A template split into literal text and variable names, whatever the
+/// names; other templates (the access log's) accept more of them.
+pub const Scanner = struct {
     s: []const u8,
     i: usize = 0,
 
-    fn next(self: *Iterator) TemplateError!?Part {
+    pub const Token = union(enum) { text: []const u8, name: []const u8 };
+
+    pub fn next(self: *Scanner) TemplateError!?Token {
         const s = self.s;
         if (self.i >= s.len) return null;
         if (s[self.i] != '$') {
@@ -67,8 +71,7 @@ const Iterator = struct {
             self.i = end;
         }
         if (end == start) return error.BadVariable;
-        const v = std.meta.stringToEnum(Var, s[start..end]) orelse return error.UnknownVariable;
-        return .{ .variable = v };
+        return .{ .name = s[start..end] };
     }
 
     fn isNameChar(c: u8) bool {
@@ -76,9 +79,20 @@ const Iterator = struct {
     }
 };
 
+const Iterator = struct {
+    scanner: Scanner,
+
+    fn next(self: *Iterator) TemplateError!?Part {
+        return switch (try self.scanner.next() orelse return null) {
+            .text => |t| .{ .text = t },
+            .name => |n| .{ .variable = std.meta.stringToEnum(Var, n) orelse return error.UnknownVariable },
+        };
+    }
+};
+
 /// Check at config load that every variable in `template` exists.
 pub fn validate(template: []const u8) TemplateError!void {
-    var it: Iterator = .{ .s = template };
+    var it: Iterator = .{ .scanner = .{ .s = template } };
     while (try it.next()) |_| {}
 }
 
@@ -86,7 +100,7 @@ pub fn validate(template: []const u8) TemplateError!void {
 /// value, so a request can never smuggle CR or LF into a header through it.
 pub fn expand(alloc: std.mem.Allocator, template: []const u8, req: Request) error{ OutOfMemory, InvalidValue }![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    var it: Iterator = .{ .s = template };
+    var it: Iterator = .{ .scanner = .{ .s = template } };
     while (it.next() catch return error.InvalidValue) |part| switch (part) {
         .text => |t| try out.appendSlice(alloc, t),
         .variable => |v| try append(alloc, &out, v, req),
@@ -95,7 +109,7 @@ pub fn expand(alloc: std.mem.Allocator, template: []const u8, req: Request) erro
     return out.items;
 }
 
-fn append(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Var, req: Request) !void {
+pub fn append(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Var, req: Request) !void {
     switch (v) {
         .scheme => try out.appendSlice(alloc, req.scheme),
         .host => {

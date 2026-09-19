@@ -19,6 +19,9 @@ const Header = common.Header;
 const stats = @import("stats.zig");
 const gzip = @import("gzip.zig");
 const vars = @import("http/vars.zig");
+const access_log = @import("access_log.zig");
+const timers = @import("timers.zig");
+const logs = @import("logs.zig");
 
 pub const Response = struct {
     status: u16,
@@ -158,7 +161,7 @@ pub const Exchange = struct {
             .req = undefined,
             .server = init.vhosts.select(init.authority),
             .location = null,
-            .start_ms = worker.timers.now_ms,
+            .start_ms = timers.nowMs(),
         };
         errdefer ex.arena_state.deinit();
         const a = ex.arena_state.allocator();
@@ -224,6 +227,7 @@ pub const Exchange = struct {
             var buf: [512]u8 = undefined;
             return self.sendFixed(200, "text/plain; charset=utf-8", stats.format(&buf, self.worker.quicConnectionCount()));
         }
+        if (loc.metrics) return self.sendMetrics();
         if (loc.root) |root| return static.start(self, loc, root);
         if (loc.proxy_pass) |target| return proxy.start(self, loc, target);
         // webtransport_pass only means something to a CONNECT over HTTP/3.
@@ -233,6 +237,7 @@ pub const Exchange = struct {
     // ---- downstream events ----
 
     pub fn onRequestBody(self: *Exchange, data: []const u8) void {
+        stats.add(&stats.request_bytes, data.len);
         switch (self.handler) {
             .proxy => |p| p.onRequestBody(data),
             else => {},
@@ -262,7 +267,7 @@ pub const Exchange = struct {
             self.done = true;
             self.failed = true;
             if (self.status == 0) self.status = 499;
-            self.logAccess();
+            self.finished();
         }
         switch (self.handler) {
             .static => {
@@ -368,7 +373,7 @@ pub const Exchange = struct {
             self.releaseGzip();
         }
         self.done = true;
-        self.logAccess();
+        self.finished();
         if (self.down) |d| {
             self.down = null;
             d.vtable.finish(d.ptr);
@@ -382,7 +387,7 @@ pub const Exchange = struct {
         if (self.done) return;
         self.done = true;
         self.failed = true;
-        self.logAccess();
+        self.finished();
         if (self.down) |d| {
             self.down = null;
             d.vtable.abort(d.ptr);
@@ -480,10 +485,38 @@ pub const Exchange = struct {
         self.worker.alloc.destroy(self);
     }
 
-    fn logAccess(self: *Exchange) void {
+    fn sendMetrics(self: *Exchange) void {
+        var out: std.Io.Writer.Allocating = .init(self.arena());
+        self.worker.metrics(&out.writer) catch return self.sendError(500);
+        self.sendFixed(200, "text/plain; version=0.0.4; charset=utf-8", out.written());
+    }
+
+    /// The response is over, sent or not: count it and log it.
+    fn finished(self: *Exchange) void {
+        stats.response(self.req.protocol == .http3, self.status);
+        stats.add(&stats.response_bytes, self.bytes_sent);
         if (!self.worker.cfg.access_log) return;
+        const elapsed = timers.nowMs() - self.start_ms;
+        switch (self.worker.shared.access_format) {
+            .main => {},
+            .template => |t| {
+                const entry: access_log.Entry = .{
+                    .req = self.varRequest(),
+                    .method = self.req.method,
+                    .protocol = self.req.protocol.text(),
+                    .headers = self.req.headers,
+                    .status = self.status,
+                    .body_bytes = self.bytes_sent,
+                    .elapsed_ms = elapsed,
+                    .upstream_addr = self.upstream_addr,
+                    .completed = !self.failed,
+                    .now_ms = logs.realtimeMs(),
+                };
+                const line = access_log.render(t, self.arena(), &entry) catch return;
+                return self.worker.accessLog(line);
+            },
+        }
         var buf: [2048]u8 = undefined;
-        const elapsed = self.worker.timers.now_ms - self.start_ms;
         const line = std.fmt.bufPrint(&buf, "{s} \"{s} {s} {s}\" {d} {d} {d}ms host={s}{s}{s}{s}\n", .{
             self.req.client_addr,
             self.req.method,

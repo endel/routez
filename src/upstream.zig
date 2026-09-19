@@ -14,6 +14,7 @@ const timers = @import("timers.zig");
 const parser = @import("http1/parser.zig");
 const Worker = @import("worker.zig").Worker;
 const Proxy = @import("handlers/proxy.zig").Proxy;
+const stats = @import("stats.zig");
 
 const log = std.log.scoped(.upstream);
 
@@ -37,7 +38,7 @@ pub const Group = struct {
                 log.err("upstream '{s}': cannot resolve {s}: {s}", .{ cfg.name, text, @errorName(err) });
                 return err;
             };
-            p.* = .{ .group = g, .addr = ip, .label = text, .host = hp.host };
+            p.* = .{ .group = g, .addr = ip, .label = text, .host = hp.host, .stats = try stats.peer(worker.io, cfg.name, text) };
             if (cfg.tls) p.tls = .{
                 .server_name = cfg.tls_server_name orelse hp.host,
                 .alpn = &.{"http/1.1"},
@@ -130,8 +131,11 @@ pub const Peer = struct {
     probe: ?*Probe = null,
     /// Set for TLS upstreams.
     tls: ?quic.tls_client.Config = null,
+    /// Process-wide counters for this server, for metrics.
+    stats: *stats.Peer,
 
     pub fn recordFailure(self: *Peer) void {
+        stats.inc(&self.stats.failures);
         self.fails += 1;
         if (self.fails >= self.group.cfg.max_fails) {
             self.fails = 0;
@@ -146,6 +150,7 @@ pub const Peer = struct {
 
     /// Take a pooled connection or open a new one, bound to `user`.
     pub fn acquire(self: *Peer, user: *Proxy) !*UpConn {
+        stats.inc(&self.stats.requests);
         self.active += 1;
         errdefer self.active -= 1;
         while (self.idle_head) |c| {
@@ -202,6 +207,7 @@ pub const Peer = struct {
 
     fn healthResult(self: *Peer, ok: bool) void {
         const h = self.group.cfg.health orelse return;
+        defer self.stats.healthy.store(@intFromBool(self.health_ok), .monotonic);
         if (ok == self.health_ok) {
             self.health_streak = 0;
             return;

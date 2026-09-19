@@ -7,13 +7,19 @@ pub fn build(b: *std.Build) void {
     const quic_dep = b.dependency("quic", .{ .target = target, .optimize = optimize });
     const quic_mod = quic_dep.module("quic");
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         // quic-zig links libc for recvmsg; we use it for the remaining syscalls
         .link_libc = true,
-        .imports = &.{.{ .name = "quic", .module = quic_mod }},
+        .imports = &.{
+            .{ .name = "quic", .module = quic_mod },
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
     });
 
     const exe = b.addExecutable(.{ .name = "routez", .root_module = root_mod });

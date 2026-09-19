@@ -18,7 +18,8 @@ fn onForeign(ctx: ?*anyopaque, dg: *const event_loop.ForeignDatagram) void {
     const w: *Worker = @ptrCast(@alignCast(ctx.?));
     steering.registry.route(w.io, dg);
 }
-const Worker = @import("../worker.zig").Worker;
+const worker_mod = @import("../worker.zig");
+const Worker = worker_mod.Worker;
 const Exchange = exchange.Exchange;
 const Header = common.Header;
 
@@ -65,7 +66,12 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
         relay: wt_relay.Relay(Self) = .{},
         alpn: [1][]const u8 = .{"h3"},
 
-        pub fn create(w: *Worker, l: config.Listen, tc: *const tls.ServerConfig) !*Self {
+        /// `sock`, when given, is a bound socket to take over; it is ours
+        /// even if this fails.
+        pub fn create(w: *Worker, l: config.Listen, tc: *const tls.ServerConfig, sock: ?std.posix.socket_t) !*Self {
+            errdefer if (sock) |fd| {
+                _ = std.c.close(fd);
+            };
             const self = try w.alloc.create(Self);
             errdefer w.alloc.destroy(self);
             self.* = .{
@@ -84,7 +90,8 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .max_idle_timeout = w.cfg.limits.quic_idle_timeout_ms,
             };
             if (proto != .h3) conn_config.max_datagram_frame_size = (event_loop.Config{}).max_datagram_frame_size;
-            self.server = try Server.init(w.alloc, &self.handler, .{
+            self.server = Server.init(w.alloc, &self.handler, .{
+                .socket = sock,
                 .conn_config = conn_config,
                 .address = l.address,
                 .port = l.port,
@@ -108,7 +115,10 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .retry_token_key = w.shared.quic_keys.retry,
                 .static_reset_key = w.shared.quic_keys.reset,
                 .send_buffer_size = 4 * 1024 * 1024,
-            });
+            }) catch |err| {
+                if (sock == null) worker_mod.bindFailed("quic", l.address, l.port, err);
+                return err;
+            };
             if (w.id == 0) log.info("listening on {s}:{d} (quic{s})", .{ l.address, l.port, if (proto == .webtransport) ", webtransport" else "" });
             return self;
         }

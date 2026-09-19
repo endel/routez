@@ -5,9 +5,16 @@ const tls = @import("net/tls.zig");
 const acme = @import("acme.zig");
 const worker_mod = @import("worker.zig");
 const Worker = worker_mod.Worker;
+const logs = @import("logs.zig");
+const stats = @import("stats.zig");
+const access_log = @import("access_log.zig");
+const privileges = @import("privileges.zig");
+const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
-    .log_level = .info,
+    // Everything is compiled in; `log_level` in the config filters at run time.
+    .log_level = .debug,
+    .logFn = logs.logFn,
     // quic-zig logs every handshake step and frame on the default scope.
     .log_scope_levels = &.{
         // quic-zig reports a peer's normal CONNECTION_CLOSE as a warning.
@@ -29,7 +36,11 @@ const usage =
 var signal_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
 fn onSignal(sig: std.posix.SIG) callconv(.c) void {
-    const b: u8 = if (sig == .HUP) 'r' else 's';
+    const b: u8 = switch (sig) {
+        .HUP => 'r',
+        .USR1 => 'l',
+        else => 's',
+    };
     _ = std.c.write(signal_pipe[1], @ptrCast(&b), 1);
 }
 
@@ -50,6 +61,7 @@ const Generation = struct {
     shared: Worker.Shared,
     workers: []*Worker,
     threads: []std.Thread,
+    access_file: ?*logs.File = null,
 
     /// Start workers on `source` if given, else on the file at `path`.
     /// `prev` is the running generation being replaced, whose listening
@@ -59,6 +71,7 @@ const Generation = struct {
         const g = try alloc.create(Generation);
         g.* = .{ .arena_state = .init(alloc), .source = undefined, .cfg = undefined, .shared = undefined, .workers = &.{}, .threads = &.{} };
         errdefer {
+            if (g.access_file) |f| logs.release(io, f);
             g.arena_state.deinit();
             alloc.destroy(g);
         }
@@ -73,21 +86,51 @@ const Generation = struct {
             log.err("{s}: {s}", .{ path, @errorName(err) });
             return err;
         };
+        // At start, before binding, so all of it lands in the error log; on
+        // a reload once nothing else can fail.
+        if (prev == null) try applyLogging(io, &g.cfg);
+        // Resolved before binding anything, so a typo fails fast.
+        const ids = try resolveUser(arena, &g.cfg);
+        if (prev != null) if (ids) |u| if (!privileges.dropped or u.uid != std.c.getuid()) {
+            log.warn("user {s}: a change of user takes effect at the next restart", .{g.cfg.user.?});
+        };
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
+        g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
+        if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
+            g.access_file = logs.acquire(io, p) catch |err| {
+                log.err("access_log_path {s}: {s}", .{ p, @errorName(err) });
+                return err;
+            };
+            g.shared.access_fd = g.access_file.?.fd;
+        };
 
         const workers = try arena.alloc(*Worker, g.cfg.workers);
         var created: usize = 0;
         errdefer for (workers[0..created]) |w| w.destroy();
         for (workers, 0..) |*w, i| {
-            const prev_worker = if (prev) |p| (if (i < p.workers.len) p.workers[i] else null) else null;
-            w.* = Worker.create(alloc, io, &g.cfg, &g.shared, first_id + i, prev_worker) catch |err| {
+            const pred: worker_mod.Predecessor = if (prev) |p| .{ .same = if (i < p.workers.len) p.workers[i] else null, .all = p.workers } else .{};
+            w.* = Worker.create(alloc, io, &g.cfg, &g.shared, first_id + i, pred) catch |err| {
                 log.err("worker {d}: {s}", .{ i, @errorName(err) });
                 return err;
             };
             created += 1;
         }
         g.workers = workers;
+        if (prev != null) try applyLogging(io, &g.cfg);
+        // Listeners are bound and logs open: nothing left that needs root.
+        if (prev == null) if (ids) |u| {
+            privileges.prepareAcmeStorage(io, arena, &g.cfg, u) catch |err| {
+                log.err("acme storage for user {s}: {s}", .{ g.cfg.user.?, @errorName(err) });
+                return err;
+            };
+            logs.chownAll(io, u.uid, u.gid);
+            privileges.drop(u) catch |err| {
+                log.err("dropping to user {s}: {s}; refusing to serve as root", .{ g.cfg.user.?, @errorName(err) });
+                return err;
+            };
+            if (privileges.dropped) log.info("running as uid {d}, gid {d}", .{ u.uid, u.gid });
+        };
         g.threads = try arena.alloc(std.Thread, workers.len);
         for (g.threads, workers) |*t, w| t.* = try std.Thread.spawn(.{}, runWorker, .{w});
         // After the listeners are up, so HTTP-01 challenges can be answered.
@@ -103,12 +146,29 @@ const Generation = struct {
     /// Wait for the workers to drain, then free the generation. Workers'
     /// own memory is left alone: a connection that outlived the drain window
     /// may still point into it.
-    fn join(self: *Generation) void {
+    fn join(self: *Generation, io: std.Io) void {
         for (self.threads) |t| t.join();
+        if (self.access_file) |f| logs.release(io, f);
         self.arena_state.deinit();
         std.heap.smp_allocator.destroy(self);
     }
 };
+
+fn applyLogging(io: std.Io, cfg: *const config.Config) !void {
+    logs.setErrorLog(io, cfg.error_log) catch |err| {
+        log.err("error_log {s}: {s}", .{ cfg.error_log.?, @errorName(err) });
+        return err;
+    };
+    logs.setLevel(cfg.log_level);
+}
+
+fn resolveUser(arena: std.mem.Allocator, cfg: *const config.Config) !?privileges.Ids {
+    const user = cfg.user orelse return null;
+    return privileges.resolve(arena, user, cfg.group) catch |err| {
+        log.err("user {s}{s}{s}: {s}", .{ user, if (cfg.group != null) ", group " else "", cfg.group orelse "", @errorName(err) });
+        return err;
+    };
+}
 
 /// TLS material per listener, loaded once and shared read-only by the
 /// workers. One ticket key per generation lets any worker resume a session.
@@ -190,6 +250,7 @@ pub fn main(init: std.process.Init) !u8 {
             log.err("{s}: {s}", .{ path, @errorName(err) });
             return 1;
         };
+        _ = resolveUser(check_arena.allocator(), &cfg) catch return 1;
         _ = loadShared(check_arena.allocator(), init.io, &cfg) catch return 1;
         log.info("{s}: configuration ok", .{path});
         return 0;
@@ -204,32 +265,44 @@ pub fn main(init: std.process.Init) !u8 {
     std.posix.sigaction(.INT, &act, null);
     std.posix.sigaction(.TERM, &act, null);
     std.posix.sigaction(.HUP, &act, null);
+    std.posix.sigaction(.USR1, &act, null);
+    stats.version = build_options.version;
+    stats.start_time_s = quic.sys.realtimeSeconds();
 
     const manager = try acme.Manager.create(std.heap.smp_allocator, init.io, onCertificateRenewed);
     var next_id: usize = 0;
     var gen = Generation.start(init.io, path, null, next_id, manager, null) catch return 1;
     next_id += gen.workers.len;
+    stats.workers.store(gen.workers.len, .monotonic);
     log.info("{d} worker(s) running, config {s}", .{ gen.workers.len, path });
 
     while (true) {
         var b: u8 = 0;
         const n = std.c.read(signal_pipe[0], @ptrCast(&b), 1);
         if (n != 1) continue; // EINTR
+        if (b == 'l') {
+            logs.reopenAll(init.io);
+            log.info("reopened log files", .{});
+            continue;
+        }
         if (b == 'r' or b == 'c') {
             // A new certificate reloads the same config text, not whatever
             // the file holds now: edits wait for their SIGHUP.
             if (b == 'r') log.info("reloading {s}", .{path}) else log.info("reloading for a new certificate", .{});
             const fresh = Generation.start(init.io, path, if (b == 'c') gen.source else null, next_id, manager, gen) catch {
+                stats.inc(&stats.reload_failures);
                 log.err("reload failed; keeping the running configuration", .{});
                 continue;
             };
+            stats.inc(&stats.reloads);
+            stats.workers.store(fresh.workers.len, .monotonic);
             next_id += fresh.workers.len;
             const old = gen;
             gen = fresh;
             old.stop();
             // Joined on its own thread so a second signal isn't held up.
-            const t = std.Thread.spawn(.{}, Generation.join, .{old}) catch {
-                old.join();
+            const t = std.Thread.spawn(.{}, Generation.join, .{ old, init.io }) catch {
+                old.join(init.io);
                 continue;
             };
             t.detach();
@@ -237,7 +310,7 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         }
         gen.stop();
-        gen.join();
+        gen.join(init.io);
         log.info("stopped (quic steered: {d})", .{@import("stats.zig").quic_steered.load(.monotonic)});
         return 0;
     }
@@ -269,4 +342,8 @@ test {
     _ = @import("gzip.zig");
     _ = @import("acme.zig");
     _ = @import("steering.zig");
+    _ = @import("access_log.zig");
+    _ = @import("logs.zig");
+    _ = @import("privileges.zig");
+    _ = @import("stats.zig");
 }
