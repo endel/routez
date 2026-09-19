@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    build_options.addOption(bool, "fault_injection", b.option(bool, "fault-injection", "Test hooks: stall reads of files named *slow-read*") orelse false);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

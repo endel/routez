@@ -162,7 +162,7 @@ pub const Exchange = struct {
 
     handler: union(enum) {
         none,
-        static: static.State,
+        static: *static.Transfer,
         proxy: *proxy.Proxy,
         /// Waiting for a verifier thread to check a password.
         auth: *auth_pool.Job,
@@ -474,7 +474,7 @@ pub const Exchange = struct {
         self.respondEnd();
     }
 
-    fn sendRetryLater(self: *Exchange, status: u16) void {
+    pub fn sendRetryLater(self: *Exchange, status: u16) void {
         const headers = [_]Header{ .{ .name = "retry-after", .value = "1" }, .{ .name = "content-type", .value = "text/plain" } };
         self.respondHead(&.{ .status = status, .headers = &headers, .content_length = 0 });
         self.respondEnd();
@@ -517,7 +517,7 @@ pub const Exchange = struct {
         }
         switch (self.handler) {
             .static => {
-                static.release(self);
+                static.detach(self);
                 self.destroy();
             },
             // Frees the exchange through handlerReleased once the upstream side is let go.

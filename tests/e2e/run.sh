@@ -9,11 +9,13 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-(cd "$ROOT" && zig build) || exit 1
+# -Dfault-injection: files named *slow-read* read as if from a stalled disk.
+(cd "$ROOT" && zig build -Dfault-injection) || exit 1
 mkdir -p "$WORK/www/sub"
 echo '<h1>hello</h1>' > "$WORK/www/index.html"
 echo 'sub file' > "$WORK/www/sub/a.txt"
 head -c 3000000 /dev/urandom > "$WORK/www/big.bin"
+head -c 40000 /dev/urandom > "$WORK/www/slow-read.bin"
 mkdir -p "$WORK/gz"
 for i in $(seq 1 2000); do echo "line $i: the quick brown fox jumps over the lazy dog"; done > "$WORK/gz/text.txt"
 mkdir -p "$WORK/spa/assets" "$WORK/spa/docs"
@@ -134,6 +136,17 @@ check range "$($CURL -H 'Range: bytes=10-19' "$B/big.bin" | sha)" "$(dd if="$WOR
 ET=$($CURL -D - -o /dev/null "$B/" | grep -i etag | cut -d' ' -f2 | tr -d '\r')
 check not-modified "$($CURL -o /dev/null -w '%{http_code}' -H "If-None-Match: $ET" "$B/")" 304
 check head "$($CURL -I "$B/big.bin" | grep -i content-length | tr -d '\r' | tr A-Z a-z)" "content-length: 3000000"
+# A stalled disk holds up only the requests reading from it: two reads of
+# slow-read.bin take 1 s each, on an I/O thread.
+$CURL -o "$WORK/slow.body" -w '%{time_total}' "$B/slow-read.bin" > "$WORK/slow.time" & SLOW=$!
+perl -e 'select(undef,undef,undef,0.3)'
+check slow-disk-others-prompt "$($CURL -o /dev/null -w '%{http_code} %{time_total}' "$B/sub/a.txt" | LC_ALL=C awk '{print $1, ($2 < 0.5 ? "prompt" : "took " $2)}')" "200 prompt"
+wait $SLOW
+check slow-disk-read "$(sha < "$WORK/slow.body") $(LC_ALL=C awk '{print ($1 >= 1.9 ? "stalled" : "took " $1)}' "$WORK/slow.time")" "$(sha < "$WORK/www/slow-read.bin") stalled"
+# A client that leaves mid-read: the read comes back to no one.
+$CURL --max-time 1.5 -o /dev/null "$B/slow-read.bin"
+perl -e 'select(undef,undef,undef,0.8)'
+check slow-disk-abandoned "$($CURL "$B/sub/a.txt")" "sub file"
 check redirect-vars "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/old/a%20b?c=1")" "301 https://127.0.0.1/old/a%20b?c=1"
 check header-vars "$($CURL -D - -o /dev/null "$B/old/a%20b?c=1" | grep -i '^x-vars' | tr -d '\r')" "x-vars: ${B%%:*} /old/a%20b ?c=1 127.0.0.1"
 check proxy-header-vars "$($CURL "$B/api2/h?q=1" | json '["headers"]["x-orig"]')" "/api2/h?q=1"

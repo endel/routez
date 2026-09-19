@@ -24,6 +24,7 @@ const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
 const auth_pool = @import("auth/pool.zig");
+const file_io = @import("file_io.zig");
 const regex = @import("regex.zig");
 const realip = @import("realip.zig");
 pub const H3Listener = h3_server.Listener(.h3);
@@ -184,6 +185,8 @@ pub const Worker = struct {
     inbox: steering.Inbox,
     /// Password checks the verifier threads finished for our requests.
     auth_inbox: auth_pool.Inbox,
+    /// File work the I/O threads finished for our requests.
+    file_inbox: file_io.Inbox,
     inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
@@ -226,6 +229,9 @@ pub const Worker = struct {
         /// bcrypt verifier threads, shared with every other generation;
         /// null until a config uses `auth_basic`.
         auth_pool: ?*auth_pool.Pool = null,
+        /// File I/O threads, shared with every other generation; null
+        /// until a config serves files.
+        file_pool: ?*file_io.Pool = null,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -272,6 +278,7 @@ pub const Worker = struct {
             .stop_async = try xev.Async.init(),
             .inbox = try steering.Inbox.init(io, alloc),
             .auth_inbox = try auth_pool.Inbox.init(io),
+            .file_inbox = try file_io.Inbox.init(io),
         };
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
@@ -295,6 +302,7 @@ pub const Worker = struct {
         self.timers.deinit();
         self.stop_async.deinit();
         self.auth_inbox.wake.deinit();
+        self.file_inbox.wake.deinit();
         self.loop.deinit();
         self.alloc.destroy(self);
     }
@@ -443,6 +451,7 @@ pub const Worker = struct {
         self.stop_async.wait(&self.loop, &self.stop_c, Worker, self, onStopSignal);
         self.inbox.wake.wait(&self.loop, &self.inbox.wake_c, Worker, self, onInbox);
         self.auth_inbox.wake.wait(&self.loop, &self.auth_inbox.wake_c, Worker, self, onAuthInbox);
+        self.file_inbox.wake.wait(&self.loop, &self.file_inbox.wake_c, Worker, self, onFileInbox);
         steering.registry.register(self.io, self.alloc, steering.serverId(self.id), &self.inbox) catch {};
         defer steering.registry.unregister(self.io, steering.serverId(self.id));
         for (self.listeners.items) |l| l.start();
@@ -475,6 +484,12 @@ pub const Worker = struct {
         _ = r catch {};
         const self = ud.?;
         self.auth_inbox.drain(self.alloc);
+        return .rearm;
+    }
+
+    fn onFileInbox(ud: ?*Worker, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        _ = r catch {};
+        ud.?.file_inbox.drain();
         return .rearm;
     }
 

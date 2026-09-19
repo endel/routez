@@ -25,6 +25,10 @@ const encoding = @import("encoding.zig");
 pub const Config = struct {
     /// Worker threads, each with its own event loop and SO_REUSEPORT sockets.
     workers: u16 = 1,
+    /// Threads that open, stat and read static files for all workers, so a
+    /// slow disk stalls only the requests reading from it. Read at start;
+    /// a reload doesn't change it.
+    file_io_threads: u16 = 4,
     servers: []const Server = &.{},
     upstreams: []const Upstream = &.{},
     /// Layer-4 UDP forwarding, for QUIC traffic we don't terminate.
@@ -487,6 +491,7 @@ fn fail(comptime fmt: []const u8, args: anytype) error{InvalidConfig} {
 /// `alloc` holds regexes compiled to check them, freed before returning.
 pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConfig, OutOfMemory }!void {
     if (cfg.workers == 0) return fail("workers must be at least 1", .{});
+    if (cfg.file_io_threads == 0 or cfg.file_io_threads > 256) return fail("file_io_threads must be 1 to 256", .{});
     // 0 would disable the idle timeout: dead peers would never be dropped.
     if (cfg.limits.quic_idle_timeout_ms == 0) return fail("limits.quic_idle_timeout_ms must be at least 1", .{});
     if (cfg.servers.len == 0 and cfg.udp_proxies.len == 0) return fail("nothing to serve: no servers or udp_proxies", .{});

@@ -13,6 +13,7 @@ const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
 const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
+const file_io = @import("file_io.zig");
 const realip = @import("realip.zig");
 const access = @import("access.zig");
 const build_options = @import("build_options");
@@ -104,6 +105,7 @@ const Generation = struct {
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
         if (g.shared.guards.any_auth) g.shared.auth_pool = try authPool(io);
+        if (servesFiles(&g.cfg)) g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
         g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
         if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
             g.access_file = logs.acquire(io, p) catch |err| {
@@ -177,6 +179,25 @@ fn authPool(io: std.Io) !*auth_pool.Pool {
     if (verifier_pool) |p| return p;
     verifier_pool = try auth_pool.Pool.create(std.heap.smp_allocator, io);
     return verifier_pool.?;
+}
+
+/// File I/O threads, started for the first config serving files and kept
+/// for the life of the process: a thread stuck on a dead disk can't be
+/// taken back anyway.
+var file_pool: ?*file_io.Pool = null;
+
+fn filePool(io: std.Io, threads: u16) !*file_io.Pool {
+    if (file_pool) |p| {
+        if (p.threadCount() != threads) log.warn("file_io_threads: a change takes effect at the next restart", .{});
+        return p;
+    }
+    file_pool = try file_io.Pool.create(std.heap.smp_allocator, io, threads);
+    return file_pool.?;
+}
+
+fn servesFiles(cfg: *const config.Config) bool {
+    for (cfg.servers) |srv| for (srv.locations) |loc| if (loc.root != null) return true;
+    return false;
 }
 
 fn clientTable(cfg: *const config.Config, auth: bool) !?*client_limits.Table {
@@ -431,6 +452,7 @@ test {
     _ = @import("auth/htpasswd.zig");
     _ = @import("auth/verify.zig");
     _ = @import("auth/pool.zig");
+    _ = @import("file_io.zig");
     _ = @import("net/client_cert.zig");
     _ = @import("regex.zig");
     _ = @import("realip.zig");

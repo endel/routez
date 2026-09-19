@@ -1,10 +1,19 @@
 //! Static files under a location's `root` (nginx `root` semantics: the full
 //! request path is appended to the root).
 //!
-//! Files are read with positional reads on the loop thread, paced by the
-//! downstream's buffered bytes. That is fine for page-cached content; a cold
-//! disk stalls the worker for the duration of each read.
+//! Opening, stat-ing and reading happen on the file I/O threads
+//! (`file_io.zig`), so a slow disk stalls only the requests reading from it.
+//! A response takes one round trip there to find its file (try_files
+//! entries, precompressed variants) and read the first chunk, then one per
+//! further chunk. At most one read is out at a time, and the next is only
+//! asked for while the downstream has room.
+//!
+//! Where the kernel can tell an answer is cached, the loop takes it itself:
+//! the lookup on Linux (openat2 with RESOLVE_CACHED), and reads everywhere
+//! (RWF_NOWAIT, else mincore). A cached file then costs no round trip on
+//! Linux, and one on macOS.
 const std = @import("std");
+const build_options = @import("build_options");
 const common = @import("../http/common.zig");
 const config = @import("../config.zig");
 const Exchange = @import("../exchange.zig").Exchange;
@@ -12,14 +21,329 @@ const socket = @import("../net/socket.zig");
 const Header = common.Header;
 const encoding = @import("../encoding.zig");
 const gzip = @import("../gzip.zig");
-
-pub const State = struct {
-    file: std.Io.File,
-    offset: u64,
-    end: u64,
-};
+const file_io = @import("../file_io.zig");
+const Coding = encoding.Coding;
 
 const chunk_size = 32 * 1024;
+const n_codings = std.meta.fields(Coding).len;
+const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
+
+/// One response's file work. Kept on the heap until its last job is back,
+/// so a request that goes away mid-read leaves the I/O thread nothing
+/// freed to write into.
+pub const Transfer = struct {
+    job: file_io.Job,
+    /// Null once the request went away with a job out; the job's return
+    /// then frees the transfer.
+    ex: ?*Exchange,
+    loc: *const config.Location,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    /// Holds `candidates`: the I/O thread reads them, so they can't live in
+    /// the exchange's arena.
+    arena: std.heap.ArenaAllocator,
+    /// A job is out: until it's back, the fields below are the I/O thread's.
+    busy: bool = false,
+
+    // What to look for.
+    candidates: []const [:0]const u8 = &.{},
+    /// try_files: the status once every candidate failed, from its `=code`.
+    fallback: ?u16 = null,
+    try_files: bool,
+    dir_request: bool,
+    /// The location's precompressed codings, and those the client takes,
+    /// best first.
+    offered: [n_codings]Coding = undefined,
+    offered_len: u8 = 0,
+    accepted: [n_codings]Coding = undefined,
+    accepted_len: u8 = 0,
+    /// Read the first chunk along with the lookup.
+    prefetch: bool = false,
+
+    // What was found.
+    result: Result = .{ .status = 500 },
+    file: ?std.Io.File = null,
+    meta: file_io.Meta = undefined,
+    coding: ?Coding = null,
+    /// The candidate served (or whose variant is), which gives the type.
+    chosen: usize = 0,
+
+    // The body.
+    offset: u64 = 0,
+    end: u64 = 0,
+    /// Bytes the last read left in `buf`; 0 when it failed.
+    filled: usize = 0,
+    /// The filesystem answers cache-only reads.
+    nowait: bool = true,
+    /// Where it doesn't: what of the file is cached; set up on first need.
+    residency: ?file_io.Residency = null,
+    mapped: bool = false,
+    /// Its own allocation: with it inline the transfer would outgrow the
+    /// allocator's slabs and cost an mmap per request.
+    buf: ?*[chunk_size]u8 = null,
+
+    const Result = union(enum) { found, status: u16, redirect_dir };
+
+    comptime {
+        std.debug.assert(@sizeOf(Transfer) <= 4096);
+    }
+
+    fn create(ex: *Exchange, loc: *const config.Location, root: []const u8) !*Transfer {
+        const gpa = ex.worker.alloc;
+        const t = try gpa.create(Transfer);
+        t.* = .{
+            .job = .{ .work = lookupWork, .done = lookupDone, .inbox = &ex.worker.file_inbox },
+            .ex = ex,
+            .loc = loc,
+            .io = ex.worker.io,
+            .gpa = gpa,
+            .arena = .init(gpa),
+            .try_files = loc.try_files.len > 0,
+            .dir_request = ex.req.path[ex.req.path.len - 1] == '/',
+        };
+        errdefer t.destroy();
+        const a = t.arena.allocator();
+        if (t.try_files) {
+            const list = try a.alloc([:0]const u8, loc.try_files.len);
+            var n: usize = 0;
+            for (loc.try_files) |entry| {
+                if (config.tryFilesStatus(entry)) |status| {
+                    t.fallback = status;
+                    break;
+                }
+                list[n] = try std.mem.concatWithSentinel(a, u8, &.{ root, try tryPath(a, entry, ex.req.path, loc.index) }, 0);
+                n += 1;
+            }
+            t.candidates = list[0..n];
+        } else {
+            const full = try std.mem.concatWithSentinel(a, u8, &.{ root, ex.req.path, if (t.dir_request) loc.index else "" }, 0);
+            t.candidates = try a.dupe([:0]const u8, &.{full});
+        }
+        for (loc.precompressed) |c| {
+            if (std.mem.indexOfScalar(Coding, t.offered[0..t.offered_len], c) != null) continue;
+            t.offered[t.offered_len] = c;
+            t.offered_len += 1;
+        }
+        if (t.offered_len > 0) {
+            var buf: [n_codings]Coding = undefined;
+            const ranked = encoding.Accept.parse(ex.req.get("accept-encoding")).rank(t.offered[0..t.offered_len], &buf);
+            @memcpy(t.accepted[0..ranked.len], ranked);
+            t.accepted_len = @intCast(ranked.len);
+        }
+        // Only when the whole body will go out from byte 0.
+        t.prefetch = !ex.req.isHead() and ex.req.get("range") == null and
+            ex.req.get("if-none-match") == null and ex.req.get("if-modified-since") == null;
+        if (t.prefetch) t.buf = try gpa.create([chunk_size]u8);
+        return t;
+    }
+
+    fn destroy(t: *Transfer) void {
+        std.debug.assert(!t.busy);
+        if (t.file) |f| f.close(t.io);
+        if (t.buf) |b| t.gpa.destroy(b);
+        if (t.residency) |r| r.deinit();
+        t.arena.deinit();
+        t.gpa.destroy(t);
+    }
+
+    /// Forget a lookup that has to start over on an I/O thread.
+    fn resetLookup(t: *Transfer) void {
+        if (t.file) |f| f.close(t.io);
+        t.file = null;
+        t.coding = null;
+        t.chosen = 0;
+    }
+
+    // ---- on an I/O thread, or cache-only on the loop ----
+
+    fn lookupWork(job: *file_io.Job) void {
+        const t: *Transfer = @alignCast(@fieldParentPtr("job", job));
+        t.result = t.lookup(false) catch unreachable;
+        if (t.result == .found and t.prefetch) t.read(0, t.meta.size);
+    }
+
+    fn readWork(job: *file_io.Job) void {
+        const t: *Transfer = @alignCast(@fieldParentPtr("job", job));
+        t.read(t.offset, t.end);
+    }
+
+    const OpenError = error{ WouldBlock, FileNotFound, NotDir, NameTooLong, BadPathName, IsDir, AccessDenied, PermissionDenied, Other };
+
+    fn open(t: *Transfer, path: [:0]const u8, comptime cached: bool) OpenError!std.Io.File {
+        if (cached) {
+            if (slowRead(path)) return error.WouldBlock;
+            return file_io.cached.open(path);
+        }
+        return std.Io.Dir.cwd().openFile(t.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => error.FileNotFound,
+            error.NotDir => error.NotDir,
+            error.NameTooLong => error.NameTooLong,
+            error.BadPathName => error.BadPathName,
+            error.IsDir => error.IsDir,
+            error.AccessDenied => error.AccessDenied,
+            error.PermissionDenied => error.PermissionDenied,
+            else => error.Other,
+        };
+    }
+
+    fn stat(t: *Transfer, file: std.Io.File, comptime cached: bool) error{ WouldBlock, Other }!file_io.Meta {
+        if (cached) return file_io.cached.stat(file);
+        return file_io.Meta.of(file.stat(t.io) catch return error.Other);
+    }
+
+    /// The first candidate naming a regular file, or with a variant the
+    /// client takes. `cached`: on the loop, giving up with WouldBlock
+    /// (leaving `resetLookup` to the caller) where the answer isn't cached.
+    fn lookup(t: *Transfer, comptime cached: bool) error{WouldBlock}!Result {
+        const io = t.io;
+        for (t.candidates, 0..) |path, i| {
+            const last = i + 1 == t.candidates.len and t.fallback == null;
+            const file = t.open(path, cached) catch |err| switch (err) {
+                error.WouldBlock => return error.WouldBlock,
+                error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName => {
+                    if (try t.openVariant(path, i, cached)) return .found;
+                    if (last) return .{ .status = 404 };
+                    continue;
+                },
+                error.IsDir => {
+                    if (!t.try_files) return .redirect_dir;
+                    if (last) return .{ .status = 404 };
+                    continue;
+                },
+                error.AccessDenied, error.PermissionDenied => {
+                    if (last) return .{ .status = 403 };
+                    continue;
+                },
+                error.Other => return .{ .status = 500 },
+            };
+            const meta = t.stat(file, cached) catch |err| {
+                file.close(io);
+                if (err == error.WouldBlock) return error.WouldBlock;
+                return .{ .status = 500 };
+            };
+            if (meta.kind != .file) {
+                file.close(io);
+                if (!t.try_files and meta.kind == .directory) return if (t.dir_request) .{ .status = 403 } else .redirect_dir;
+                if (last) return .{ .status = 404 };
+                continue;
+            }
+            const variant = t.openVariant(path, i, cached) catch |err| {
+                file.close(io);
+                return err;
+            };
+            if (variant) {
+                file.close(io);
+                return .found;
+            }
+            t.file = file;
+            t.meta = meta;
+            t.chosen = i;
+            return .found;
+        }
+        return .{ .status = t.fallback orelse 404 };
+    }
+
+    /// Open the best variant of `path` the client takes, if one exists as
+    /// a regular file. It sits beside `path`, so it's no further from root.
+    fn openVariant(t: *Transfer, path: []const u8, i: usize, comptime cached: bool) error{WouldBlock}!bool {
+        if (t.offered_len == 0) return false;
+        const io = t.io;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        for (t.accepted[0..t.accepted_len]) |c| {
+            const vpath = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, c.suffix() }) catch continue;
+            const file = t.open(vpath, cached) catch |err| switch (err) {
+                error.WouldBlock => return error.WouldBlock,
+                else => continue,
+            };
+            const meta = t.stat(file, cached) catch |err| {
+                file.close(io);
+                if (err == error.WouldBlock) return error.WouldBlock;
+                continue;
+            };
+            if (meta.kind != .file) {
+                file.close(io);
+                continue;
+            }
+            t.file = file;
+            t.meta = meta;
+            t.coding = c;
+            t.chosen = i;
+            return true;
+        }
+        return false;
+    }
+
+    fn read(t: *Transfer, offset: u64, end: u64) void {
+        const want: usize = @intCast(@min(end -| offset, chunk_size));
+        if (want == 0) {
+            t.filled = 0;
+            return;
+        }
+        if (slowRead(t.candidates[t.chosen])) std.Io.sleep(t.io, .fromMilliseconds(1000), .awake) catch {};
+        t.filled = t.file.?.readPositional(t.io, &.{t.buf.?[0..want]}, offset) catch 0;
+    }
+
+    /// The next chunk from the page cache, on the loop; false when it isn't
+    /// there to take without waiting.
+    fn readCached(t: *Transfer) bool {
+        if (slowRead(t.candidates[t.chosen])) return false;
+        const want: usize = @intCast(@min(t.end - t.offset, chunk_size));
+        const buf = t.buf.?[0..want];
+        if (t.nowait and file_io.cached.enabled()) {
+            if (file_io.cached.read(t.file.?, buf, t.offset)) |n| {
+                t.filled = n;
+                return true;
+            } else |err| switch (err) {
+                error.WouldBlock => return false,
+                error.Unsupported => t.nowait = false,
+            }
+        }
+        if (!t.mapped) {
+            t.mapped = true;
+            t.residency = file_io.Residency.init(t.file.?, t.meta.size);
+        }
+        const r = t.residency orelse return false;
+        if (!r.cached(t.offset, want)) return false;
+        t.filled = t.file.?.readPositional(t.io, &.{buf}, t.offset) catch 0;
+        return true;
+    }
+
+    // ---- back on the loop ----
+
+    fn lookupDone(job: *file_io.Job) void {
+        const t: *Transfer = @alignCast(@fieldParentPtr("job", job));
+        t.busy = false;
+        const ex = t.ex orelse return t.destroy();
+        t.looked(ex);
+    }
+
+    fn looked(t: *Transfer, ex: *Exchange) void {
+        switch (t.result) {
+            .found => serve(ex, t),
+            .status => |status| {
+                release(ex);
+                ex.sendError(status);
+            },
+            .redirect_dir => {
+                release(ex);
+                redirectToDir(ex);
+            },
+        }
+    }
+
+    fn readDone(job: *file_io.Job) void {
+        const t: *Transfer = @alignCast(@fieldParentPtr("job", job));
+        t.busy = false;
+        const ex = t.ex orelse return t.destroy();
+        if (send(ex, t)) pump(ex);
+    }
+};
+
+/// Test builds (`-Dfault-injection`): files named *slow-read* read as if
+/// from a stalled disk: never from cache, and 1 s per read.
+fn slowRead(path: []const u8) bool {
+    return build_options.fault_injection and std.mem.indexOf(u8, path, "slow-read") != null;
+}
 
 pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void {
     const is_head = ex.req.isHead();
@@ -28,112 +352,21 @@ pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void 
         ex.respondHead(&.{ .status = 405, .headers = &headers, .content_length = 0 });
         return ex.respondEnd();
     }
-
-    if (loc.try_files.len > 0) return tryFiles(ex, loc, root);
-    const a = ex.arena();
-    const dir_request = ex.req.path[ex.req.path.len - 1] == '/';
-    const full = std.mem.concat(a, u8, &.{ root, ex.req.path, if (dir_request) loc.index else "" }) catch return ex.sendError(500);
-    const io = ex.worker.io;
-
-    const file = std.Io.Dir.cwd().openFile(io, full, .{}) catch |err| return ex.sendError(switch (err) {
-        error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName => {
-            if (openVariant(ex, loc, full)) |v| return serve(ex, loc, v, full);
-            return ex.sendError(404);
-        },
-        error.AccessDenied, error.PermissionDenied => 403,
-        error.IsDir => return redirectToDir(ex),
-        else => 500,
-    });
-    const st = file.stat(io) catch {
-        file.close(io);
-        return ex.sendError(500);
-    };
-    switch (st.kind) {
-        .file => {},
-        .directory => {
-            file.close(io);
-            if (dir_request) return ex.sendError(403);
-            return redirectToDir(ex);
-        },
-        else => {
-            file.close(io);
-            return ex.sendError(404);
-        },
+    const pool = ex.worker.shared.file_pool orelse return ex.sendError(500);
+    const t = Transfer.create(ex, loc, root) catch return ex.sendError(500);
+    ex.handler = .{ .static = t };
+    if (file_io.cached.enabled()) {
+        if (t.lookup(true)) |result| {
+            t.result = result;
+            return t.looked(ex);
+        } else |_| t.resetLookup();
     }
-    serveOrVariant(ex, loc, .{ .file = file, .st = st }, full);
-}
-
-/// `try_files`: serve the first entry naming a regular file, or one with a
-/// precompressed variant the client takes.
-fn tryFiles(ex: *Exchange, loc: *const config.Location, root: []const u8) void {
-    const a = ex.arena();
-    const io = ex.worker.io;
-    for (loc.try_files, 1..) |entry, n| {
-        if (config.tryFilesStatus(entry)) |status| return ex.sendError(status);
-        const last = n == loc.try_files.len;
-        const rel = tryPath(a, entry, ex.req.path, loc.index) catch return ex.sendError(500);
-        const full = std.mem.concat(a, u8, &.{ root, rel }) catch return ex.sendError(500);
-        const file = std.Io.Dir.cwd().openFile(io, full, .{}) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName, error.IsDir => {
-                if (err != error.IsDir) if (openVariant(ex, loc, full)) |v| return serve(ex, loc, v, full);
-                if (last) return ex.sendError(404);
-                continue;
-            },
-            error.AccessDenied, error.PermissionDenied => {
-                if (last) return ex.sendError(403);
-                continue;
-            },
-            else => return ex.sendError(500),
-        };
-        const st = file.stat(io) catch {
-            file.close(io);
-            return ex.sendError(500);
-        };
-        if (st.kind != .file) {
-            file.close(io);
-            if (last) return ex.sendError(404);
-            continue;
-        }
-        return serveOrVariant(ex, loc, .{ .file = file, .st = st }, full);
+    t.busy = true;
+    if (!pool.submit(&t.job, true)) {
+        t.busy = false;
+        release(ex);
+        return ex.sendRetryLater(503);
     }
-}
-
-/// An open regular file to answer with, and the coding it's stored in.
-const Opened = struct {
-    file: std.Io.File,
-    st: std.Io.File.Stat,
-    coding: ?encoding.Coding = null,
-};
-
-fn serveOrVariant(ex: *Exchange, loc: *const config.Location, original: Opened, full: []const u8) void {
-    if (openVariant(ex, loc, full)) |v| {
-        original.file.close(ex.worker.io);
-        return serve(ex, loc, v, full);
-    }
-    serve(ex, loc, original, full);
-}
-
-/// The best precompressed variant of `full` the client takes, if one exists
-/// as a regular file. It sits beside `full`, so it's no further from root.
-fn openVariant(ex: *Exchange, loc: *const config.Location, full: []const u8) ?Opened {
-    if (loc.precompressed.len == 0) return null;
-    const io = ex.worker.io;
-    var buf: [3]encoding.Coding = undefined;
-    const ranked = encoding.Accept.parse(ex.req.get("accept-encoding")).rank(loc.precompressed, &buf);
-    for (ranked) |c| {
-        const path = std.mem.concat(ex.arena(), u8, &.{ full, c.suffix() }) catch return null;
-        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
-        const st = file.stat(io) catch {
-            file.close(io);
-            continue;
-        };
-        if (st.kind != .file) {
-            file.close(io);
-            continue;
-        }
-        return .{ .file = file, .st = st, .coding = c };
-    }
-    return null;
 }
 
 /// A `try_files` entry as a path under root. Config validation keeps `..`
@@ -154,31 +387,29 @@ fn tryPath(a: std.mem.Allocator, entry: []const u8, path: []const u8, index: []c
     return out.items;
 }
 
-/// Answer with an open regular file: conditional requests, ranges, body.
+/// Answer with the file found: conditional requests, ranges, body.
 /// A precompressed variant is its own representation: its size, mtime and
-/// ETag, and ranges count its bytes. `full` names the original, which
-/// gives the type.
-fn serve(ex: *Exchange, loc: *const config.Location, opened: Opened, full: []const u8) void {
+/// ETag, and ranges count its bytes. The candidate names the original,
+/// which gives the type.
+fn serve(ex: *Exchange, t: *Transfer) void {
     const a = ex.arena();
-    const io = ex.worker.io;
-    const file = opened.file;
-    const st = opened.st;
+    const loc = t.loc;
+    const st = t.meta;
     const is_head = ex.req.isHead();
-    const content_type = mimeType(full);
-    const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    const etag = (if (opened.coding) |c|
+    const content_type = mimeType(t.candidates[t.chosen]);
+    const mtime_s = st.mtime_s;
+    const etag = (if (t.coding) |c|
         std.fmt.allocPrint(a, "\"{x}-{x}-{s}\"", .{ mtime_s, st.size, c.token() })
     else
-        std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime_s, st.size })) catch return closeAndFail(ex, file);
-    const lm_buf = a.create([29]u8) catch return closeAndFail(ex, file);
+        std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime_s, st.size })) catch return fail(ex);
+    const lm_buf = a.create([29]u8) catch return fail(ex);
     const last_modified = common.formatHttpDate(mtime_s, lm_buf);
     // Whether another client could get another coding of this path.
-    const varies = opened.coding != null or
+    const varies = t.coding != null or
         ((loc.precompressed.len > 0 or loc.gzip) and gzip.compressible(content_type));
-    const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
 
     if (notModified(ex, etag, mtime_s)) {
-        file.close(io);
+        release(ex);
         const headers = [_]Header{ .{ .name = "etag", .value = etag }, .{ .name = "last-modified", .value = last_modified }, vary };
         ex.respondHead(&.{ .status = 304, .headers = headers[0..if (varies) 3 else 2] });
         return ex.respondEnd();
@@ -193,7 +424,7 @@ fn serve(ex: *Exchange, loc: *const config.Location, opened: Opened, full: []con
         if (if_range_ok) switch (parseRange(range, st.size)) {
             .ignore => {},
             .unsatisfiable => {
-                file.close(io);
+                release(ex);
                 const cr = std.fmt.allocPrint(a, "bytes */{d}", .{st.size}) catch return ex.sendError(500);
                 const headers = [_]Header{.{ .name = "content-range", .value = cr }};
                 ex.respondHead(&.{ .status = 416, .headers = &headers, .content_length = 0 });
@@ -203,7 +434,7 @@ fn serve(ex: *Exchange, loc: *const config.Location, opened: Opened, full: []con
                 range_start = r.start;
                 range_end = r.end;
                 status = 206;
-                content_range = std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ r.start, r.end - 1, st.size }) catch return closeAndFail(ex, file);
+                content_range = std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ r.start, r.end - 1, st.size }) catch return fail(ex);
             },
         };
     }
@@ -222,7 +453,7 @@ fn serve(ex: *Exchange, loc: *const config.Location, opened: Opened, full: []con
         headers[n] = .{ .name = "content-range", .value = cr };
         n += 1;
     }
-    if (opened.coding) |c| {
+    if (t.coding) |c| {
         headers[n] = .{ .name = "content-encoding", .value = c.token() };
         n += 1;
     }
@@ -231,14 +462,19 @@ fn serve(ex: *Exchange, loc: *const config.Location, opened: Opened, full: []con
         n += 1;
     }
 
-    ex.handler = .{ .static = .{ .file = file, .offset = range_start, .end = range_end } };
+    t.offset = range_start;
+    t.end = range_end;
     ex.respondHead(&.{ .status = status, .headers = headers[0..n], .content_length = range_end - range_start });
     if (is_head) return finish(ex);
+    // The prefetch read from 0 and there's no range: it's the body's start.
+    if (t.prefetch and t.filled > 0) {
+        if (!send(ex, t)) return;
+    }
     pump(ex);
 }
 
-fn closeAndFail(ex: *Exchange, file: std.Io.File) void {
-    file.close(ex.worker.io);
+fn fail(ex: *Exchange) void {
+    release(ex);
     ex.sendError(500);
 }
 
@@ -269,24 +505,48 @@ fn notModified(ex: *Exchange, etag: []const u8, mtime_s: i64) bool {
     return false;
 }
 
-/// Send file data until the downstream buffers enough; resumed from
+/// Send what the last read brought; false when that ended the response.
+fn send(ex: *Exchange, t: *Transfer) bool {
+    const n: usize = @intCast(@min(t.filled, t.end - t.offset));
+    t.filled = 0;
+    if (n == 0) {
+        // File shrank or failed mid-response: the length is already promised.
+        release(ex);
+        ex.respondAbort();
+        return false;
+    }
+    t.offset += n;
+    ex.respondBody(t.buf.?[0..n]);
+    if (ex.down == null) {
+        // The encoder failed and aborted the response.
+        release(ex);
+        ex.handlerReleased();
+        return false;
+    }
+    return true;
+}
+
+/// Send chunks while the downstream has room: from the page cache where
+/// possible, else one read at a time from an I/O thread. Resumed from
 /// `onDownstreamWritable`.
 pub fn pump(ex: *Exchange) void {
-    const st = &ex.handler.static;
-    var buf: [chunk_size]u8 = undefined;
-    while (st.offset < st.end and ex.downstreamBuffered() < socket.high_water) {
-        const want: usize = @intCast(@min(st.end - st.offset, buf.len));
-        const n = st.file.readPositional(ex.worker.io, &.{buf[0..want]}, st.offset) catch 0;
-        if (n == 0) {
-            // File shrank or failed mid-response: the length is already promised.
-            release(ex);
-            return ex.respondAbort();
-        }
-        st.offset += n;
-        ex.respondBody(buf[0..n]);
-        if (ex.down == null) return;
+    const t = ex.handler.static;
+    if (t.busy) return;
+    if (t.buf == null) t.buf = t.gpa.create([chunk_size]u8) catch {
+        release(ex);
+        return ex.respondAbort();
+    };
+    while (true) {
+        if (t.busy) return;
+        if (t.offset >= t.end) return finish(ex);
+        if (ex.downstreamBuffered() > socket.high_water) return;
+        if (!t.readCached()) break;
+        if (!send(ex, t)) return;
     }
-    if (st.offset >= st.end) finish(ex);
+    t.job.work = Transfer.readWork;
+    t.job.done = Transfer.readDone;
+    t.busy = true;
+    _ = ex.worker.shared.file_pool.?.submit(&t.job, false);
 }
 
 fn finish(ex: *Exchange) void {
@@ -294,13 +554,21 @@ fn finish(ex: *Exchange) void {
     ex.respondEnd();
 }
 
-/// Close the file and drop the handler state.
+/// Free the transfer (closing its file) and drop the handler state.
 pub fn release(ex: *Exchange) void {
     switch (ex.handler) {
-        .static => |st| st.file.close(ex.worker.io),
+        .static => |t| t.destroy(),
         else => return,
     }
     ex.handler = .none;
+}
+
+/// The request went away: free the transfer, or leave that to its job's
+/// return if one is out.
+pub fn detach(ex: *Exchange) void {
+    const t = ex.handler.static;
+    ex.handler = .none;
+    if (t.busy) t.ex = null else t.destroy();
 }
 
 pub const RangeResult = union(enum) {

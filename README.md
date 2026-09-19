@@ -16,7 +16,9 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   HTTP-01), renewed and swapped in without dropping connections.
 - Static files: ranges, ETag / Last-Modified conditional requests, index
   files, directory redirects, path normalization, `try_files` fallbacks for
-  single-page apps.
+  single-page apps. Opened and read on I/O threads, so a slow disk stalls
+  only the requests reading from it; what the page cache holds is served
+  straight from the worker.
 - Reverse proxy to HTTP/1.1 upstreams, plain or over TLS 1.3 (quic-zig's
   sans-IO `tls_client`, with optional certificate verification and client
   certificates): streaming
@@ -151,6 +153,14 @@ A ZON file; see `src/config.zig` for every field and default.
   fallback, served for any path, or a status such as `"=404"`. Unlike
   nginx, the fallback is a file under the same `root`, not a new request
   routed through the locations.
+- Static files are opened, stat-ed and read on `file_io_threads` threads (4
+  by default, shared by all workers; a change takes a restart), with at
+  most one 32 KiB read out per response, paced by the client. Where the
+  kernel can tell the data is cached, the worker skips the round trip:
+  lookups on Linux (`openat2` with `RESOLVE_CACHED`), reads everywhere
+  (`RWF_NOWAIT`, or `mincore` on filesystems without it, such as overlayfs).
+  When 1024 new lookups are already waiting for a thread, further requests
+  get 503.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
 - TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
@@ -592,7 +602,9 @@ The end-to-end script needs python3, bun, node >= 22, curl, and a built
 `../quic-zig` (its WebTransport echo server is the relay's upstream). The
 HTTP/3 checks need a curl built with HTTP/3: Homebrew's on macOS; on Linux,
 without one, the script fetches a pinned static build (stunnel/static-curl,
-checksummed) into `~/.cache/routez-e2e`. Set `CURL_BIN` to use another. The ACME script needs Docker, python3, curl and
+checksummed) into `~/.cache/routez-e2e`. Set `CURL_BIN` to use another.
+It builds routez with `-Dfault-injection`, a test-only option under which
+files named `*slow-read*` read as if from a stalled disk. The ACME script needs Docker, python3, curl and
 openssl; it runs Pebble, Let's Encrypt's test CA, with real HTTP-01
 validation against routez.
 
@@ -621,8 +633,8 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
 | TLS: 10 KB static file | 131k | — | 163k |
 | TLS: new connection per request | 12k | 10k | 16k |
 
-- HAProxy isn't a file server. nginx has `sendfile` on; routez reads files on
-  the worker thread.
+- HAProxy isn't a file server. nginx has `sendfile` on; routez copies files
+  through userspace.
 - TLS is 1.3 with AES-128-GCM and X25519 everywhere, routez's own choice;
   nginx and HAProxy are pinned to it.
 - The last row measures resumed handshakes: wrk reuses the session on each
@@ -654,8 +666,10 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   address isn't validated when it is accepted (a spoofed Initial would
   count against someone else's) and changes when the client migrates;
   `max_connections` and `limit_req` bound QUIC clients instead.
-- Static files are read on the worker thread; fine for page-cached files,
-  slow disks stall that worker.
+- A disk that stalls for good ties up an I/O thread per request reading
+  from it; once all are taken, other static requests wait too (proxied
+  ones don't). On macOS every static request takes a round trip to an I/O
+  thread to open its file: nothing there can tell that an open won't wait.
 - Compression on the fly is gzip only: Zig's standard library has no
   Brotli or zstd encoder, and a small one written here would compress worse
   than gzip. Precompress with `brotli` or `zstd` at build time and serve the
