@@ -20,6 +20,35 @@ pub const Var = enum {
     is_args,
     /// Client IP address.
     remote_addr,
+    /// The user `auth_basic` let in; empty otherwise.
+    remote_user,
+    /// `SUCCESS` when the client presented a certificate that verified
+    /// against the server's `tls.client_ca`, else `NONE`.
+    ssl_client_verify,
+    /// The client certificate's subject, RFC 4514 (`CN=alice,O=Example`).
+    ssl_client_s_dn,
+    /// The client certificate's issuer, RFC 4514.
+    ssl_client_i_dn,
+    /// The client certificate's serial number, uppercase hex.
+    ssl_client_serial,
+    /// SHA-1 of the client certificate (DER), lowercase hex.
+    ssl_client_fingerprint,
+
+    /// Empty for this request means unset: logged as `-`.
+    pub fn optional(v: Var) bool {
+        return switch (v) {
+            .remote_user, .ssl_client_s_dn, .ssl_client_i_dn, .ssl_client_serial, .ssl_client_fingerprint => true,
+            else => false,
+        };
+    }
+};
+
+/// The verified client certificate, as the `ssl_client_*` variables show it.
+pub const ClientCert = struct {
+    s_dn: []const u8 = "",
+    i_dn: []const u8 = "",
+    serial: []const u8 = "",
+    fingerprint: []const u8 = "",
 };
 
 /// What the variables read from one request.
@@ -31,6 +60,8 @@ pub const Request = struct {
     path: []const u8,
     query: ?[]const u8,
     remote_addr: []const u8,
+    remote_user: []const u8 = "",
+    client_cert: ?*const ClientCert = null,
 };
 
 pub const TemplateError = error{ UnknownVariable, BadVariable };
@@ -123,6 +154,12 @@ pub fn append(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Var, req: Re
         .args => try out.appendSlice(alloc, req.query orelse ""),
         .is_args => if (req.query != null) try out.append(alloc, '?'),
         .remote_addr => try out.appendSlice(alloc, req.remote_addr),
+        .remote_user => try out.appendSlice(alloc, req.remote_user),
+        .ssl_client_verify => try out.appendSlice(alloc, if (req.client_cert != null) "SUCCESS" else "NONE"),
+        .ssl_client_s_dn => if (req.client_cert) |c| try out.appendSlice(alloc, c.s_dn),
+        .ssl_client_i_dn => if (req.client_cert) |c| try out.appendSlice(alloc, c.i_dn),
+        .ssl_client_serial => if (req.client_cert) |c| try out.appendSlice(alloc, c.serial),
+        .ssl_client_fingerprint => if (req.client_cert) |c| try out.appendSlice(alloc, c.fingerprint),
     }
 }
 
@@ -197,4 +234,24 @@ test "expand refuses control characters" {
     try testing.expectError(error.InvalidValue, expand(a, "https://$host/", req));
     // A decoded CR LF in the path is percent-encoded again.
     try testing.expectEqualStrings("/%0D%0A", try expand(a, "$uri", req));
+}
+
+test "client certificate and user variables" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var req: Request = .{
+        .scheme = "https",
+        .authority = "x",
+        .default_host = "",
+        .target = "/",
+        .path = "/",
+        .query = null,
+        .remote_addr = "::1",
+    };
+    try testing.expectEqualStrings("NONE [] []", try expand(a, "$ssl_client_verify [$ssl_client_s_dn] [$remote_user]", req));
+    const cert: ClientCert = .{ .s_dn = "CN=alice,O=Example", .i_dn = "CN=CA", .serial = "1001", .fingerprint = "ab" };
+    req.client_cert = &cert;
+    req.remote_user = "alice";
+    try testing.expectEqualStrings("SUCCESS CN=alice,O=Example CN=CA 1001 ab alice", try expand(a, "$ssl_client_verify $ssl_client_s_dn $ssl_client_i_dn $ssl_client_serial $ssl_client_fingerprint $remote_user", req));
 }

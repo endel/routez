@@ -10,6 +10,8 @@ const stats = @import("stats.zig");
 const access_log = @import("access_log.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
+const guard = @import("guard.zig");
+const auth_pool = @import("auth/pool.zig");
 const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
@@ -97,7 +99,8 @@ const Generation = struct {
         };
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
-        g.shared.clients = try clientTable(&g.cfg);
+        g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
+        if (g.shared.guards.any_auth) g.shared.auth_pool = try authPool(io);
         g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
         if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
             g.access_file = logs.acquire(io, p) catch |err| {
@@ -163,8 +166,19 @@ const Generation = struct {
 var client_table: ?*client_limits.Table = null;
 var client_table_size: u32 = 0;
 
-fn clientTable(cfg: *const config.Config) !?*client_limits.Table {
-    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg);
+/// Verifier threads for bcrypt, started for the first config with
+/// `auth_basic` and kept, cache included, for the life of the process.
+var verifier_pool: ?*auth_pool.Pool = null;
+
+fn authPool(io: std.Io) !*auth_pool.Pool {
+    if (verifier_pool) |p| return p;
+    verifier_pool = try auth_pool.Pool.create(std.heap.smp_allocator, io);
+    return verifier_pool.?;
+}
+
+fn clientTable(cfg: *const config.Config, auth: bool) !?*client_limits.Table {
+    // auth_basic rate-limits each client's uncached password checks.
+    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth;
     if (client_table) |t| {
         if (wanted and cfg.limits.max_tracked_clients != client_table_size)
             log.warn("limits.max_tracked_clients: a change takes effect at the next restart", .{});
@@ -203,6 +217,8 @@ fn resolveUser(arena: std.mem.Allocator, cfg: *const config.Config) !?privileges
 var quic_keys: Worker.Shared.QuicKeys = undefined;
 
 fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !Worker.Shared {
+    const guards = try arena.create(guard.Guards);
+    guards.* = try guard.build(arena, cfg);
     var ticket_key: [16]u8 = undefined;
     quic.sys.randomBytes(&ticket_key);
     var tls_listeners: std.ArrayListUnmanaged(Worker.Shared.TlsListener) = .empty;
@@ -219,14 +235,14 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
                     }
                 }
             }
-            const tc = tls.ServerConfig.load(arena, io, on_listener.items, ticket_key, &.{"http/1.1"}) catch |err| {
+            const tc = tls.ServerConfig.load(arena, io, on_listener.items, ticket_key, &.{"http/1.1"}, guards) catch |err| {
                 log.err("tls for {s}:{d}: {s}", .{ l.address, l.port, @errorName(err) });
                 return err;
             };
             try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
         }
     }
-    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys, .upstream_cas = try loadUpstreamCas(arena, cfg) };
+    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys, .upstream_cas = try loadUpstreamCas(arena, cfg), .guards = guards };
 }
 
 /// One bundle per `tls_ca` file, and the system store at most once.
@@ -374,4 +390,10 @@ test {
     _ = @import("privileges.zig");
     _ = @import("stats.zig");
     _ = @import("client_limits.zig");
+    _ = @import("access.zig");
+    _ = @import("guard.zig");
+    _ = @import("auth/htpasswd.zig");
+    _ = @import("auth/verify.zig");
+    _ = @import("auth/pool.zig");
+    _ = @import("net/client_cert.zig");
 }

@@ -23,6 +23,12 @@ const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
 const stats = @import("../stats.zig");
 const Worker = @import("../worker.zig").Worker;
+const access = @import("../access.zig");
+const guard = @import("../guard.zig");
+const htpasswd = @import("../auth/htpasswd.zig");
+const auth_pool = @import("../auth/pool.zig");
+const basic = @import("../auth/basic.zig");
+const Location = @import("../config.zig").Location;
 
 const log = std.log.scoped(.wt_relay);
 
@@ -40,6 +46,28 @@ pub fn Relay(comptime Listener: type) type {
 
         sessions: std.AutoHashMapUnmanaged(Key, *RSession) = .empty,
         down_streams: std.AutoHashMapUnmanaged(Key, *Pair) = .empty,
+        /// CONNECTs waiting for a verifier thread to check a password.
+        pending: std.AutoHashMapUnmanaged(Key, *Pending) = .empty,
+
+        /// A CONNECT held while its password is checked; owns copies of
+        /// what `open` needs.
+        const Pending = struct {
+            relay: *Self,
+            listener: *Listener,
+            entry: *ConnEntry,
+            key: Key,
+            arena_state: std.heap.ArenaAllocator,
+            path: []const u8,
+            headers: []const qpack.Header,
+            loc: *const Location,
+            job: *auth_pool.Job,
+
+            fn destroy(self: *Pending) void {
+                const a = self.listener.worker.alloc;
+                self.arena_state.deinit();
+                a.destroy(self);
+            }
+        };
 
         const UpClient = event_loop.Client(UpHandler);
 
@@ -350,8 +378,36 @@ pub fn Relay(comptime Listener: type) type {
             var path_buf: [2048]u8 = undefined;
             const target = router.normalizeTarget(path, &path_buf) catch return refuse(session, session_id);
             const loc = router.matchLocation(srv, target.path) orelse return refuse(session, session_id);
-            const name = loc.webtransport_pass orelse return refuse(session, session_id);
-            const group = w.findGroup(name) orelse return refuse(session, session_id);
+            if (loc.webtransport_pass == null) return refuse(session, session_id);
+
+            // The checks `Exchange.start` makes of a request.
+            const pol = w.shared.guards.policy(loc);
+            const ip = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
+            if (access.check(pol.rules, ip) == .deny) return answer(session, session_id, "403", null);
+            const want = w.shared.guards.clientAuth(srv);
+            if (want != null and session.clientAuth() != want) return answer(session, session_id, "421", null);
+            if (pol.require_client_cert and (want == null or session.peerCertificate() == null)) return answer(session, session_id, "403", null);
+            if (pol.auth) |auth| {
+                var value: ?[]const u8 = null;
+                for (headers) |h| if (std.mem.eql(u8, h.name, "authorization")) {
+                    value = h.value;
+                };
+                var buf: [htpasswd.max_credentials]u8 = undefined;
+                defer std.crypto.secureZero(u8, &buf);
+                switch (basic.check(w, auth, value, ip, &buf, onPasswordChecked)) {
+                    .ok => {},
+                    .denied => return answer(session, session_id, "401", auth.challenge),
+                    .limited => return answer(session, session_id, "429", null),
+                    .busy => return answer(session, session_id, "503", null),
+                    .pending => |p| return self.hold(l, session, session_id, path, headers, loc, p.job),
+                }
+            }
+            self.proceed(l, session, session_id, path, headers, loc);
+        }
+
+        fn proceed(self: *Self, l: *Listener, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header, loc: *const Location) void {
+            const w = l.worker;
+            const group = w.findGroup(loc.webtransport_pass.?) orelse return refuse(session, session_id);
             var client_buf: [64]u8 = undefined;
             const client_addr = socket.formatSockaddr(session.entry.conn.peerAddress(), &client_buf);
             const peer = group.pick(client_addr, &.{}) orelse return refuse(session, session_id);
@@ -364,8 +420,65 @@ pub fn Relay(comptime Listener: type) type {
         }
 
         fn refuse(session: *event_loop.Session, session_id: u64) void {
-            const headers = [_]qpack.Header{.{ .name = ":status", .value = "404" }};
-            session.sendResponse(session_id, &headers, "") catch {};
+            answer(session, session_id, "404", null);
+        }
+
+        fn answer(session: *event_loop.Session, session_id: u64, status: []const u8, challenge: ?[]const u8) void {
+            var headers: [2]qpack.Header = .{ .{ .name = ":status", .value = status }, undefined };
+            var n: usize = 1;
+            if (challenge) |c| {
+                headers[1] = .{ .name = "www-authenticate", .value = c };
+                n = 2;
+            }
+            session.sendResponse(session_id, headers[0..n], "") catch {};
+        }
+
+        /// Park a CONNECT until a verifier thread has checked its password.
+        fn hold(self: *Self, l: *Listener, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header, loc: *const Location, job: *auth_pool.Job) void {
+            const a = l.worker.alloc;
+            const p = a.create(Pending) catch return answer(session, session_id, "503", null);
+            p.* = .{
+                .relay = self,
+                .listener = l,
+                .entry = session.entry,
+                .key = .{ .conn = session.id(), .id = session_id },
+                .arena_state = .init(a),
+                .path = &.{},
+                .headers = &.{},
+                .loc = loc,
+                .job = job,
+            };
+            // The job is queued: from here on it hears of us only through ctx.
+            copyRequest(p, path, headers) catch {
+                p.destroy();
+                return answer(session, session_id, "503", null);
+            };
+            self.pending.put(a, p.key, p) catch {
+                p.destroy();
+                return answer(session, session_id, "503", null);
+            };
+            job.ctx = p;
+        }
+
+        fn copyRequest(p: *Pending, path: []const u8, headers: []const qpack.Header) !void {
+            const arena = p.arena_state.allocator();
+            p.path = try arena.dupe(u8, path);
+            const hs = try arena.alloc(qpack.Header, headers.len);
+            for (headers, hs) |h, *d| d.* = .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) };
+            p.headers = hs;
+        }
+
+        fn onPasswordChecked(job: *auth_pool.Job) void {
+            const p: *Pending = @ptrCast(@alignCast(job.ctx.?));
+            const self = p.relay;
+            _ = self.pending.remove(p.key);
+            defer p.destroy();
+            var session: event_loop.Session = .{ .entry = p.entry };
+            if (!job.ok) {
+                const auth = p.listener.worker.shared.guards.policy(p.loc).auth.?;
+                return answer(&session, p.key.id, "401", auth.challenge);
+            }
+            self.proceed(p.listener, &session, p.key.id, p.path, p.headers, p.loc);
         }
 
         fn open(self: *Self, w: *Worker, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header, group: *upstream.Group, peer: *upstream.Peer) !void {
@@ -502,6 +615,15 @@ pub fn Relay(comptime Listener: type) type {
 
         pub fn onConnectionClosed(self: *Self, session: *event_loop.Session) void {
             const conn = session.id();
+            while (true) {
+                var it = self.pending.iterator();
+                const p = while (it.next()) |e| {
+                    if (e.key_ptr.conn == conn) break e.value_ptr.*;
+                } else break;
+                _ = self.pending.remove(p.key);
+                p.job.ctx = null;
+                p.destroy();
+            }
             var doomed: [64]*RSession = undefined;
             while (true) {
                 var n: usize = 0;

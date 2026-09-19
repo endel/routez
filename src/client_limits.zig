@@ -27,6 +27,9 @@ pub const Ip = [16]u8;
 
 /// The zone of an address's connection count; `zoneId` never returns it.
 pub const conn_zone: u32 = 0;
+/// The bucket of an address's uncached `auth_basic` password checks;
+/// `zoneId` never returns it either (its ids are odd).
+pub const auth_zone: u32 = 2;
 
 const default_shards = 64;
 const none: u32 = 0;

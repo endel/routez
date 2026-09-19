@@ -16,6 +16,8 @@
 //!   $msec                 Unix time in seconds, ms resolution
 //!   $http_<name>          a request header, `_` standing for `-`
 //!
+//! `$remote_user` and the `$ssl_client_*` names are request variables too.
+//!
 //! A variable without a value logs as `-`, or as an empty string under JSON
 //! escaping.
 const std = @import("std");
@@ -55,10 +57,10 @@ pub const Format = union(enum) {
     template: Template,
 };
 
-const combined = "$remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
+const combined = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
 
 const json =
-    \\{"time":"$time_iso8601","remote_addr":"$remote_addr","method":"$request_method","uri":"$request_uri","protocol":"$protocol","status":$status,"body_bytes_sent":$body_bytes_sent,"request_time":$request_time,"host":"$host","referer":"$http_referer","user_agent":"$http_user_agent","upstream_addr":"$upstream_addr","request_completion":"$request_completion"}
+    \\{"time":"$time_iso8601","remote_addr":"$remote_addr","remote_user":"$remote_user","method":"$request_method","uri":"$request_uri","protocol":"$protocol","status":$status,"body_bytes_sent":$body_bytes_sent,"request_time":$request_time,"host":"$host","referer":"$http_referer","user_agent":"$http_user_agent","upstream_addr":"$upstream_addr","request_completion":"$request_completion"}
 ;
 
 pub const Error = vars.TemplateError || error{NoVariable};
@@ -154,6 +156,7 @@ pub fn render(t: Template, alloc: std.mem.Allocator, e: *const Entry) error{OutO
             },
             .request => |v| blk: {
                 vars.append(alloc, &scratch, v, e.req) catch return error.OutOfMemory;
+                if (scratch.items.len == 0 and v.optional()) break :blk null;
                 break :blk scratch.items;
             },
             .header => |name| e.header(name),

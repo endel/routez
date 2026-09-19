@@ -22,6 +22,13 @@ const vars = @import("http/vars.zig");
 const access_log = @import("access_log.zig");
 const timers = @import("timers.zig");
 const logs = @import("logs.zig");
+const access = @import("access.zig");
+const guard = @import("guard.zig");
+const tls = @import("net/tls.zig");
+const client_cert = @import("net/client_cert.zig");
+const htpasswd = @import("auth/htpasswd.zig");
+const auth_pool = @import("auth/pool.zig");
+const basic = @import("auth/basic.zig");
 
 pub const Response = struct {
     status: u16,
@@ -123,6 +130,8 @@ pub const RequestInit = struct {
     client_addr: []const u8,
     client_ip: [16]u8,
     vhosts: *const router.VirtualHosts,
+    /// The connection's client certificate; meaningful over TLS and QUIC.
+    client_cert: tls.ClientCert = .{},
 };
 
 pub const Exchange = struct {
@@ -137,6 +146,8 @@ pub const Exchange = struct {
         none,
         static: static.State,
         proxy: *proxy.Proxy,
+        /// Waiting for a verifier thread to check a password.
+        auth: *auth_pool.Job,
     } = .none,
 
     status: u16 = 0,
@@ -153,6 +164,16 @@ pub const Exchange = struct {
     /// variables expanded; null when none has a variable.
     add_values: ?[]const []const u8 = null,
     set_values: ?[]const []const u8 = null,
+    /// The verified client certificate, when the server asks for one and
+    /// the connection's handshake ran under that server's policy.
+    client_cert: ?*const vars.ClientCert = null,
+    /// A TLS connection whose handshake ran under another server's client
+    /// certificate policy (SNI named one server, Host another): 421.
+    cert_misdirected: bool = false,
+    /// Set once `auth_basic` accepted the user.
+    remote_user: []const u8 = "",
+    /// The user whose password a verifier thread is checking.
+    pending_user: []const u8 = "",
 
     pub fn create(worker: *Worker, down: Downstream, init: RequestInit) !*Exchange {
         const ex = try worker.alloc.create(Exchange);
@@ -194,6 +215,22 @@ pub const Exchange = struct {
             .client_addr = try a.dupe(u8, init.client_addr),
             .client_ip = init.client_ip,
         };
+        // By transport: an HTTP/3 request may claim any :scheme.
+        if (init.client_cert.secure) {
+            if (worker.shared.guards.clientAuth(ex.server)) |want| {
+                if (init.client_cert.auth != want) {
+                    ex.cert_misdirected = true;
+                } else if (init.client_cert.der) |der| {
+                    // Verified in the handshake; this only formats it.
+                    const info = client_cert.describe(a, der) catch null;
+                    if (info) |i| {
+                        const c = try a.create(vars.ClientCert);
+                        c.* = .{ .s_dn = i.s_dn, .i_dn = i.i_dn, .serial = i.serial, .fingerprint = i.fingerprint };
+                        ex.client_cert = c;
+                    }
+                }
+            }
+        }
         return ex;
     }
 
@@ -214,16 +251,35 @@ pub const Exchange = struct {
         }
         const loc = router.matchLocation(self.server, self.req.path) orelse return self.sendError(404);
         self.add_values = self.expandAll(loc.add_headers) catch return self.sendError(400);
-        self.set_values = self.expandAll(loc.proxy_set_headers) catch return self.sendError(400);
         self.location = loc;
         if (loc.limit_req) |lim| {
             if (!self.worker.allowRequest(self.server, loc, lim, self.req.client_ip)) {
                 stats.inc(&stats.requests_limited);
-                const headers = [_]Header{ .{ .name = "retry-after", .value = "1" }, .{ .name = "content-type", .value = "text/plain" } };
-                self.respondHead(&.{ .status = 429, .headers = &headers, .content_length = 0 });
-                return self.respondEnd();
+                return self.sendRetryLater(429);
             }
         }
+        const pol = self.worker.shared.guards.policy(loc);
+        if (access.check(pol.rules, self.req.client_ip) == .deny) return self.sendError(403);
+        if (self.cert_misdirected) return self.sendError(421);
+        if (pol.require_client_cert and self.client_cert == null) return self.sendError(403);
+        if (pol.auth) |auth| switch (self.checkPassword(auth)) {
+            .ok => {},
+            .denied => return self.sendUnauthorized(auth),
+            .limited => return self.sendRetryLater(429),
+            .busy => return self.sendRetryLater(503),
+            .pending => {
+                // Held in the downstream until the verdict: nothing to hand it to yet.
+                self.pauseRequestBody(true);
+                return;
+            },
+        };
+        self.dispatch(loc);
+    }
+
+    /// Past every check: run the location's handler.
+    fn dispatch(self: *Exchange, loc: *const config.Location) void {
+        self.set_values = self.expandAll(loc.proxy_set_headers) catch return self.sendError(400);
+        if (self.remote_user.len > 0) self.add_values = self.expandAll(loc.add_headers) catch return self.sendError(400);
         const max_body = self.worker.cfg.limits.max_body_bytes;
         if (max_body != 0 and (self.req.content_length orelse 0) > max_body) return self.sendError(413);
 
@@ -237,6 +293,54 @@ pub const Exchange = struct {
         if (loc.proxy_pass) |target| return proxy.start(self, loc, target);
         // webtransport_pass only means something to a CONNECT over HTTP/3.
         return self.sendError(404);
+    }
+
+    const PasswordCheck = enum { ok, denied, limited, busy, pending };
+
+    fn checkPassword(self: *Exchange, auth: guard.Auth) PasswordCheck {
+        var buf: [htpasswd.max_credentials]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        switch (basic.check(self.worker, auth, self.req.get("authorization"), self.req.client_ip, &buf, onPasswordChecked)) {
+            .ok => |user| {
+                self.remote_user = self.arena().dupe(u8, user) catch return .busy;
+                return .ok;
+            },
+            .pending => |p| {
+                p.job.ctx = self;
+                self.handler = .{ .auth = p.job };
+                // Out of memory here still leaves the verdict to come; it just logs no user.
+                self.pending_user = self.arena().dupe(u8, p.user) catch "";
+                return .pending;
+            },
+            .denied => return .denied,
+            .limited => return .limited,
+            .busy => return .busy,
+        }
+    }
+
+    /// A verifier thread's verdict, on the worker's thread.
+    fn onPasswordChecked(job: *auth_pool.Job) void {
+        const self: *Exchange = @ptrCast(@alignCast(job.ctx.?));
+        self.handler = .none;
+        self.pauseRequestBody(false);
+        const loc = self.location.?;
+        if (!job.ok) return self.sendUnauthorized(self.worker.shared.guards.policy(loc).auth.?);
+        self.remote_user = self.pending_user;
+        self.dispatch(loc);
+    }
+
+    fn sendUnauthorized(self: *Exchange, auth: guard.Auth) void {
+        const body = "<html><head><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1></body></html>\n";
+        const headers = [_]Header{ .{ .name = "www-authenticate", .value = auth.challenge }, .{ .name = "content-type", .value = "text/html; charset=utf-8" } };
+        self.respondHead(&.{ .status = 401, .headers = &headers, .content_length = body.len });
+        if (!self.req.isHead()) self.respondBody(body);
+        self.respondEnd();
+    }
+
+    fn sendRetryLater(self: *Exchange, status: u16) void {
+        const headers = [_]Header{ .{ .name = "retry-after", .value = "1" }, .{ .name = "content-type", .value = "text/plain" } };
+        self.respondHead(&.{ .status = status, .headers = &headers, .content_length = 0 });
+        self.respondEnd();
     }
 
     // ---- downstream events ----
@@ -260,7 +364,7 @@ pub const Exchange = struct {
         switch (self.handler) {
             .static => static.pump(self),
             .proxy => |p| p.onDownstreamWritable(),
-            .none => {},
+            .none, .auth => {},
         }
     }
 
@@ -281,6 +385,12 @@ pub const Exchange = struct {
             },
             // Frees the exchange through handlerReleased once the upstream side is let go.
             .proxy => |p| p.onDownstreamGone(),
+            .auth => |job| {
+                // The verdict still arrives; nobody is there for it.
+                job.ctx = null;
+                self.handler = .none;
+                self.destroy();
+            },
             .none => self.destroy(),
         }
     }
@@ -424,6 +534,8 @@ pub const Exchange = struct {
             .path = self.req.path,
             .query = self.req.query,
             .remote_addr = self.req.client_addr,
+            .remote_user = self.remote_user,
+            .client_cert = self.client_cert,
         };
     }
 

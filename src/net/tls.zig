@@ -8,6 +8,7 @@ const tls_server = quic.tls_server;
 const tls_client = quic.tls_client;
 const socket = @import("socket.zig");
 const tls13 = quic.tls13;
+const guard = @import("../guard.zig");
 
 /// Certificates and TLS settings for one listener, shared read-only by all
 /// workers. The certificate list is also what the QUIC listener serves.
@@ -17,8 +18,9 @@ pub const ServerConfig = struct {
     ticket_key: [16]u8,
 
     /// Build from the servers sharing a listener; the first one with TLS
-    /// provides the default certificate.
-    pub fn load(arena: std.mem.Allocator, io: std.Io, servers: []const *const config.Server, ticket_key: [16]u8, alpn: []const []const u8) !*const ServerConfig {
+    /// provides the default certificate. Each server's entry asks for client
+    /// certificates when `guards` has a policy for it.
+    pub fn load(arena: std.mem.Allocator, io: std.Io, servers: []const *const config.Server, ticket_key: [16]u8, alpn: []const []const u8, guards: *const guard.Guards) !*const ServerConfig {
         var certs: std.ArrayListUnmanaged(tls_server.CertEntry) = .empty;
         for (servers) |srv| {
             const t = srv.tls orelse continue;
@@ -26,7 +28,7 @@ pub const ServerConfig = struct {
                 try acme.servingCertificate(arena, io, a, srv.server_names)
             else
                 try loadCertificate(arena, t.cert.?, t.key.?);
-            try certs.append(arena, .{ .server_names = srv.server_names, .cert = cert });
+            try certs.append(arena, .{ .server_names = srv.server_names, .cert = cert, .client_auth = guards.clientAuth(srv) });
         }
         if (certs.items.len == 0) return error.NoCertificate;
         const self = try arena.create(ServerConfig);
@@ -119,6 +121,21 @@ pub const Transport = struct {
     pub fn handshakeComplete(self: *Transport) bool {
         return self.conn.handshakeComplete();
     }
+
+    /// The client's verified certificate and the policy that verified it.
+    pub fn clientCert(self: *const Transport) ClientCert {
+        return .{ .secure = true, .auth = self.conn.clientAuth(), .der = self.conn.peerCertificate() };
+    }
+};
+
+/// A connection's client-certificate state, as a request sees it.
+pub const ClientCert = struct {
+    /// The request came over TLS or QUIC (whatever its scheme says).
+    secure: bool = false,
+    /// The policy the handshake ran under; null when none asked.
+    auth: ?*const tls13.ClientAuth = null,
+    /// The verified leaf (DER); null when none was presented.
+    der: ?[]const u8 = null,
 };
 
 /// TLS to an upstream, between its socket and its owner (`UpConn`, `Probe`).

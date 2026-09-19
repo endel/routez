@@ -317,6 +317,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .client_addr = client,
                 .client_ip = socket.ipKey(peer) orelse @splat(0),
                 .vhosts = &self.vhosts,
+                .client_cert = .{ .secure = true, .auth = session.clientAuth(), .der = session.peerCertificate() },
             }) catch {
                 s.destroy();
                 return reject(session, stream_id, 500);

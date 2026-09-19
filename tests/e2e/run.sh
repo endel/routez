@@ -295,6 +295,128 @@ SUITE=rsa check pss-schemes "$(sig_type rsa.test) $(sig_type rsa.test rsa_pss_rs
 SUITE=rsa check ec-alongside "$(sig_type localhost)" "ecdsa-SHA256"
 kill $RSA; wait $RSA 2>/dev/null
 
+# Access control: IP rules, Basic auth, client certificates. A client CA
+# and certificates made here; localhost asks for a certificate optionally,
+# strict.test requires one; both on one TLS/QUIC port.
+ACL="$WORK/acl"; mkdir -p "$ACL"
+mkcert() { # name subject issuer-prefix extensions
+    $OPENSSL ecparam -name prime256v1 -genkey -noout -out "$ACL/$1.key" 2>/dev/null
+    $OPENSSL req -new -key "$ACL/$1.key" -subj "$2" -out "$ACL/$1.csr" 2>/dev/null
+    printf '%b' "$4" > "$ACL/$1.ext"
+    $OPENSSL x509 -req -in "$ACL/$1.csr" -CA "$ACL/$3.crt" -CAkey "$ACL/$3.key" -set_serial "0x$RANDOM$RANDOM" -days 2 -extfile "$ACL/$1.ext" -out "$ACL/$1.crt" 2>/dev/null
+}
+for ca in cca other; do
+    $OPENSSL ecparam -name prime256v1 -genkey -noout -out "$ACL/$ca.key" 2>/dev/null
+    $OPENSSL req -x509 -new -key "$ACL/$ca.key" -subj "/CN=routez e2e $ca" -days 2 -out "$ACL/$ca.crt" \
+        -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null
+done
+CLIENT_EXT='basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n'
+mkcert alice "/O=routez/CN=alice e2e" cca "$CLIENT_EXT"
+mkcert mallory "/CN=mallory" other "$CLIENT_EXT"
+$OPENSSL req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$ACL/strict.key" -out "$ACL/strict.crt" -days 2 \
+    -subj /CN=strict.test -addext subjectAltName=DNS:strict.test 2>/dev/null
+cat "$CERTS/ca.crt" "$ACL/strict.crt" > "$ACL/trust.pem"
+cp "$HERE/htpasswd" "$ACL/htpasswd"
+cat > "$ACL/routez.zon" <<EOF2
+.{ .access_log_path = "$ACL/access.log", .access_log_format = "\$request_uri \$remote_user \$ssl_client_verify \$status",
+   .servers = .{
+    .{
+        .server_names = .{"localhost"},
+        .listen = .{ .{ .address = "127.0.0.1", .port = 18480 }, .{ .address = "127.0.0.1", .port = 18481, .tls = true, .quic = true } },
+        .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key", .client_ca = "$ACL/cca.crt", .client_verify = .optional },
+        .locations = .{
+            .{ .prefix = "/", .@"return" = .{ .body = "open" }, .add_headers = .{.{ .name = "x-verify", .value = "\$ssl_client_verify" }} },
+            .{ .prefix = "/deny/", .@"return" = .{ .body = "no" }, .access = .{ .{ .deny = "127.0.0.1" }, .{ .allow = "all" } } },
+            .{ .prefix = "/allow/", .@"return" = .{ .body = "yes" }, .access = .{ .{ .allow = "127.0.0.0/8" }, .{ .deny = "all" } } },
+            .{ .prefix = "/v6only/", .@"return" = .{ .body = "v6" }, .access = .{ .{ .allow = "::1" }, .{ .deny = "all" } } },
+            .{ .prefix = "/auth/", .@"return" = .{ .body = "secret" }, .auth_basic = .{ .realm = "Test", .user_file = "$ACL/htpasswd" } },
+            .{ .prefix = "/authp/", .proxy_pass = "127.0.0.1:19001", .strip_prefix = true,
+               .auth_basic = .{ .realm = "Test", .user_file = "$ACL/htpasswd" },
+               .proxy_set_headers = .{.{ .name = "x-user", .value = "\$remote_user" }} },
+            .{ .prefix = "/cert/", .proxy_pass = "127.0.0.1:19001", .strip_prefix = true, .require_client_cert = true,
+               .proxy_set_headers = .{
+                   .{ .name = "x-client-dn", .value = "\$ssl_client_s_dn" },
+                   .{ .name = "x-client-issuer", .value = "\$ssl_client_i_dn" },
+                   .{ .name = "x-client-verify", .value = "\$ssl_client_verify" },
+               } },
+            .{ .prefix = "/wt-denied", .webtransport_pass = "127.0.0.1:4450", .access = .{.{ .deny = "all" }} },
+            .{ .prefix = "/.well-known/webtransport", .webtransport_pass = "127.0.0.1:4450", .auth_basic = .{ .user_file = "$ACL/htpasswd" } },
+        },
+    },
+    .{
+        .server_names = .{"strict.test"},
+        .listen = .{ .{ .address = "127.0.0.1", .port = 18481, .tls = true, .quic = true } },
+        .tls = .{ .cert = "$ACL/strict.crt", .key = "$ACL/strict.key", .client_ca = "$ACL/cca.crt" },
+        .locations = .{.{ .prefix = "/", .@"return" = .{ .body = "strict" }, .add_headers = .{.{ .name = "x-dn", .value = "\$ssl_client_s_dn" }} }},
+    },
+} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$ACL/routez.zon" 2> "$ACL/server.log" & ACLD=$!; PIDS+=($ACLD)
+wait_port 18480
+ACURL="$CURL_BIN -s --max-time 10 --cacert $ACL/trust.pem --resolve strict.test:18481:127.0.0.1 --resolve localhost:18481:127.0.0.1"
+code() { $ACURL -o /dev/null -w '%{http_code}' "$@"; }
+ALICE="--cert $ACL/alice.crt --key $ACL/alice.key"
+acl_suite() { # base-url [curl flags]
+    local B=$1; shift
+    check ip-deny "$(code "$@" "$B/deny/x") $(code "$@" "$B/allow/x") $(code "$@" "$B/v6only/x")" "403 200 403"
+    check auth-none "$(code "$@" "$B/auth/")" 401
+    check auth-challenge "$($ACURL "$@" -D - -o /dev/null "$B/auth/" | grep -i '^www-authenticate' | tr -d '\r')" 'www-authenticate: Basic realm="Test", charset="UTF-8"'
+    check auth-wrong "$(code "$@" -u alice:wrong "$B/auth/") $(code "$@" -u nobody:secret "$B/auth/")" "401 401"
+    check auth-bcrypt "$($ACURL "$@" -u alice:secret "$B/auth/")" secret
+    check auth-sha "$($ACURL "$@" -u bob:hunter2 "$B/auth/")" secret
+    # An uncached bcrypt user: the body waits for the verdict, then goes through whole.
+    check auth-post-body "$($ACURL "$@" -u "$AUTH_USER:secret" -X POST --data-binary @"$WORK/www/big.bin" "$B/authp/up" | json '["received"]')" 3000000
+    # Authorization goes upstream, as nginx sends it.
+    check auth-forwarded "$($ACURL "$@" -u alice:secret "$B/authp/h" | python3 -c 'import json,sys; d={k.lower(): v for k, v in json.load(sys.stdin)["headers"].items()}; print(d["x-user"], d["authorization"])')" "alice Basic YWxpY2U6c2VjcmV0"
+}
+SUITE=acl-http AUTH_USER=p1 acl_suite http://127.0.0.1:18480
+SUITE=acl-https AUTH_USER=p2 acl_suite https://localhost:18481
+if $CURL_BIN --version | grep -q HTTP3; then
+    SUITE=acl-h3 AUTH_USER=p3 acl_suite https://localhost:18481 --http3-only
+fi
+mtls_suite() {
+    check optional-without "$($ACURL "$@" -D - https://localhost:18481/ | grep -i '^x-verify' | tr -d '\r') $(code "$@" https://localhost:18481/cert/x)" "x-verify: NONE 403"
+    check optional-with "$($ACURL "$@" $ALICE https://localhost:18481/cert/x | python3 -c 'import json,sys; d=json.load(sys.stdin)["headers"]; print(d["x-client-verify"], "|", d["x-client-dn"], "|", d["x-client-issuer"])')" \
+        "SUCCESS | CN=alice e2e,O=routez | CN=routez e2e cca"
+    check required-without "$(code "$@" https://strict.test:18481/)" 000
+    check required-with "$($ACURL "$@" $ALICE -D - https://strict.test:18481/ | grep -i '^x-dn\|^strict' | tr -d '\r' | tr '\n' ' ')" "x-dn: CN=alice e2e,O=routez strict "
+    check required-foreign "$(code "$@" --cert "$ACL/mallory.crt" --key "$ACL/mallory.key" https://strict.test:18481/)" 000
+    # SNI localhost, Host strict.test: localhost's handshake can't vouch for strict.test.
+    check misdirected "$(code "$@" $ALICE -H 'Host: strict.test' https://localhost:18481/)" 421
+}
+SUITE=mtls-https mtls_suite
+if $CURL_BIN --version | grep -q HTTP3; then SUITE=mtls-h3 mtls_suite --http3-only; fi
+# No session tickets where client certificates are asked for: nothing to resume.
+echo | $OPENSSL s_client -connect 127.0.0.1:18481 -servername strict.test -tls1_3 -CAfile "$ACL/trust.pem" -cert "$ACL/alice.crt" -key "$ACL/alice.key" -sess_out "$ACL/sess" >/dev/null 2>&1
+SUITE=mtls check no-resumption "$(echo | $OPENSSL s_client -connect 127.0.0.1:18481 -servername strict.test -tls1_3 -CAfile "$ACL/trust.pem" -cert "$ACL/alice.crt" -key "$ACL/alice.key" -sess_in "$ACL/sess" 2>/dev/null | grep -c '^Reused')" 0
+SUITE=acl check access-log "$(grep -c '^/auth/ alice NONE 200$' "$ACL/access.log") $(grep -c '^/cert/x - SUCCESS 200$' "$ACL/access.log")" "$($CURL_BIN --version | grep -q HTTP3 && echo '3 2' || echo '2 1')"
+# WebTransport CONNECTs get the same checks.
+(cd "$ROOT" && zig build wt-test-client) || exit 1
+"$ROOT/zig-out/bin/wt-test-client" 18481 "$CERTS/ca.crt" 0 /wt-denied > "$ACL/wt.log" 2>&1 & WT=$!
+for _ in $(seq 1 50); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+kill $WT 2>/dev/null; wait $WT 2>/dev/null
+SUITE=acl check wt-ip-denied "$(grep -c 'wt-ok' "$ACL/wt.log")" 0
+"$ROOT/zig-out/bin/wt-test-client" 18481 "$CERTS/ca.crt" > "$ACL/wt.log" 2>&1 & WT=$!
+for _ in $(seq 1 50); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+kill $WT 2>/dev/null; wait $WT 2>/dev/null
+SUITE=acl check wt-auth-required "$(grep -c 'wt-ok' "$ACL/wt.log")" 0
+# A reload rereads the user file.
+echo "carol:{SHA}$(printf 'pw' | $OPENSSL dgst -sha1 -binary | base64)" >> "$ACL/htpasswd"
+SUITE=acl check before-reload "$(code -u carol:pw http://127.0.0.1:18480/auth/)" 401
+kill -HUP $ACLD
+for _ in $(seq 1 50); do [ "$(code -u carol:pw http://127.0.0.1:18480/auth/)" == 200 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
+SUITE=acl check reload-rereads-users "$(code -u carol:pw http://127.0.0.1:18480/auth/)" 200
+kill $ACLD; wait $ACLD 2>/dev/null
+if grep -qiE "panic|segmentation" "$ACL/server.log"; then fail=$((fail+1)); echo "FAIL access-control server crashed:"; tail -20 "$ACL/server.log"; fi
+# -t checks the user file and the CA bundle.
+printf 'carol:$apr1$kGdr5LQA$DXpLyEflTeI.UIQIoXQ1E1\n' > "$ACL/apr1"
+sed "s|$ACL/htpasswd|$ACL/apr1|g" "$ACL/routez.zon" > "$ACL/apr1.zon"
+"$ROOT/zig-out/bin/routez" -t "$ACL/apr1.zon" 2> "$ACL/t.log"
+SUITE=acl check test-rejects-apr1 "$? $(grep -c 'apr1.*htpasswd -B' "$ACL/t.log")" "1 1"
+sed "s|$ACL/cca.crt|$ACL/missing.crt|g" "$ACL/routez.zon" > "$ACL/noca.zon"
+"$ROOT/zig-out/bin/routez" -t "$ACL/noca.zon" 2> "$ACL/t.log"
+SUITE=acl check test-needs-client-ca "$? $(grep -c 'client_ca' "$ACL/t.log")" "1 1"
+
 # Operations: JSON access log to a file, reopened on SIGUSR1; error log at
 # warn; Prometheus metrics; a key that isn't the certificate's.
 OPS="$WORK/ops"; mkdir -p "$OPS"

@@ -11,6 +11,9 @@ const parser = @import("http1/parser.zig");
 const router = @import("router.zig");
 const static = @import("handlers/static.zig");
 const common = @import("http/common.zig");
+const access = @import("access.zig");
+const htpasswd = @import("auth/htpasswd.zig");
+const client_cert = @import("net/client_cert.zig");
 
 const request_seeds = [_][]const u8{
     "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
@@ -119,6 +122,68 @@ test "fuzz: range header" {
         }
     }.f, &.{ "bytes=0-9", "bytes=-5", "bytes=10-" });
 }
+
+test "fuzz: access rules" {
+    try mutate(struct {
+        fn f(input: []const u8) anyerror!void {
+            const r = access.parse(.deny, input) catch return;
+            try testing.expect(r.bits <= 128);
+            // Masked: the network matches itself, and so does every address in it.
+            try testing.expect(r.matches(r.net));
+            var ip = r.net;
+            ip[15] ^= 0xff;
+            if (r.bits <= 120) try testing.expect(r.matches(ip));
+        }
+    }.f, &.{ "10.0.0.0/8", "2001:db8::/32", "all", "::ffff:10.0.0.0/104", "192.0.2.1", "fe80::1/64" });
+}
+
+test "fuzz: htpasswd and Authorization" {
+    try mutate(struct {
+        fn f(input: []const u8) anyerror!void {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            var d: htpasswd.Diagnostic = .{};
+            if (htpasswd.parse(arena_state.allocator(), input, &d)) |file| {
+                var it = file.users.iterator();
+                while (it.next()) |e| switch (e.value_ptr.*) {
+                    .bcrypt => |h| try testing.expect(std.mem.startsWith(u8, &h, "$2")),
+                    .sha1 => {},
+                };
+            } else |_| {}
+            var buf: [htpasswd.max_credentials]u8 = undefined;
+            if (htpasswd.parseAuthorization(input, &buf)) |c| {
+                try testing.expect(std.mem.indexOfScalar(u8, c.user, ':') == null);
+            }
+        }
+    }.f, &.{
+        "alice:$2y$10$f/mtfnwsB2gGNc04FBRPnu07AK7xFpWb9z4jwcHSRI4vGLNN2IC82\nbob:{SHA}87u9ZqY9S/F0eUBXjsPQEDUw4h0=\n",
+        "Basic YWxpY2U6czNjcjN0",
+        "# c\n\ncarol:$apr1$kGdr5LQA$DXpLyEflTeI.UIQIoXQ1E1",
+    });
+}
+
+test "fuzz: client certificate names" {
+    try mutate(struct {
+        fn f(input: []const u8) anyerror!void {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            if (client_cert.formatName(arena_state.allocator(), input)) |dn| {
+                // Always a valid header value.
+                try testing.expect(common.isFieldValue(dn));
+            } else |_| {}
+            if (client_cert.describe(arena_state.allocator(), input)) |info| {
+                try testing.expect(common.isFieldValue(info.s_dn) and common.isFieldValue(info.i_dn));
+            } else |_| {}
+        }
+    }.f, &name_seeds);
+}
+
+const name_seeds = [_][]const u8{
+    // SET { CN=alice }, SET { O=Example }
+    "\x31\x0e\x30\x0c\x06\x03\x55\x04\x03\x0c\x05alice\x31\x10\x30\x0e\x06\x03\x55\x04\x0a\x0c\x07Example",
+    // An unknown attribute and a BMPString.
+    "\x31\x0f\x30\x0d\x06\x03\x2a\x03\x04\x1e\x06\x00a\x00\xe9\x00b",
+};
 
 /// Run `target` on each seed, then on random mutations of them: byte flips,
 /// insertions of protocol-significant bytes, deletions, splices and

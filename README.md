@@ -36,6 +36,9 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   (per-client token bucket, optionally a named zone shared by locations).
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
+- Access control: IP allow/deny rules, Basic auth against htpasswd files
+  (bcrypt checked off the event loop), and client certificates (mutual TLS)
+  over TLS and HTTP/3, with the client's identity in variables.
 - Operations: drops root after binding (`user`, `group`), access and error
   log files reopened on SIGUSR1 for rotation, access log formats (nginx's
   `combined`, JSON lines, or a template of variables), a runtime log level,
@@ -164,6 +167,73 @@ A ZON file; see `src/config.zig` for every field and default.
   addresses lock out every new client, and those addresses already let
   them sidestep per-address limits.
 
+### Access control
+
+```zig
+.{ .servers = .{.{
+    .listen = .{ .{ .port = 443, .tls = true, .quic = true } },
+    .tls = .{ .cert = "fullchain.pem", .key = "privkey.pem",
+              .client_ca = "clients-ca.pem", .client_verify = .optional },
+    // Every location without rules of its own.
+    .access = .{ .{ .allow = "10.0.0.0/8" }, .{ .allow = "2001:db8::/32" }, .{ .deny = "all" } },
+    .locations = .{
+        .{ .prefix = "/", .root = "/var/www" },
+        .{ .prefix = "/public/", .root = "/var/www", .access = .{.{ .allow = "all" }} },
+        .{ .prefix = "/admin/", .proxy_pass = "backend",
+           .auth_basic = .{ .realm = "Admin", .user_file = "/etc/routez/htpasswd" },
+           .proxy_set_headers = .{.{ .name = "x-user", .value = "$remote_user" }} },
+        .{ .prefix = "/internal/", .proxy_pass = "backend", .require_client_cert = true,
+           .proxy_set_headers = .{
+               .{ .name = "x-client-dn", .value = "$ssl_client_s_dn" },
+               .{ .name = "x-client-verify", .value = "$ssl_client_verify" },
+           } },
+    },
+}} }
+```
+
+Checks run in this order, after `limit_req`: IP rules (403), client
+certificate (421, 403), Basic auth (401). They apply to HTTP/1.1, HTTPS,
+HTTP/3 and WebTransport CONNECTs alike.
+
+- **IP rules**: `.allow`/`.deny` with `all`, an address or a CIDR network,
+  IPv4 or IPv6; the first rule matching the client decides, and a client
+  none matches is allowed (as in nginx). A location's `access` replaces its
+  server's. IPv4 rules also match IPv4-mapped IPv6 peers. The client is the
+  TCP or QUIC peer: `X-Forwarded-For` is not trusted, and there is no
+  `real_ip_from` yet, so behind another proxy the rules see that proxy.
+- **Basic auth**: `auth_basic` answers 401 with
+  `WWW-Authenticate: Basic realm="..."` until the credentials match the
+  htpasswd file. Entries may be bcrypt (`htpasswd -B`; cost 4 to 16) or
+  `{SHA}` (`htpasswd -s`; unsalted SHA-1, accepted with a warning). apr1
+  MD5, crypt(3) and plain-text entries are refused at load with the line
+  named, as is a missing file; `-t` checks the files, and a reload rereads
+  them. The `Authorization` header is passed upstream, as nginx does;
+  remove it with `.proxy_set_headers = .{.{ .name = "authorization", .value = "" }}`.
+  `$remote_user` holds the user, for headers and the access log (`combined`
+  logs it).
+  bcrypt costs tens to hundreds of milliseconds, so checks run on a few
+  verifier threads, never on a worker. A correct password is cached for
+  five minutes (an HMAC of the stored hash, user and password; changing the
+  password invalidates it), so a browser sending it with every request
+  costs one check. Each client may start 5 uncached checks per second
+  (burst 10, across workers) before getting 429, and at most 128 wait for a
+  thread before requests get 503. An unknown user is checked against
+  another entry's hash, so it takes as long as a wrong password.
+- **Client certificates**: `tls.client_ca` makes the server ask TLS and
+  QUIC clients reaching it by SNI for a certificate, verified against that
+  CA bundle (chain, validity, and the clientAuth usage when present). With
+  `client_verify = .required` (the default) a client without a valid one
+  fails the handshake (`certificate_required`, `unknown_ca`, ...); with
+  `.optional` it gets in, `require_client_cert = true` on a location answers
+  403, and the variables say `NONE`. A certificate that fails to verify
+  fails the handshake either way. Several servers can share a port, each
+  with its own CA or none; a request whose `Host` names a server with a
+  `client_ca` other than the one its handshake ran under (SNI one name,
+  Host another) gets 421. Session tickets are neither issued nor accepted
+  for such a server, so a resumed session can never skip the certificate.
+  `client_verify` means nothing on a plain-HTTP listener: don't serve the
+  same locations there, or mark them `require_client_cert`.
+
 ### Operations
 
 ```zig
@@ -230,6 +300,15 @@ A ZON file; see `src/config.zig` for every field and default.
 | `$uri` | normalized path (dot segments resolved), percent-encoded |
 | `$args`, `$is_args` | query string without the `?`; `?` if there is one |
 | `$remote_addr` | client IP |
+| `$remote_user` | the user `auth_basic` let in |
+| `$ssl_client_verify` | `SUCCESS` for a verified client certificate, else `NONE` |
+| `$ssl_client_s_dn`, `$ssl_client_i_dn` | its subject and issuer, RFC 4514 (`CN=alice,O=Example`) |
+| `$ssl_client_serial` | its serial number, hex |
+| `$ssl_client_fingerprint` | SHA-1 of the certificate, hex |
+
+Pass certificate details upstream with `proxy_set_headers`: it replaces
+any header the client sent under the same name (and an empty value removes
+it), so a client can't forge them.
 
 An unknown variable, or a `$` not starting one, fails the config check. A
 value that would expand to something invalid in a header gets a 400.
@@ -373,7 +452,13 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   write: nothing keeps root to do those, unlike nginx's master process.
 - TLS to upstreams: TLS 1.3 only, no session resumption (pooled keep-alive
   connections avoid most handshakes), no client certificates and no
-  revocation checks. A literal `proxy_pass` target is always plain HTTP;
+  revocation checks.
+- Client certificates: no revocation checks (CRL, OCSP) and no
+  post-handshake authentication, so a location can't ask for a certificate
+  the handshake didn't; a server's `client_ca` applies to its whole name.
+  Connections to a `client_ca` server are never resumed from a ticket.
+- IP rules see the TCP or QUIC peer only; there is no trusted-proxy
+  (`real_ip_from`) support. A literal `proxy_pass` target is always plain HTTP;
   declare an upstream to use TLS.
 - macOS does not spread TCP connections across SO_REUSEPORT listeners, so
   extra workers only help on Linux.

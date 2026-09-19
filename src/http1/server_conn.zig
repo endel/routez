@@ -36,6 +36,9 @@ pub const Conn = struct {
     ex: ?*Exchange = null,
     body: parser.BodyDecoder = parser.BodyDecoder.init(.none),
     body_paused: bool = false,
+    /// The request ended while its body was paused; the exchange hears of
+    /// it on resume, as it would of the body.
+    end_pending: bool = false,
     body_received: u64 = 0,
     req_version: parser.Version = .http11,
     req_is_head: bool = false,
@@ -279,7 +282,13 @@ pub const Conn = struct {
                 self.in.clearRetainingCapacity();
                 return false;
             },
-            .wait, .closing => return false,
+            .wait => {
+                if (!self.end_pending or self.body_paused) return false;
+                self.end_pending = false;
+                if (self.ex) |ex| ex.onRequestEnd();
+                return true;
+            },
+            .closing => return false,
         }
     }
 
@@ -305,6 +314,7 @@ pub const Conn = struct {
         self.resp = .{};
         self.body_received = 0;
         self.body_paused = false;
+        self.end_pending = false;
         self.body = parser.BodyDecoder.init(parser.requestBodyKind(&head));
 
         if (std.mem.eql(u8, head.method, "CONNECT")) {
@@ -335,6 +345,7 @@ pub const Conn = struct {
             .client_addr = self.clientAddr(),
             .client_ip = self.client_ip,
             .vhosts = &self.listener.vhosts,
+            .client_cert = if (self.tls) |t| t.clientCert() else .{},
         }) catch {
             self.rejectRequest(500);
             return false;
@@ -349,7 +360,9 @@ pub const Conn = struct {
         if (expect_continue) self.output("HTTP/1.1 100 Continue\r\n\r\n");
         ex.start();
         if (self.phase == .wait) {
-            if (self.ex) |e| e.onRequestEnd();
+            if (self.body_paused) {
+                self.end_pending = true;
+            } else if (self.ex) |e| e.onRequestEnd();
         }
         return true;
     }

@@ -18,6 +18,7 @@
 const std = @import("std");
 const vars = @import("http/vars.zig");
 const access_log = @import("access_log.zig");
+const access = @import("access.zig");
 
 pub const Config = struct {
     /// Worker threads, each with its own event loop and SO_REUSEPORT sockets.
@@ -102,6 +103,46 @@ pub const Tls = struct {
     key: ?[]const u8 = null,
     /// Obtain and renew the certificate for `server_names` automatically.
     acme: ?Acme = null,
+    /// PEM bundle of the CAs client certificates must chain to. Set, TLS and
+    /// QUIC clients reaching this server by SNI are asked for a certificate
+    /// (mutual TLS); see `client_verify`.
+    client_ca: ?[]const u8 = null,
+    /// `.required`: a client without a valid certificate fails the handshake.
+    /// `.optional`: it gets in without one, and locations can insist with
+    /// `require_client_cert`. A certificate that fails to verify fails the
+    /// handshake either way.
+    client_verify: ClientVerify = .required,
+};
+
+pub const ClientVerify = enum { required, optional };
+
+/// One IP rule: `.{ .allow = "10.0.0.0/8" }`, `.{ .deny = "all" }`. The
+/// value is `all`, an address, or a CIDR network, IPv4 or IPv6.
+pub const AccessRule = union(enum) {
+    allow: []const u8,
+    deny: []const u8,
+
+    pub fn action(self: AccessRule) access.Action {
+        return switch (self) {
+            .allow => .allow,
+            .deny => .deny,
+        };
+    }
+
+    pub fn text(self: AccessRule) []const u8 {
+        return switch (self) {
+            inline else => |t| t,
+        };
+    }
+};
+
+/// HTTP Basic authentication against an htpasswd file.
+pub const AuthBasic = struct {
+    /// Shown by the browser's login prompt.
+    realm: []const u8 = "Restricted",
+    /// htpasswd file with bcrypt (`htpasswd -B`) or `{SHA}` entries. Read
+    /// at start and on every reload.
+    user_file: []const u8,
 };
 
 /// Automatic certificates from an ACME CA (RFC 8555), validated with HTTP-01
@@ -133,6 +174,9 @@ pub const Server = struct {
     /// The first server on a listener is the default for unmatched hosts.
     server_names: []const []const u8 = &.{},
     tls: ?Tls = null,
+    /// IP rules for every location that has none of its own; see
+    /// `Location.access`.
+    access: []const AccessRule = &.{},
     locations: []const Location,
 };
 
@@ -174,6 +218,16 @@ pub const Location = struct {
     gzip: bool = false,
     /// Per-client request rate limit, shared by all workers.
     limit_req: ?LimitReq = null,
+    /// IP allow/deny rules, nginx-style: the first rule matching the client
+    /// decides, and a client no rule matches is allowed; denied ones get 403.
+    /// Replaces the server's `access` when not empty. The client is the TCP
+    /// or QUIC peer; forwarded-for headers are not trusted.
+    access: []const AccessRule = &.{},
+    /// Ask for a user and password (401 until they match).
+    auth_basic: ?AuthBasic = null,
+    /// 403 unless the client presented a certificate that verified against
+    /// the server's `tls.client_ca`; for `client_verify = .optional`.
+    require_client_cert: bool = false,
 
     /// Serve connection and request counters as plain text.
     stub_status: bool = false,
@@ -355,6 +409,7 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (!l.tcp and l.tls) return fail("listen :{d}: tls without tcp", .{l.port});
         }
         if (srv.tls) |t| try checkTls(cfg, srv, t);
+        try checkAccess(srv.access, "server");
         for (srv.locations) |loc| {
             var actions: u8 = 0;
             if (loc.root != null) actions += 1;
@@ -374,9 +429,29 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
             }
             if (loc.limit_req) |l| try checkLimitReq(cfg, loc.prefix, l);
+            try checkAccess(loc.access, loc.prefix);
+            if (loc.auth_basic) |ab| try checkAuthBasic(loc.prefix, ab);
+            if (loc.require_client_cert and (srv.tls == null or srv.tls.?.client_ca == null))
+                return fail("location '{s}': require_client_cert needs the server's tls.client_ca", .{loc.prefix});
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkAccess(rules: []const AccessRule, where: []const u8) error{InvalidConfig}!void {
+    for (rules) |r| {
+        _ = access.parse(r.action(), r.text()) catch return fail("{s}: access rule '{s}' is not all, an address or a network", .{ where, r.text() });
+        if (access.hostBitsSet(r.action(), r.text()) and !@import("builtin").is_test)
+            std.log.scoped(.config).warn("{s}: access rule '{s}' has bits set past its prefix; they are ignored", .{ where, r.text() });
+    }
+}
+
+fn checkAuthBasic(prefix: []const u8, ab: AuthBasic) error{InvalidConfig}!void {
+    if (ab.user_file.len == 0) return fail("location '{s}': auth_basic.user_file is empty", .{prefix});
+    // It goes out inside a quoted string in WWW-Authenticate.
+    if (ab.realm.len == 0 or ab.realm.len > 256) return fail("location '{s}': auth_basic.realm must be 1 to 256 bytes", .{prefix});
+    for (ab.realm) |c| if (c < 0x20 or c == 0x7f or c == '"' or c == '\\')
+        return fail("location '{s}': auth_basic.realm may not hold quotes, backslashes or control characters", .{prefix});
 }
 
 fn checkLimitReq(cfg: *const Config, prefix: []const u8, l: Location.LimitReq) error{InvalidConfig}!void {
@@ -413,6 +488,7 @@ pub fn tryFilesStatus(entry: []const u8) ?u16 {
 }
 
 fn checkTls(cfg: *const Config, srv: *const Server, t: Tls) error{InvalidConfig}!void {
+    if (t.client_ca) |p| if (p.len == 0) return fail("server tls.client_ca is empty", .{});
     const acme = t.acme orelse {
         if (t.cert == null or t.key == null) return fail("server tls needs cert and key, or acme", .{});
         return;
@@ -700,6 +776,47 @@ test "try_files" {
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "/$host/x" } }} }} }
         ,
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .try_files = .{ "$uri", "=40x" } }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "access rules, auth_basic and client certificates" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{
+        \\    .listen = .{.{ .port = 443, .tls = true }},
+        \\    .tls = .{ .cert = "c", .key = "k", .client_ca = "ca.pem", .client_verify = .optional },
+        \\    .access = .{ .{ .allow = "10.0.0.0/8" }, .{ .allow = "2001:db8::/32" }, .{ .deny = "all" } },
+        \\    .locations = .{
+        \\        .{ .prefix = "/", .root = "x" },
+        \\        .{ .prefix = "/admin/", .root = "x", .require_client_cert = true,
+        \\           .auth_basic = .{ .realm = "Admins", .user_file = "/etc/routez/htpasswd" },
+        \\           .access = .{.{ .allow = "all" }} },
+        \\    },
+        \\}} }
+    , "test");
+    const srv = cfg.servers[0];
+    try std.testing.expectEqual(@as(usize, 3), srv.access.len);
+    try std.testing.expectEqualStrings("all", srv.access[2].deny);
+    try std.testing.expectEqual(ClientVerify.optional, srv.tls.?.client_verify);
+    try std.testing.expectEqualStrings("Admins", srv.locations[1].auth_basic.?.realm);
+
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .access = .{.{ .allow = "10.0.0.0/33" }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .access = .{.{ .deny = "everyone" }} }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .auth_basic = .{ .user_file = "" } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .auth_basic = .{ .realm = "a\"b", .user_file = "f" } }} }} }
+        ,
+        // require_client_cert without a client CA
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .require_client_cert = true }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 443, .tls = true }}, .tls = .{ .cert = "c", .key = "k", .client_ca = "" }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
