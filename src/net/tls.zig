@@ -59,6 +59,14 @@ pub fn loadCertificate(arena: std.mem.Allocator, cert_path: []const u8, key_path
         }
         return err;
     };
+    const matches = tls13.keyMatchesCertificate(key, chain[0]) catch |err| {
+        std.log.err("{s}: the first certificate does not parse", .{cert_path});
+        return err;
+    };
+    if (!matches) {
+        std.log.err("{s} is not the key of the first certificate in {s}", .{ key_path, cert_path });
+        return error.KeyMismatch;
+    }
     return .{ .cert_chain_der = chain, .private_key_bytes = try arena.dupe(u8, key.bytes), .private_key_algorithm = key.algorithm };
 }
 
