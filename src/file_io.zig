@@ -275,7 +275,7 @@ pub const Residency = struct {
         if (offset >= self.map.len) return false;
         const start = std.mem.alignBackward(usize, @intCast(offset), page);
         const end = @min(@as(usize, @intCast(offset)) + len, self.map.len);
-        var vec: [64]u8 = undefined;
+        var vec: [256]u8 = undefined;
         if ((end - start + page - 1) / page > vec.len) return false;
         std.posix.mincore(@alignCast(self.map.ptr + start), end - start, &vec) catch return false;
         for (vec[0 .. (end - start + page - 1) / page]) |v| if (v & 1 == 0) return false;

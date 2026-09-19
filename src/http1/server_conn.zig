@@ -536,6 +536,8 @@ pub const Conn = struct {
         .buffered = dsBuffered,
         .setRequestBodyPaused = dsSetPaused,
         .startTunnel = dsStartTunnel,
+        .canSendFile = dsCanSendFile,
+        .sendFile = dsSendFile,
     };
 
     fn cast(ptr: *anyopaque) *Conn {
@@ -620,6 +622,22 @@ pub const Conn = struct {
             },
             .close, .tunnel => self.output(data),
         }
+    }
+
+    fn dsCanSendFile(ptr: *anyopaque) bool {
+        const self = cast(ptr);
+        return self.tls == null and self.resp.framing == .length;
+    }
+
+    fn dsSendFile(ptr: *anyopaque, f: socket.FileOut) exchange.FileSend {
+        const self = cast(ptr);
+        if (self.tls != null or self.resp.framing != .length or f.len > self.resp.remaining) {
+            f.release(f.hold);
+            return .unsupported;
+        }
+        if (!self.sock.sendFile(f)) return .busy;
+        self.resp.remaining -= f.len;
+        return .sent;
     }
 
     fn dsFinish(ptr: *anyopaque) void {

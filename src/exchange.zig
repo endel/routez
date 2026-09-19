@@ -64,7 +64,20 @@ pub const Downstream = struct {
         setRequestBodyPaused: *const fn (*anyopaque, bool) void,
         /// After a 101 head: raw bytes in both directions from here on.
         startTunnel: *const fn (*anyopaque) void,
+        /// Whether the body may go out as file ranges (`sendFile`).
+        canSendFile: ?*const fn (*anyopaque) bool = null,
+        /// Queue a range of a file as body bytes. Takes the range's hold
+        /// whatever the answer.
+        sendFile: ?*const fn (*anyopaque, socket.FileOut) FileSend = null,
     };
+};
+
+pub const FileSend = enum {
+    sent,
+    /// Not now: send this range as bytes.
+    busy,
+    /// Not for this response.
+    unsupported,
 };
 
 pub const Protocol = enum {
@@ -641,6 +654,29 @@ pub const Exchange = struct {
             d.vtable.abort(d.ptr);
         }
         if (self.handler == .none) self.destroy();
+    }
+
+    /// Whether the body may go out as file ranges: an untransformed body
+    /// over a downstream that can sendfile.
+    pub fn canSendFile(self: *const Exchange) bool {
+        const d = self.down orelse return false;
+        const can = d.vtable.canSendFile orelse return false;
+        return self.gz == null and can(d.ptr);
+    }
+
+    /// Send a file range as body bytes; see `Downstream.VTable.sendFile`.
+    pub fn respondFile(self: *Exchange, f: socket.FileOut) FileSend {
+        const d = self.down orelse {
+            f.release(f.hold);
+            return .unsupported;
+        };
+        const send = d.vtable.sendFile orelse {
+            f.release(f.hold);
+            return .unsupported;
+        };
+        const r = send(d.ptr, f);
+        if (r == .sent) self.bytes_sent += f.len;
+        return r;
     }
 
     pub fn downstreamBuffered(self: *const Exchange) usize {

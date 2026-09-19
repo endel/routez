@@ -18,7 +18,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   files, directory redirects, path normalization, `try_files` fallbacks for
   single-page apps. Opened and read on I/O threads, so a slow disk stalls
   only the requests reading from it; what the page cache holds is served
-  straight from the worker, with an open-file cache.
+  straight from the worker, with an open-file cache and, over plain HTTP,
+  `sendfile`.
 - Reverse proxy to HTTP/1.1 upstreams, plain or over TLS 1.3 (quic-zig's
   sans-IO `tls_client`, with optional certificate verification and client
   certificates): streaming
@@ -180,6 +181,12 @@ A ZON file; see `src/config.zig` for every field and default.
   `valid_ms`, a file edited in place is served with its old length and
   ETag: truncated, its response is cut short (the connection closes); grown,
   the extra bytes are left out.
+- Over plain HTTP/1.1, a static body over 32 KiB that isn't compressed on
+  the fly goes out with `sendfile`, range by range as the socket takes it,
+  for the parts the page cache holds; the rest is read on an I/O thread as
+  over TLS and HTTP/3 (sendfile reads the file on the calling thread, so a
+  cold page would stall the worker). Where the filesystem can't sendfile,
+  the socket falls back to reading the cached range itself.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
 - TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
@@ -654,8 +661,8 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
 | TLS: 10 KB static file | 131k | — | 163k |
 | TLS: new connection per request | 12k | 10k | 16k |
 
-- HAProxy isn't a file server. nginx has `sendfile` on; routez copies files
-  through userspace. The static rows predate routez's open-file cache.
+- HAProxy isn't a file server. The static rows predate routez's
+  open-file cache and `sendfile`, which nginx has on.
 - TLS is 1.3 with AES-128-GCM and X25519 everywhere, routez's own choice;
   nginx and HAProxy are pinned to it.
 - The last row measures resumed handshakes: wrk reuses the session on each
@@ -692,6 +699,8 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   ones don't). On macOS a lookup the open-file cache can't answer (a path's
   first request, or its first after `valid_ms`) takes a round trip to an
   I/O thread: nothing there can tell that an open won't wait.
+- `sendfile` is used for plain HTTP/1.1 only: TLS and HTTP/3 encrypt in
+  userspace, and bodies compressed on the fly are made there.
 - Compression on the fly is gzip only: Zig's standard library has no
   Brotli or zstd encoder, and a small one written here would compress worse
   than gzip. Precompress with `brotli` or `zstd` at build time and serve the

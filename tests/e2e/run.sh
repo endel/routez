@@ -215,6 +215,12 @@ echo | $OPENSSL s_client -connect 127.0.0.1:18443 -tls1_3 -CAfile $CERTS/ca.crt 
 SUITE=https check tls-resumption "$(echo | $OPENSSL s_client -connect 127.0.0.1:18443 -tls1_3 -CAfile $CERTS/ca.crt -sess_in "$WORK/sess" 2>/dev/null | grep -c '^Reused')" 1
 SUITE=https check tls-alpn "$($CURL_BIN -s -o /dev/null -w '%{http_version}' --cacert $CERTS/ca.crt https://127.0.0.1:18443/ping)" "1.1"
 SUITE=https check plain-http-on-tls-port "$($CURL_BIN -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18443/ping)" "000"
+# Plain HTTP sends static bodies with sendfile: pipelined, paced by a slow
+# reader, and abandoned mid-body.
+SUITE=sendfile check pipelined-files "$(python3 "$HERE/pipe_files.py" "$WORK/www/big.bin" "$WORK/www/sub/a.txt")" ok
+SUITE=sendfile check slow-client-file "$($CURL_BIN -s --limit-rate 4M http://127.0.0.1:18080/big.bin | sha)" "$(sha < "$WORK/www/big.bin")"
+$CURL_BIN -s --limit-rate 200k --max-time 0.5 -o /dev/null http://127.0.0.1:18080/big.bin
+SUITE=sendfile check client-gone-mid-file "$($CURL_BIN -s http://127.0.0.1:18080/big.bin | sha)" "$(sha < "$WORK/www/big.bin")"
 # Open-file cache: a change on disk shows within valid_ms (1 s by default).
 # The body if 200, else the status.
 ofc_get() {

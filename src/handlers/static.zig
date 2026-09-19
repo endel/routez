@@ -12,6 +12,10 @@
 //! open-file cache (`open_file_cache.zig`), and where the kernel can tell an
 //! answer is cached, the loop takes it itself: the lookup on Linux (openat2
 //! with RESOLVE_CACHED), reads everywhere (RWF_NOWAIT, else mincore).
+//!
+//! Over plain HTTP/1.1, cached ranges of an untransformed body go out with
+//! sendfile. Only cached ones: sendfile reads the file on the calling
+//! thread, so a cold page would stall the worker.
 const std = @import("std");
 const build_options = @import("build_options");
 const common = @import("../http/common.zig");
@@ -27,6 +31,9 @@ const timers = @import("../timers.zig");
 const Coding = encoding.Coding;
 
 const chunk_size = 32 * 1024;
+/// Most handed to one sendfile segment; within what `Residency.cached`
+/// checks in one call.
+const sendfile_chunk = 256 * 1024;
 const n_codings = std.meta.fields(Coding).len;
 const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
 
@@ -90,6 +97,8 @@ pub const Transfer = struct {
     end: u64 = 0,
     /// Bytes the last read left in `buf`; 0 when it failed.
     filled: usize = 0,
+    /// The downstream may take the body as file ranges.
+    sendfile: bool = false,
     /// Its own allocation: with it inline the transfer would outgrow the
     /// allocator's slabs and cost an mmap per request.
     buf: ?*[chunk_size]u8 = null,
@@ -493,6 +502,9 @@ fn serve(ex: *Exchange, t: *Transfer) void {
     t.end = range_end;
     ex.respondHead(&.{ .status = status, .headers = headers[0..n], .content_length = range_end - range_start });
     if (is_head) return finish(ex);
+    // A body that fits one read costs a read and a write either way, and
+    // on ext4 the read needs no residency check.
+    t.sendfile = range_end - range_start > chunk_size and ex.canSendFile();
     // The prefetch read from 0 and there's no range: it's the body's start.
     if (t.prefetch and t.filled > 0) {
         if (!send(ex, t)) return;
@@ -553,15 +565,16 @@ fn send(ex: *Exchange, t: *Transfer) bool {
     return true;
 }
 
-/// Send chunks while the downstream has room: from the page cache where
-/// possible, else one read at a time from an I/O thread. Resumed from
-/// `onDownstreamWritable`.
+/// Send the body while the downstream has room: as file ranges where it
+/// takes them, else chunks from the page cache, else one read at a time
+/// from an I/O thread. Resumed from `onDownstreamWritable`.
 pub fn pump(ex: *Exchange) void {
     const t = ex.handler.static;
     while (true) {
         if (t.busy) return;
         if (t.offset >= t.end) return finish(ex);
         if (ex.downstreamBuffered() > socket.high_water) return;
+        if (t.sendfile and sendRange(ex, t)) continue;
         if (t.buf == null) t.buf = t.gpa.create([chunk_size]u8) catch {
             release(ex);
             return ex.respondAbort();
@@ -573,6 +586,31 @@ pub fn pump(ex: *Exchange) void {
     t.job.done = Transfer.readDone;
     t.busy = true;
     _ = ex.worker.shared.file_pool.?.submit(&t.job, false);
+}
+
+/// Hand the next range to the downstream to sendfile, if it's cached;
+/// false to send it some other way.
+fn sendRange(ex: *Exchange, t: *Transfer) bool {
+    const e = t.entry.?;
+    const len: usize = @intCast(@min(t.end - t.offset, sendfile_chunk));
+    if (slowRead(t.candidates[t.chosen]) or !e.resident(t.offset, len)) return false;
+    e.retain();
+    switch (ex.respondFile(.{ .fd = e.file.handle, .offset = t.offset, .len = len, .hold = e, .release = releaseEntry })) {
+        .sent => {
+            t.offset += len;
+            return true;
+        },
+        .busy => return false,
+        .unsupported => {
+            t.sendfile = false;
+            return false;
+        },
+    }
+}
+
+fn releaseEntry(hold: *anyopaque) void {
+    const e: *ofc.Entry = @ptrCast(@alignCast(hold));
+    e.release();
 }
 
 fn finish(ex: *Exchange) void {

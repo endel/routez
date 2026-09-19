@@ -27,6 +27,16 @@ const send_flags: c_int = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL e
 pub const high_water = 256 * 1024;
 pub const low_water = 64 * 1024;
 
+/// A range of a file to send as-is (sendfile), after the bytes queued
+/// before it. `release(hold)` is called once the socket is done with it.
+pub const FileOut = struct {
+    fd: std.posix.fd_t,
+    offset: u64,
+    len: u64,
+    hold: *anyopaque,
+    release: *const fn (*anyopaque) void,
+};
+
 pub fn Socket(comptime Owner: type) type {
     return struct {
         const Self = @This();
@@ -51,6 +61,10 @@ pub fn Socket(comptime Owner: type) type {
         active: std.ArrayListUnmanaged(u8) = .empty,
         active_off: usize = 0,
         pending: std.ArrayListUnmanaged(u8) = .empty,
+        /// Sent once `active` and the first `file_before` bytes of
+        /// `pending` are; bytes queued after it wait for it.
+        file: ?FileOut = null,
+        file_before: usize = 0,
 
         state: State = .open,
         fd_closed: bool = false,
@@ -195,25 +209,108 @@ pub fn Socket(comptime Owner: type) type {
             self.kickWrite();
         }
 
+        /// Queue a file range after the bytes queued so far; false (and the
+        /// range released) when one is already queued that this doesn't
+        /// continue, or the socket is closing. The range must be in the
+        /// page cache: sendfile reads it on this thread.
+        pub fn sendFile(self: *Self, f: FileOut) bool {
+            if (self.state != .open or self.connecting) {
+                f.release(f.hold);
+                return false;
+            }
+            if (self.file) |*cur| {
+                const continues = cur.fd == f.fd and cur.offset + cur.len == f.offset and self.pending.items.len == self.file_before;
+                f.release(f.hold);
+                if (!continues) return false;
+                cur.len += f.len;
+                return true;
+            }
+            self.file = f;
+            self.file_before = self.pending.items.len;
+            self.kickWrite();
+            return true;
+        }
+
         /// Bytes queued and not yet accepted by the kernel.
         pub fn buffered(self: *const Self) usize {
-            return (self.active.items.len - self.active_off) + self.pending.items.len;
+            const file_len: usize = if (self.file) |f| @intCast(f.len) else 0;
+            return (self.active.items.len - self.active_off) + self.pending.items.len + file_len;
         }
 
         fn kickWrite(self: *Self) void {
             if (self.writing or self.connecting) return;
             if (self.state == .closing or self.state == .closed or self.state == .lingering) return;
-            if (self.active_off >= self.active.items.len) {
+            while (self.active_off >= self.active.items.len) {
+                self.active.clearRetainingCapacity();
+                self.active_off = 0;
+                if (self.file != null) {
+                    if (self.file_before > 0) {
+                        // The bytes ahead of the file go first.
+                        self.active.appendSlice(self.alloc, self.pending.items[0..self.file_before]) catch return self.abort();
+                        const rest = self.pending.items.len - self.file_before;
+                        std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[self.file_before..]);
+                        self.pending.items.len = rest;
+                        self.file_before = 0;
+                        break;
+                    }
+                    switch (self.sendFileNow()) {
+                        .done, .copied => continue,
+                        .blocked => {
+                            // An empty write completes once the socket is writable.
+                            self.writing = true;
+                            self.tcp.write(self.loop, &self.write_c, .{ .slice = &.{} }, Self, self, onWrite);
+                            return;
+                        },
+                        .failed => return self.abort(),
+                    }
+                }
                 if (self.pending.items.len == 0) {
                     if (self.state == .flushing) self.finishFlush();
                     return;
                 }
                 std.mem.swap(std.ArrayListUnmanaged(u8), &self.active, &self.pending);
                 self.pending.clearRetainingCapacity();
-                self.active_off = 0;
             }
             self.writing = true;
             self.tcp.write(self.loop, &self.write_c, .{ .slice = self.active.items[self.active_off..] }, Self, self, onWrite);
+        }
+
+        /// sendfile until the range is out or the socket is full. Where the
+        /// file can't be sent that way, a piece of it is copied into
+        /// `active` instead (a plain read: the range is cached).
+        fn sendFileNow(self: *Self) enum { done, blocked, copied, failed } {
+            const f = &self.file.?;
+            while (f.len > 0) {
+                const r = sendfile(self.tcp.fd, f.fd, f.offset, f.len);
+                f.offset += r.sent;
+                f.len -= r.sent;
+                switch (r.status) {
+                    .ok => if (r.sent == 0) return .failed, // the file shrank
+                    .again => return .blocked,
+                    .unsupported => {
+                        const n: usize = @intCast(@min(f.len, 64 * 1024));
+                        self.active.ensureTotalCapacity(self.alloc, n) catch return .failed;
+                        const rc = std.c.pread(f.fd, self.active.allocatedSlice().ptr, n, @intCast(f.offset));
+                        if (rc <= 0) return .failed;
+                        const got: usize = @intCast(rc);
+                        self.active.items.len = got;
+                        f.offset += got;
+                        f.len -= got;
+                        if (f.len == 0) self.dropFile();
+                        return .copied;
+                    },
+                    .failed => return .failed,
+                }
+            }
+            self.dropFile();
+            return .done;
+        }
+
+        fn dropFile(self: *Self) void {
+            const f = self.file orelse return;
+            self.file = null;
+            self.file_before = 0;
+            f.release(f.hold);
         }
 
         fn onWrite(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, r: xev.WriteError!usize) xev.CallbackAction {
@@ -274,12 +371,14 @@ pub fn Socket(comptime Owner: type) type {
                 self.active_off = 0;
             }
             self.pending.clearAndFree(self.alloc);
+            self.dropFile();
         }
 
         fn maybeFinishClose(self: *Self) void {
             if (self.state != .closing) return;
             if (self.reading or self.writing or self.connecting) return;
             self.state = .closed;
+            self.dropFile();
             // The fd is closed from the deferred callback, not here: this
             // may run inside a completion's callback, and libxev's epoll
             // backend deregisters that fd after the callback returns.
@@ -297,6 +396,38 @@ pub fn Socket(comptime Owner: type) type {
             Owner.onSocketClosed(self.owner);
         }
     };
+}
+
+const SendfileResult = struct {
+    sent: u64,
+    status: enum { ok, again, unsupported, failed },
+};
+
+/// One non-blocking sendfile of up to `len` bytes of `file` at `offset`.
+fn sendfile(sock: std.posix.socket_t, file: std.posix.fd_t, offset: u64, len: u64) SendfileResult {
+    if (comptime builtin.os.tag == .linux) {
+        var off: i64 = @intCast(offset);
+        const rc = std.os.linux.sendfile(sock, file, &off, @intCast(@min(len, 0x7fff_f000)));
+        return switch (std.os.linux.errno(rc)) {
+            .SUCCESS => .{ .sent = rc, .status = .ok },
+            .AGAIN, .INTR => .{ .sent = 0, .status = .again },
+            .INVAL, .NOSYS, .OPNOTSUPP => .{ .sent = 0, .status = .unsupported },
+            else => .{ .sent = 0, .status = .failed },
+        };
+    } else if (comptime builtin.os.tag.isDarwin()) {
+        // Darwin reports what went out through `n`, also on EAGAIN.
+        var n: std.c.off_t = @intCast(@min(len, std.math.maxInt(i32)));
+        const rc = std.c.sendfile(file, sock, @intCast(offset), &n, null, 0);
+        const sent: u64 = @intCast(n);
+        if (rc == 0) return .{ .sent = sent, .status = .ok };
+        return switch (std.posix.errno(rc)) {
+            .AGAIN, .INTR => .{ .sent = sent, .status = .again },
+            .OPNOTSUPP, .NOTSOCK, .INVAL => .{ .sent = sent, .status = if (sent > 0) .again else .unsupported },
+            else => .{ .sent = sent, .status = .failed },
+        };
+    } else {
+        return .{ .sent = 0, .status = .unsupported };
+    }
 }
 
 /// Accept one queued connection without waiting; null when none is queued.
