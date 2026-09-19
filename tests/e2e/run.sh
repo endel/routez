@@ -57,8 +57,9 @@ for _ in $(seq 1 50); do
     perl -e 'select(undef,undef,undef,0.1)'
 done
 
-# Homebrew curl: TLS 1.3 and HTTP/3 support.
-CURL_BIN=$(command -v /opt/homebrew/opt/curl/bin/curl || command -v curl)
+# A curl with TLS 1.3 and HTTP/3; CI must not skip the HTTP/3 checks.
+CURL_BIN=${CURL_BIN:-$("$HERE/curl-h3.sh")}
+if ! $CURL_BIN --version | grep -q HTTP3 && [ -n "${CI:-}" ]; then echo "no curl with HTTP/3 on CI"; exit 1; fi
 pass=0; fail=0
 check() { if [ "$2" == "$3" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL [$SUITE] $1: got '$2' want '$3'"; fi; }
 json() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)" 2>/dev/null; }

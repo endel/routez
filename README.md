@@ -261,9 +261,11 @@ tests/e2e/run.sh        # end-to-end over HTTP/1.1, TLS, HTTP/3 and WebTransport
 tests/acme/run.sh       # ACME against Pebble in Docker (skipped without Docker)
 ```
 
-The end-to-end script needs python3, bun, node >= 22, a curl built with
-HTTP/3 (Homebrew's), and a built `../quic-zig` (its WebTransport echo server
-is the relay's upstream). The ACME script needs Docker, python3, curl and
+The end-to-end script needs python3, bun, node >= 22, curl, and a built
+`../quic-zig` (its WebTransport echo server is the relay's upstream). The
+HTTP/3 checks need a curl built with HTTP/3: Homebrew's on macOS; on Linux,
+without one, the script fetches a pinned static build (stunnel/static-curl,
+checksummed) into `~/.cache/routez-e2e`. Set `CURL_BIN` to use another. The ACME script needs Docker, python3, curl and
 openssl; it runs Pebble, Let's Encrypt's test CA, with real HTTP-01
 validation against routez.
 
