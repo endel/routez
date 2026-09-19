@@ -9,8 +9,8 @@ pub var active_tcp: std.atomic.Value(u64) = .init(0);
 /// Published by each worker on its tick, from its QUIC servers' own counts.
 pub var accepted_quic: std.atomic.Value(u64) = .init(0);
 pub var active_quic: std.atomic.Value(u64) = .init(0);
-pub var requests: std.atomic.Value(u64) = .init(0);
-pub var requests_h3: std.atomic.Value(u64) = .init(0);
+pub var requests: Counter = .{};
+pub var requests_h3: Counter = .{};
 pub var refused_per_ip: std.atomic.Value(u64) = .init(0);
 /// Connections to a `proxy_protocol` listener from an untrusted peer, or
 /// whose header was malformed or late.
@@ -20,19 +20,48 @@ pub var requests_limited: std.atomic.Value(u64) = .init(0);
 /// QUIC datagrams handed to the worker owning their connection.
 pub var quic_steered: std.atomic.Value(u64) = .init(0);
 /// Finished responses by protocol (HTTP/1.x, HTTP/3) and status class.
-pub var responses: [2][5]std.atomic.Value(u64) = @splat(@splat(.init(0)));
+pub var responses: [2][5]Counter = @splat(@splat(.{}));
 /// Request and response body bytes, the latter as sent (compressed).
-pub var request_bytes: std.atomic.Value(u64) = .init(0);
-pub var response_bytes: std.atomic.Value(u64) = .init(0);
+pub var request_bytes: Counter = .{};
+pub var response_bytes: Counter = .{};
 pub var reloads: std.atomic.Value(u64) = .init(0);
 pub var reload_failures: std.atomic.Value(u64) = .init(0);
 pub var workers: std.atomic.Value(u64) = .init(0);
+
+/// A counter bumped on every request: one cache line per thread slot, so
+/// workers don't contend on it; reads sum the slots.
+pub const Counter = struct {
+    slots: [shard_count]Slot = @splat(.{}),
+
+    const Slot = struct { v: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0) };
+
+    pub fn fetchAdd(self: *Counter, n: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        return self.slots[shardIndex()].v.fetchAdd(n, order);
+    }
+
+    pub fn load(self: *const Counter, comptime order: std.builtin.AtomicOrder) u64 {
+        var sum: u64 = 0;
+        for (&self.slots) |*s| sum +%= s.v.load(order);
+        return sum;
+    }
+};
+
+const shard_count = 16;
+var next_shard: std.atomic.Value(usize) = .init(0);
+threadlocal var shard_index: ?usize = null;
+
+fn shardIndex() usize {
+    if (shard_index) |i| return i;
+    const i = next_shard.fetchAdd(1, .monotonic) % shard_count;
+    shard_index = i;
+    return i;
+}
 
 /// Set by main.
 pub var version: []const u8 = "unknown";
 pub var start_time_s: i64 = 0;
 
-pub fn inc(v: *std.atomic.Value(u64)) void {
+pub fn inc(v: anytype) void {
     _ = v.fetchAdd(1, .monotonic);
 }
 
@@ -40,7 +69,7 @@ pub fn dec(v: *std.atomic.Value(u64)) void {
     _ = v.fetchSub(1, .monotonic);
 }
 
-pub fn add(v: *std.atomic.Value(u64), n: u64) void {
+pub fn add(v: anytype, n: u64) void {
     if (n != 0) _ = v.fetchAdd(n, .monotonic);
 }
 
@@ -115,7 +144,7 @@ pub const UpstreamView = struct {
 /// The Prometheus text exposition format, version 0.0.4.
 pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?*const client_limits.Table) std.Io.Writer.Error!void {
     const load = struct {
-        fn f(v: *const std.atomic.Value(u64)) u64 {
+        fn f(v: anytype) u64 {
             return v.load(.monotonic);
         }
     }.f;
