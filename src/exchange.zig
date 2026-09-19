@@ -76,7 +76,14 @@ pub const Downstream = struct {
         /// Queue a range of a file as body bytes. Takes the range's hold
         /// whatever the answer.
         sendFile: ?*const fn (*anyopaque, socket.FileOut) FileSend = null,
+        /// Hold output back (true) until released (false), so pieces
+        /// produced in one callback leave in one send.
+        cork: ?*const fn (*anyopaque, bool) void = null,
     };
+
+    pub fn setCork(self: Downstream, on: bool) void {
+        if (self.vtable.cork) |f| f(self.ptr, on);
+    }
 };
 
 pub const FileSend = enum {

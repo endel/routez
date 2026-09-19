@@ -367,6 +367,11 @@ pub const Proxy = struct {
     // ---- response side ----
 
     pub fn onUpstreamData(self: *Proxy, data: []const u8) void {
+        // Head and body out in one send. The downstream outlives this call
+        // (its frees are deferred), the exchange may not.
+        const down = self.ex.down;
+        if (down) |d| d.setCork(true);
+        defer if (down) |d| d.setCork(false);
         switch (self.phase) {
             .connecting, .done => return,
             .tunnel => {

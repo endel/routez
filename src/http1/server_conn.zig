@@ -343,6 +343,9 @@ pub const Conn = struct {
             return;
         }
         self.processing = true;
+        // Responses produced in this pass leave in one send.
+        self.sock.cork();
+        defer self.sock.uncork();
         while (true) {
             self.again = false;
             const progressed = self.step();
@@ -600,7 +603,13 @@ pub const Conn = struct {
         .startTunnel = dsStartTunnel,
         .canSendFile = dsCanSendFile,
         .sendFile = dsSendFile,
+        .cork = dsCork,
     };
+
+    fn dsCork(ptr: *anyopaque, on: bool) void {
+        const self = cast(ptr);
+        if (on) self.sock.cork() else self.sock.uncork();
+    }
 
     fn cast(ptr: *anyopaque) *Conn {
         return @ptrCast(@alignCast(ptr));

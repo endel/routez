@@ -56,6 +56,8 @@ pub fn Socket(comptime Owner: type) type {
 
         reading: bool = false,
         read_paused: bool = false,
+        /// Writes only queue until `uncork`, which sends them in one go.
+        corked: bool = false,
         writing: bool = false,
         connecting: bool = false,
 
@@ -184,7 +186,7 @@ pub fn Socket(comptime Owner: type) type {
             // Nothing queued: try the kernel directly. A write completion
             // costs an epoll registration round trip (and on epoll a dup of
             // the fd), which most writes to a healthy socket don't need.
-            if (!self.writing and !self.connecting and self.buffered() == 0) {
+            if (!self.corked and !self.writing and !self.connecting and self.buffered() == 0) {
                 const rc = std.c.send(self.tcp.fd, data.ptr, data.len, send_flags);
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
@@ -199,6 +201,42 @@ pub fn Socket(comptime Owner: type) type {
                 return;
             };
             self.kickWrite();
+        }
+
+        /// Hold writes back until `uncork`, so a response's pieces leave in
+        /// one send (one segment for the peer to read).
+        pub fn cork(self: *Self) void {
+            self.corked = true;
+        }
+
+        pub fn uncork(self: *Self) void {
+            if (!self.corked) return;
+            self.corked = false;
+            if (self.state != .open and self.state != .flushing) return;
+            const sent_before = self.sent_total;
+            // A producer that stopped at high_water waits for onSocketWritable,
+            // which only a write completion would otherwise give it.
+            const was_full = self.buffered() >= low_water;
+            if (!self.writing and !self.connecting and self.active_off >= self.active.items.len) {
+                // What goes ahead of a queued file, or everything.
+                const n = if (self.file != null) self.file_before else self.pending.items.len;
+                if (n > 0) {
+                    const rc = std.c.send(self.tcp.fd, self.pending.items.ptr, n, send_flags);
+                    if (rc > 0) {
+                        const sent: usize = @intCast(rc);
+                        self.sent_total += sent;
+                        const rest = self.pending.items.len - sent;
+                        std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[sent..]);
+                        self.pending.items.len = rest;
+                        if (self.file != null) self.file_before -= sent;
+                    }
+                }
+            }
+            // kickWrite may sendfile directly too.
+            self.kickWrite();
+            if (self.sent_total == sent_before) return;
+            if (@hasDecl(Owner, "onSocketSent") and self.state != .closing and self.state != .closed) Owner.onSocketSent(self.owner);
+            if (was_full and self.state == .open and self.buffered() < low_water) Owner.onSocketWritable(self.owner);
         }
 
         /// Reserve `n` bytes at the end of the output queue to fill in place.
@@ -249,7 +287,7 @@ pub fn Socket(comptime Owner: type) type {
         }
 
         fn kickWrite(self: *Self) void {
-            if (self.writing or self.connecting) return;
+            if (self.writing or self.connecting or self.corked) return;
             if (self.state == .closing or self.state == .closed or self.state == .lingering) return;
             while (self.active_off >= self.active.items.len) {
                 self.active.clearRetainingCapacity();
