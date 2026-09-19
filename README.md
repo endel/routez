@@ -632,8 +632,9 @@ HTTP/3 checks need a curl built with HTTP/3: Homebrew's on macOS; on Linux,
 without one, the script fetches a pinned static build (stunnel/static-curl,
 checksummed) into `~/.cache/routez-e2e`. Set `CURL_BIN` to use another.
 It builds routez with `-Dfault-injection`, a test-only option under which
-files named `*slow-read*` read as if from a stalled disk. The ACME script needs Docker, python3, curl and
-openssl; it runs Pebble, Let's Encrypt's test CA, with real HTTP-01
+files named `*slow-read*` read as if from a stalled disk, and requests naming
+`small-sndbuf` get a 16 KiB socket send buffer. The ACME script needs
+Docker, python3, curl and openssl; it runs Pebble, Let's Encrypt's test CA, with real HTTP-01
 validation against routez.
 
 ## Performance

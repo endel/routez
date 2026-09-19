@@ -16,6 +16,8 @@ echo '<h1>hello</h1>' > "$WORK/www/index.html"
 echo 'sub file' > "$WORK/www/sub/a.txt"
 head -c 3000000 /dev/urandom > "$WORK/www/big.bin"
 head -c 40000 /dev/urandom > "$WORK/www/slow-read.bin"
+# -Dfault-injection: requests naming small-sndbuf get a 16 KiB send buffer.
+head -c 700000 /dev/urandom > "$WORK/www/small-sndbuf-700k.bin"
 mkdir -p "$WORK/gz"
 for i in $(seq 1 2000); do echo "line $i: the quick brown fox jumps over the lazy dog"; done > "$WORK/gz/text.txt"
 mkdir -p "$WORK/spa/assets" "$WORK/spa/docs"
@@ -221,6 +223,11 @@ SUITE=sendfile check pipelined-files "$(python3 "$HERE/pipe_files.py" "$WORK/www
 SUITE=sendfile check slow-client-file "$($CURL_BIN -s --limit-rate 4M http://127.0.0.1:18080/big.bin | sha)" "$(sha < "$WORK/www/big.bin")"
 $CURL_BIN -s --limit-rate 200k --max-time 0.5 -o /dev/null http://127.0.0.1:18080/big.bin
 SUITE=sendfile check client-gone-mid-file "$($CURL_BIN -s http://127.0.0.1:18080/big.bin | sha)" "$(sha < "$WORK/www/big.bin")"
+# A client that stops reading holds up no one else on the worker.
+python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 18080)); s.sendall(b'GET /small-sndbuf-700k.bin HTTP/1.1\r\nHost: a\r\n\r\n'); time.sleep(3)" & STALLED=$!
+perl -e 'select(undef,undef,undef,0.3)'
+SUITE=sendfile check stalled-reader "$($CURL_BIN -s --max-time 5 -o /dev/null -w '%{http_code} %{time_total}' http://127.0.0.1:18080/sub/a.txt | LC_ALL=C awk '{print $1, ($2 < 1 ? "prompt" : "took " $2)}')" "200 prompt"
+kill $STALLED; wait $STALLED 2>/dev/null
 # Open-file cache: a change on disk shows within valid_ms (1 s by default).
 # The body if 200, else the status.
 ofc_get() {

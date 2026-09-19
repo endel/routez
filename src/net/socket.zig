@@ -438,10 +438,19 @@ pub fn acceptNow(listen_fd: std.posix.socket_t) ?std.posix.socket_t {
     }
     const fd = std.c.accept(listen_fd, null, null);
     if (fd < 0) return null;
-    const nonblock: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
-    _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(nonblock)));
+    setNonBlocking(fd);
     _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
     return fd;
+}
+
+pub fn setNonBlocking(fd: std.posix.socket_t) void {
+    const nonblock: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
+    _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(nonblock)));
+}
+
+/// Caps the kernel's send buffer (and stops it growing on its own).
+pub fn setSendBuffer(fd: std.posix.socket_t, bytes: c_int) void {
+    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&bytes), @sizeOf(c_int));
 }
 
 pub fn setNoDelay(fd: std.posix.socket_t) void {

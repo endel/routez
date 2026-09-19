@@ -12,6 +12,7 @@ const router = @import("../router.zig");
 const tls_transport = @import("../net/tls.zig");
 const proxy_protocol = @import("../net/proxy_protocol.zig");
 const stats = @import("../stats.zig");
+const build_options = @import("build_options");
 const worker_mod = @import("../worker.zig");
 const Worker = worker_mod.Worker;
 const Listener = worker_mod.Listener;
@@ -351,6 +352,10 @@ pub const Conn = struct {
         const head = parsed.head;
 
         self.requests += 1;
+        // Test hook: a small send buffer keeps output queued on our side.
+        if (build_options.fault_injection and std.mem.indexOf(u8, head.target, "small-sndbuf") != null) {
+            socket.setSendBuffer(self.sock.fd(), 16 * 1024);
+        }
         self.req_version = head.version;
         self.req_is_head = std.mem.eql(u8, head.method, "HEAD");
         self.keep_alive = head.keep_alive and !self.worker.stopping;

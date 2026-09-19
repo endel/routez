@@ -829,6 +829,9 @@ pub const Listener = struct {
             return;
         }
         stats.inc(&stats.accepted);
+        // libxev's epoll accept leaves the socket blocking, and a direct
+        // send or sendfile into a full socket would stall the whole loop.
+        if (xev.backend == .epoll) socket.setNonBlocking(tcp.fd);
         var ip_key: ?[16]u8 = null;
         if (self.proxy_protocol) {
             // Counted per IP once the header names the client.
