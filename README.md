@@ -654,22 +654,22 @@ against one server at a time. The table and every run land in
 `bench/results/<timestamp>/`. Knobs: `WORKERS` (3), `CONNS` (256),
 `DURATION` (10 s), `ROUNDS` (3), `WORKLOADS` (a subset of rows).
 
-Docker Desktop on an Apple M-series Mac (10 cores), 18 Sep 2026: nginx 1.30.5
-and HAProxy 3.2.23 on OpenSSL 3.5, 3 workers each, with the server, wrk and
-upstream on separate cores. Median of 3 × 10 s runs, keep-alive, in
-requests per second. Relative numbers only; a VM is not a benchmark machine.
+Docker Desktop on an Apple M-series Mac (10 cores), 19 Sep 2026: routez
+58ed54b, nginx 1.30.5 and HAProxy 3.2.23 on OpenSSL 3.5, 3 workers each, with
+the server, wrk and upstream on separate cores. Median of 3 × 10 s runs,
+keep-alive, in requests per second. Relative numbers only; a VM is not a
+benchmark machine.
 
 | Workload | nginx | HAProxy | routez |
 |---|---|---|---|
-| Fixed response (`return`) | 597k | 402k | 495k |
-| 10 KB static file | 251k | — | 240k |
-| Reverse proxy to a keep-alive upstream | 218k | 180k | 225k |
-| TLS: fixed response | 368k | 275k | 385k |
-| TLS: 10 KB static file | 131k | — | 163k |
-| TLS: new connection per request | 12k | 10k | 16k |
+| Fixed response (`return`) | 579k | 400k | 684k |
+| 10 KB static file | 236k | — | 334k |
+| Reverse proxy to a keep-alive upstream | 207k | 167k | 239k |
+| TLS: fixed response | 347k | 255k | 507k |
+| TLS: 10 KB static file | 125k | — | 189k |
+| TLS: new connection per request | 11k | 8.3k | 14k |
 
-- HAProxy isn't a file server. The static rows predate routez's
-  open-file cache and `sendfile`, which nginx has on.
+- HAProxy isn't a file server.
 - TLS is 1.3 with AES-128-GCM and X25519 everywhere, routez's own choice;
   nginx and HAProxy are pinned to it.
 - The last row measures resumed handshakes: wrk reuses the session on each
