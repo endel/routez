@@ -150,9 +150,13 @@ pub const Routes = struct {
 
     pub fn build(arena: std.mem.Allocator, cfg: *const config.Config) !Routes {
         var r: Routes = .{};
-        for (cfg.servers) |*srv| for (srv.locations) |*loc| {
-            if (loc.regex) |pattern| try r.add(arena, loc, pattern, loc.case_insensitive);
-        };
+        for (cfg.servers) |*srv| {
+            for (srv.rewrite) |*rw| try r.add(arena, rw, rw.regex, rw.case_insensitive);
+            for (srv.locations) |*loc| {
+                if (loc.regex) |pattern| try r.add(arena, loc, pattern, loc.case_insensitive);
+                for (loc.rewrite) |*rw| try r.add(arena, rw, rw.regex, rw.case_insensitive);
+            }
+        }
         return r;
     }
 

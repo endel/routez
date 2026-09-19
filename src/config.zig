@@ -178,7 +178,49 @@ pub const Server = struct {
     /// IP rules for every location that has none of its own; see
     /// `Location.access`.
     access: []const AccessRule = &.{},
+    /// Applied to every request before a location is chosen. `last` and
+    /// `break` both end the server's rules here.
+    rewrite: []const Rewrite = &.{},
     locations: []const Location,
+};
+
+/// nginx's `rewrite`: when `regex` finds a match in the path, the request
+/// URI becomes `replacement`. Rules run in order.
+pub const Rewrite = struct {
+    regex: []const u8,
+    /// The new URI, with variables and the groups `$1`..`$9` (percent-encoded
+    /// like `$uri`). Starting with `http://`, `https://` or `$scheme`, it
+    /// is a redirect. The request's query string is appended unless the
+    /// replacement ends with `?` (which is dropped); after a replacement
+    /// that has a query of its own, it follows with `&`.
+    replacement: []const u8,
+    flag: Flag = .none,
+    /// ASCII letters match either case.
+    case_insensitive: bool = false,
+
+    pub const Flag = enum {
+        /// On to the next rule; if the URI changed, locations are matched
+        /// again after the last one.
+        none,
+        /// Stop, and match the locations again with the new URI.
+        last,
+        /// Stop, and carry on in this location with the new URI.
+        @"break",
+        /// Answer 302 with the new URI.
+        redirect,
+        /// Answer 301 with the new URI.
+        permanent,
+    };
+
+    /// The replacement is sent back to the client rather than served.
+    pub fn redirects(self: *const Rewrite) bool {
+        return self.flag == .redirect or self.flag == .permanent or isAbsolute(self.replacement);
+    }
+
+    fn isAbsolute(r: []const u8) bool {
+        return std.mem.startsWith(u8, r, "http://") or std.mem.startsWith(u8, r, "https://") or
+            std.mem.startsWith(u8, r, "$scheme") or std.mem.startsWith(u8, r, "${scheme}");
+    }
 };
 
 /// A location matches the request path (decoded, dot segments resolved)
@@ -227,6 +269,9 @@ pub const Location = struct {
 
     /// Answer with a fixed status and body, or redirect.
     @"return": ?Return = null,
+    /// Rules applied once the location is chosen, before its handler; see
+    /// `Rewrite`.
+    rewrite: []const Rewrite = &.{},
 
     /// Request headers set on proxied requests, replacing any the client
     /// sent under the same name. An empty value removes the header; `host`
@@ -385,8 +430,11 @@ pub fn readSource(io: std.Io, arena: std.mem.Allocator, path: []const u8) std.Io
 }
 
 pub fn parse(arena: std.mem.Allocator, source: [:0]const u8, name: []const u8) error{ InvalidConfig, OutOfMemory }!Config {
+    // std.zon generates code per field; Location has more than its default allows.
+    @setEvalBranchQuota(4000);
+    // All in `arena`; freeing on error would also touch strings still in `source`.
     var diag: std.zon.parse.Diagnostics = .{};
-    const cfg = std.zon.parse.fromSliceAlloc(Config, arena, source, &diag, .{}) catch |err| switch (err) {
+    const cfg = std.zon.parse.fromSliceAlloc(Config, arena, source, &diag, .{ .free_on_error = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
             std.log.err("{s}: {f}", .{ name, diag });
@@ -455,8 +503,10 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
         }
         if (srv.tls) |t| try checkTls(cfg, srv, t);
         try checkAccess(srv.access, "server");
+        for (srv.rewrite) |rw| try checkRewrite(alloc, "server", rw);
         for (srv.locations) |*loc| {
             try checkMatch(alloc, loc);
+            for (loc.rewrite) |rw| try checkRewrite(alloc, loc.pattern(), rw);
             var actions: u8 = 0;
             if (loc.root != null) actions += 1;
             if (loc.proxy_pass != null) actions += 1;
@@ -501,6 +551,14 @@ pub fn checkRegex(alloc: std.mem.Allocator, what: []const u8, pattern: []const u
         error.InvalidPattern => return fail("{s} regex '{s}': {s} (at offset {d})", .{ what, pattern, d.message, d.offset }),
     };
     re.deinit(alloc);
+}
+
+fn checkRewrite(alloc: std.mem.Allocator, where: []const u8, rw: Rewrite) error{ InvalidConfig, OutOfMemory }!void {
+    try checkRegex(alloc, "rewrite", rw.regex, rw.case_insensitive);
+    const r = rw.replacement;
+    if (r.len == 0 or (r[0] != '/' and r[0] != '$' and !Rewrite.isAbsolute(r)))
+        return fail("{s}: rewrite replacement '{s}' must start with '/', http://, https:// or a variable", .{ where, r });
+    try checkUri(r, "rewrite replacement");
 }
 
 fn checkProxyPass(cfg: *const Config, loc: *const Location, text: []const u8) error{InvalidConfig}!void {
@@ -956,4 +1014,37 @@ test "location match types and proxy_pass URIs" {
     try std.testing.expectEqualDeep(ProxyPass{ .target = "backend", .uri = null }, splitProxyPass("backend"));
     try std.testing.expectEqualDeep(ProxyPass{ .target = "http://h:1", .uri = "/" }, splitProxyPass("http://h:1/"));
     try std.testing.expectEqualDeep(ProxyPass{ .target = "[::1]:80", .uri = "/x/$1" }, splitProxyPass("[::1]:80/x/$1"));
+}
+
+test "rewrite rules" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }},
+        \\    .rewrite = .{.{ .regex = "^/old/(.*)$", .replacement = "/new/$1", .flag = .last }},
+        \\    .locations = .{.{ .prefix = "/", .root = "x", .rewrite = .{
+        \\        .{ .regex = "^/a$", .replacement = "/b?x=1", .flag = .@"break" },
+        \\        .{ .regex = "^/c$", .replacement = "https://$host/c?", .case_insensitive = true },
+        \\        .{ .regex = "^/d$", .replacement = "/e", .flag = .permanent },
+        \\        .{ .regex = "^/f$", .replacement = "$scheme://h/f" },
+        \\    } }},
+        \\}} }
+    , "test");
+    const rw = cfg.servers[0].locations[0].rewrite;
+    try std.testing.expectEqual(Rewrite.Flag.last, cfg.servers[0].rewrite[0].flag);
+    try std.testing.expect(!rw[0].redirects());
+    try std.testing.expect(rw[1].redirects() and rw[2].redirects() and rw[3].redirects());
+
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .rewrite = .{.{ .regex = "^/(a)\\1", .replacement = "/b" }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .rewrite = .{.{ .regex = "a", .replacement = "b" }} }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .rewrite = .{.{ .regex = "a", .replacement = "/$bad" }} }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .rewrite = .{.{ .regex = "a", .replacement = "/a b" }} }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
 }

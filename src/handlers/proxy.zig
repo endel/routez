@@ -155,7 +155,8 @@ pub const Proxy = struct {
     }
 
     /// The request target sent upstream: what `proxy_pass`'s URI or
-    /// `strip_prefix` make of the path, else the client's.
+    /// `strip_prefix` make of the path, else the client's. After a rewrite,
+    /// the new path in full, as nginx sends it.
     fn appendTarget(self: *Proxy, head: *std.ArrayList(u8)) !void {
         const ex = self.ex;
         const a = self.alloc();
@@ -168,13 +169,17 @@ pub const Proxy = struct {
                 if (std.mem.indexOfAny(u8, target, " \t") != null) return error.BadTarget;
                 return head.appendSlice(a, target);
             }
-            try head.appendSlice(a, uri);
-            try router.encodePath(path[matched.?.len..], head, a);
-        } else if (self.loc.strip_prefix) {
+            if (ex.rewritten) {
+                try router.encodePath(path, head, a);
+            } else {
+                try head.appendSlice(a, uri);
+                try router.encodePath(path[matched.?.len..], head, a);
+            }
+        } else if (self.loc.strip_prefix and std.mem.startsWith(u8, path, matched.?)) {
             const rest = path[matched.?.len..];
             if (rest.len == 0 or rest[0] != '/') try head.append(a, '/');
             try router.encodePath(rest, head, a);
-        } else if (ex.req.target.len > 0 and ex.req.target[0] == '/') {
+        } else if (!ex.rewritten and ex.req.target.len > 0 and ex.req.target[0] == '/') {
             return head.appendSlice(a, ex.req.target);
         } else {
             try router.encodePath(path, head, a);

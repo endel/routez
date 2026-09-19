@@ -17,11 +17,16 @@ const static = @import("handlers/static.zig");
 const proxy = @import("handlers/proxy.zig");
 const Header = common.Header;
 const stats = @import("stats.zig");
+
+/// URI changes a request may go through (rewrites that match the
+/// locations again) before it is taken for a loop: nginx's limit.
+const max_uri_changes = 10;
 const gzip = @import("gzip.zig");
 const vars = @import("http/vars.zig");
 const access_log = @import("access_log.zig");
 const timers = @import("timers.zig");
 const logs = @import("logs.zig");
+const log = std.log.scoped(.rewrite);
 const access = @import("access.zig");
 const guard = @import("guard.zig");
 const tls = @import("net/tls.zig");
@@ -177,6 +182,9 @@ pub const Exchange = struct {
     pending_user: []const u8 = "",
     /// Groups of the last regex that matched, `$1`..`$9`.
     captures: regex.Captures = .{},
+    /// A rewrite changed `req.path` or `req.query`; `req.target` is still
+    /// what the client sent.
+    rewritten: bool = false,
 
     pub fn create(worker: *Worker, down: Downstream, init: RequestInit) !*Exchange {
         const ex = try worker.alloc.create(Exchange);
@@ -252,7 +260,7 @@ pub const Exchange = struct {
                 }
             }
         }
-        const loc = router.matchLocation(self.server, self.req.path, self.matcher(), &self.captures) orelse return self.sendError(404);
+        const loc = self.route() orelse return;
         self.add_values = self.expandAll(loc.add_headers) catch return self.sendError(400);
         self.location = loc;
         if (loc.limit_req) |lim| {
@@ -277,6 +285,110 @@ pub const Exchange = struct {
             },
         };
         self.dispatch(loc);
+    }
+
+    /// The server's rewrites, then the location and its rewrites, matched
+    /// again after each URI change. Null once a response has been sent.
+    fn route(self: *Exchange) ?*const config.Location {
+        switch (self.rewrite(self.server.rewrite, null)) {
+            .responded => return null,
+            .done, .stop, .restart => {},
+        }
+        var changes: u8 = 0;
+        while (true) {
+            const loc = router.matchLocation(self.server, self.req.path, self.matcher(), &self.captures) orelse {
+                self.sendError(404);
+                return null;
+            };
+            switch (self.rewrite(loc.rewrite, loc)) {
+                .responded => return null,
+                .done, .stop => return loc,
+                .restart => {
+                    changes += 1;
+                    if (changes > max_uri_changes) {
+                        log.warn("rewrite cycle: {s} changed {d} times, now {s}", .{ self.req.target, changes, self.req.path });
+                        self.sendError(500);
+                        return null;
+                    }
+                },
+            }
+        }
+    }
+
+    const Rewritten = enum {
+        /// No rule changed the URI.
+        done,
+        /// `break`: stay in this location.
+        stop,
+        /// Match the locations again.
+        restart,
+        responded,
+    };
+
+    fn rewrite(self: *Exchange, rules: []const config.Rewrite, loc: ?*const config.Location) Rewritten {
+        var changed = false;
+        for (rules) |*rule| {
+            var caps: regex.Captures = .{};
+            if (!self.matcher().find(rule, self.req.path, &caps)) continue;
+            self.captures = caps;
+            const uri = self.rewriteUri(rule) catch {
+                self.sendError(500);
+                return .responded;
+            };
+            if (rule.redirects()) {
+                if (loc) |l| {
+                    self.add_values = self.expandAll(l.add_headers) catch null;
+                    self.location = l;
+                }
+                self.sendRedirect(if (rule.flag == .permanent) 301 else 302, uri);
+                return .responded;
+            }
+            if (uri.len == 0 or uri[0] != '/') {
+                self.sendError(500);
+                return .responded;
+            }
+            const buf = self.arena().alloc(u8, uri.len + 2) catch {
+                self.sendError(500);
+                return .responded;
+            };
+            // Groups are percent-encoded, so this decodes what the client sent once.
+            const t = router.normalizeTarget(uri, buf) catch {
+                self.sendError(400);
+                return .responded;
+            };
+            self.req.path = t.path;
+            self.req.query = t.query;
+            self.rewritten = true;
+            changed = true;
+            switch (rule.flag) {
+                .last => return .restart,
+                .@"break" => return .stop,
+                .none, .redirect, .permanent => {},
+            }
+        }
+        return if (changed) .restart else .done;
+    }
+
+    /// `rule`'s replacement, expanded, with the query string handled as
+    /// nginx does.
+    fn rewriteUri(self: *Exchange, rule: *const config.Rewrite) ![]const u8 {
+        var uri = try self.expand(rule.replacement);
+        const keep_args = !std.mem.endsWith(u8, rule.replacement, "?");
+        if (!keep_args) uri = uri[0 .. uri.len - 1];
+        const args = self.req.query orelse return uri;
+        if (!keep_args) return uri;
+        const sep: u8 = if (std.mem.indexOfScalar(u8, uri, '?') != null) '&' else '?';
+        return std.fmt.allocPrint(self.arena(), "{s}{c}{s}", .{ uri, sep, args });
+    }
+
+    fn sendRedirect(self: *Exchange, status: u16, location: []const u8) void {
+        var buf: [256]u8 = undefined;
+        const reason = common.reason(status);
+        const body = std.fmt.bufPrint(&buf, "<html><head><title>{d} {s}</title></head><body><h1>{d} {s}</h1></body></html>\n", .{ status, reason, status, reason }) catch unreachable;
+        const headers = [_]Header{ .{ .name = "location", .value = location }, .{ .name = "content-type", .value = "text/html; charset=utf-8" } };
+        self.respondHead(&.{ .status = status, .headers = &headers, .content_length = body.len });
+        if (!self.req.isHead()) self.respondBody(body);
+        self.respondEnd();
     }
 
     /// Past every check: run the location's handler.

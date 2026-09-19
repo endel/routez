@@ -110,6 +110,17 @@ check capture-proxy-path "$($CURL "$B/m/user/42/a%20b" | json '["path"]')" "/use
 check capture-redirect "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/m/go/x/y?q=1")" "302 https://example.com/x/y?q=1"
 check capture-header "$($CURL -D - -o /dev/null "$B/m/go/x/y" | grep -i '^x-cap' | tr -d '\r')" "x-cap: x/y"
 check proxy-pass-uri "$($CURL "$B/m/pp/a?q=1" | json '["path"]')" "/v2/a?q=1"
+upath() { python3 -c 'import json,sys; d=json.load(sys.stdin); h=d["headers"]; print(d["path"], h.get("x-orig"), h.get("x-uri"))'; }
+check rewrite-break "$($CURL "$B/rwp/break/a%20b?q=1" | upath)" "/new/a%20b?q=1 /rwp/break/a%20b?q=1 /new/a%20b"
+check rewrite-args "$($CURL "$B/rwp/noargs/x?q=1" | json '["path"]') $($CURL "$B/rwp/addargs/x?q=1" | json '["path"]')" "/new/x /new/x?a=1&q=1"
+check rewrite-case-insensitive "$($CURL "$B/rwp/ci/x" | json '["path"]')" "/new/ci-x"
+check rewrite-last "$($CURL "$B/rwp/last/exact") $($CURL "$B/rwp/last/first")" "exact first-regex"
+check rewrite-no-flag "$($CURL "$B/rwp/chain/a" | json '["path"]')" "/rwp/chain/c"
+check rewrite-server "$($CURL "$B/srv-old/exact") $($CURL "$B/srv-old/other")" "exact prefix"
+check rewrite-redirect "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/rwp/redirect/x?q=1")" "302 $B/m/x?q=1"
+check rewrite-permanent "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/rwp/permanent/x?q=1")" "301 https://example.com/x?q=1"
+check rewrite-scheme "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/rwp/abs/x")" "302 ${B%%:*}://example.com/x"
+check rewrite-loop "$($CURL -o /dev/null -w '%{http_code}' "$B/rwp/loop/x")" 500
 [ "$SUITE" == http ] && check smuggling "$(python3 "$HERE/pipe.py" 'POST /api/x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n' | grep -o 'HTTP/1.1 [0-9]*')" "HTTP/1.1 400"
 
 }
@@ -137,6 +148,11 @@ SUITE=features check add-headers "$($CURL_BIN -s -D - -o /dev/null http://127.0.
 SUITE=features check set-header-host "$($CURL_BIN -s http://127.0.0.1:18080/api2/h | json '["headers"]["Host"]')" "upstream.local"
 SUITE=features check set-header-add "$($CURL_BIN -s http://127.0.0.1:18080/api2/h | json '["headers"]["x-custom"]')" "v1"
 SUITE=features check set-header-remove "$($CURL_BIN -s http://127.0.0.1:18080/api2/h | json '.get("headers").get("User-Agent")')" "None"
+cat > "$WORK/badre.zon" <<'EOF2'
+.{ .servers = .{.{ .listen = .{.{ .port = 18490 }}, .rewrite = .{.{ .regex = "^/(a)\\1", .replacement = "/b" }}, .locations = .{.{ .prefix = "/", .@"return" = .{} }} }} }
+EOF2
+"$ROOT/zig-out/bin/routez" -t "$WORK/badre.zon" 2> "$WORK/badre.log"
+SUITE=features check rejects-backreference "$? $(grep -c "backreferences aren't supported" "$WORK/badre.log")" "1 1"
 SUITE=features check rate-limit "$(for i in 1 2 3 4 5 6; do $CURL_BIN -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:18080/limited; done)" "200 200 200 429 429 429 "
 
 # HTTPS upstreams. The health checks (TLS too) have had two rounds by now,

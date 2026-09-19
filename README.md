@@ -35,6 +35,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   ending the search, like `^~`) and regular expressions, case-sensitive or
   not, on a linear-time engine, so no pattern can be turned into a ReDoS.
   Regex groups feed `proxy_pass` URIs, redirects and header values.
+- `rewrite` rules at server and location level with nginx's flags (`last`,
+  `break`, `redirect`, `permanent`) and query-string handling.
 - Per location: gzip for text-like responses, `add_headers`,
   `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
   (per-client token bucket, optionally a named zone shared by locations).
@@ -180,6 +182,46 @@ Backreferences, lookahead and lookbehind, named groups, inline flags such as
 the reason and offset. A pattern is at most 1024 bytes and compiles to at
 most 1000 instructions (so `x{1,1000}` fits only for a small `x`); only the
 first nine groups are captured.
+
+### Rewrites
+
+```zig
+.{
+    .listen = .{.{ .port = 80 }},
+    // Before a location is chosen.
+    .rewrite = .{.{ .regex = "^/blog/(\\d+)/(.*)$", .replacement = "/posts/$2?year=$1", .flag = .last }},
+    .locations = .{
+        .{ .prefix = "/posts/", .proxy_pass = "backend" },
+        .{ .prefix = "/old/", .@"return" = .{ .status = 404 }, .rewrite = .{
+            .{ .regex = "^/old/docs/(.*)$", .replacement = "https://docs.example.com/$1", .flag = .permanent },
+            .{ .regex = "^/old/(.*)$", .replacement = "/$1", .flag = .last },
+        } },
+    },
+}
+```
+
+Each rule whose `regex` finds a match in the path replaces the URI with
+`replacement`, in which the rule's groups are `$1`..`$9` and other
+variables work too. The flag says what happens next, as in nginx:
+
+- none: go on with the next rule; if the URI changed, the locations are
+  matched again after the last one.
+- `.last`: stop, and match the locations again with the new URI.
+- `.@"break"`: stop, and carry on in the current location with the new URI.
+- `.redirect` / `.permanent`: answer 302 / 301 with the new URI as
+  `Location`. A replacement starting with `http://`, `https://` or
+  `$scheme` redirects (302) whatever the flag.
+
+Server rules run once, before a location is chosen (`last` and `break`
+both just end them); a location's run when it is chosen, before access
+checks, limits and its handler. The query string is appended to the new
+URI, after a `&` if the replacement has a query of its own; a replacement
+ending in `?` drops it. `$request_uri` stays what the client sent, while
+`$uri`, `$args` and the path a proxied request or file lookup uses are the
+rewritten ones. A proxied request sends the rewritten path in full,
+ignoring the `proxy_pass` URI unless that has variables, as nginx does. A
+request whose URI changes more than 10 times gets a 500. Rewrites don't
+apply to WebTransport CONNECTs.
 
 ### Client limits
 
@@ -346,7 +388,7 @@ HTTP/3 and WebTransport CONNECTs alike.
 | `$scheme` | `http` or `https` |
 | `$host` | `Host` / `:authority` lowercased, without the port; the first `server_names` entry if absent |
 | `$request_uri` | path and query as the client sent them |
-| `$uri` | normalized path (dot segments resolved), percent-encoded |
+| `$uri` | normalized path (dot segments resolved), percent-encoded; after a rewrite, the new one |
 | `$args`, `$is_args` | query string without the `?`; `?` if there is one |
 | `$remote_addr` | client IP |
 | `$remote_user` | the user `auth_basic` let in |
@@ -354,7 +396,7 @@ HTTP/3 and WebTransport CONNECTs alike.
 | `$ssl_client_s_dn`, `$ssl_client_i_dn` | its subject and issuer, RFC 4514 (`CN=alice,O=Example`) |
 | `$ssl_client_serial` | its serial number, hex |
 | `$ssl_client_fingerprint` | SHA-1 of the certificate, hex |
-| `$1`..`$9`, `$0` | groups of the regex location that matched, and its whole match, percent-encoded |
+| `$1`..`$9`, `$0` | groups of the last regex that matched (a rewrite's or the location's), and its whole match, percent-encoded |
 
 Pass certificate details upstream with `proxy_set_headers`: it replaces
 any header the client sent under the same name (and an empty value removes
@@ -424,7 +466,14 @@ Instead of `cert` and `key`, a server can ask an ACME CA for its certificate:
 zig build test          # unit tests
 tests/e2e/run.sh        # end-to-end over HTTP/1.1, TLS, HTTP/3 and WebTransport
 tests/acme/run.sh       # ACME against Pebble in Docker (skipped without Docker)
+zig build regex-diff && tests/regex/differential.py   # regex engine against Python's re
 ```
+
+The regex differential test compares every group's span on a few thousand
+random patterns and inputs; where Python's `re` differs from PCRE (around
+repeated groups that can match empty) it asks PCRE2's `pcre2test`, if
+installed. `zig build fuzz` runs the fuzz targets, regex compilation and
+matching among them.
 
 The end-to-end script needs python3, bun, node >= 22, curl, and a built
 `../quic-zig` (its WebTransport echo server is the relay's upstream). The
