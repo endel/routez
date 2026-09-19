@@ -262,7 +262,7 @@ pub const Table = struct {
 
 /// The bucket a `limit_req` counts in: its named zone, else its location,
 /// identified by what survives a reload (server name and first listen
-/// address, location prefix), so buckets carry over.
+/// address, location path or pattern), so buckets carry over.
 pub fn zoneId(srv: *const config.Server, loc: *const config.Location) u32 {
     var h = std.hash.Wyhash.init(0);
     const lim = loc.limit_req.?;
@@ -275,7 +275,8 @@ pub fn zoneId(srv: *const config.Server, loc: *const config.Location) u32 {
         h.update("\x00");
         h.update(srv.listen[0].address);
         h.update(std.mem.asBytes(&srv.listen[0].port));
-        h.update(loc.prefix);
+        h.update(@tagName(loc.match()));
+        h.update(loc.pattern());
     }
     return @as(u32, @truncate(h.final())) | 1;
 }

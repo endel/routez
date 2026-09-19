@@ -11,6 +11,7 @@ const access_log = @import("access_log.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
+const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
 const build_options = @import("build_options");
 
@@ -219,6 +220,8 @@ var quic_keys: Worker.Shared.QuicKeys = undefined;
 fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !Worker.Shared {
     const guards = try arena.create(guard.Guards);
     guards.* = try guard.build(arena, cfg);
+    const routes = try arena.create(router.Routes);
+    routes.* = try router.Routes.build(arena, cfg);
     var ticket_key: [16]u8 = undefined;
     quic.sys.randomBytes(&ticket_key);
     var tls_listeners: std.ArrayListUnmanaged(Worker.Shared.TlsListener) = .empty;
@@ -242,7 +245,7 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
             try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
         }
     }
-    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys, .upstream_cas = try loadUpstreamCas(arena, cfg), .guards = guards };
+    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys, .upstream_cas = try loadUpstreamCas(arena, cfg), .guards = guards, .routes = routes };
 }
 
 /// One bundle per `tls_ca` file, and the system store at most once.

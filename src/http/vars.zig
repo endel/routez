@@ -1,8 +1,12 @@
 //! nginx-style `$name` / `${name}` variables in config strings: `return`'s
-//! `location` and the values of `add_headers` and `proxy_set_headers`.
+//! `location`, the values of `add_headers` and `proxy_set_headers`, and
+//! `proxy_pass` URIs. `$1`..`$9` are the groups of the last regex that
+//! matched (a regex location's), `$0` the whole match; percent-encoded like
+//! `$uri`, and empty when unset.
 const std = @import("std");
 const common = @import("common.zig");
 const router = @import("../router.zig");
+const regex = @import("../regex.zig");
 
 pub const Var = enum {
     /// `http` or `https`.
@@ -62,6 +66,7 @@ pub const Request = struct {
     remote_addr: []const u8,
     remote_user: []const u8 = "",
     client_cert: ?*const ClientCert = null,
+    captures: ?*const regex.Captures = null,
 };
 
 pub const TemplateError = error{ UnknownVariable, BadVariable };
@@ -70,8 +75,8 @@ pub fn has(template: []const u8) bool {
     return std.mem.indexOfScalar(u8, template, '$') != null;
 }
 
-/// One piece of a template: literal text or a variable.
-const Part = union(enum) { text: []const u8, variable: Var };
+/// One piece of a template: literal text, a variable or a regex group.
+const Part = union(enum) { text: []const u8, variable: Var, capture: u8 };
 
 /// A template split into literal text and variable names, whatever the
 /// names; other templates (the access log's) accept more of them.
@@ -96,6 +101,10 @@ pub const Scanner = struct {
             const close = std.mem.indexOfScalarPos(u8, s, start, '}') orelse return error.BadVariable;
             end = close;
             self.i = close + 1;
+        } else if (start < s.len and std.ascii.isDigit(s[start])) {
+            // `$1abc` is group 1, then text.
+            end = start + 1;
+            self.i = end;
         } else {
             end = start;
             while (end < s.len and isNameChar(s[end])) end += 1;
@@ -116,7 +125,10 @@ const Iterator = struct {
     fn next(self: *Iterator) TemplateError!?Part {
         return switch (try self.scanner.next() orelse return null) {
             .text => |t| .{ .text = t },
-            .name => |n| .{ .variable = std.meta.stringToEnum(Var, n) orelse return error.UnknownVariable },
+            .name => |n| if (n.len == 1 and std.ascii.isDigit(n[0]))
+                .{ .capture = n[0] - '0' }
+            else
+                .{ .variable = std.meta.stringToEnum(Var, n) orelse return error.UnknownVariable },
         };
     }
 };
@@ -135,6 +147,7 @@ pub fn expand(alloc: std.mem.Allocator, template: []const u8, req: Request) erro
     while (it.next() catch return error.InvalidValue) |part| switch (part) {
         .text => |t| try out.appendSlice(alloc, t),
         .variable => |v| try append(alloc, &out, v, req),
+        .capture => |g| if (req.captures) |c| if (c.get(g)) |text| try router.encodePath(text, &out, alloc),
     };
     if (!common.isFieldValue(out.items)) return error.InvalidValue;
     return out.items;
@@ -191,6 +204,20 @@ test "validate" {
     try testing.expectError(error.BadVariable, validate("cost: $ 5"));
     try testing.expectError(error.BadVariable, validate("${host"));
     try testing.expectError(error.BadVariable, validate("trailing $"));
+    try validate("/img/$1/${2}x$0");
+}
+
+test "regex groups" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const re = try regex.Regex.compile(a, "^/u/([^/]+)/(.*)$", .{}, null);
+    var s = try regex.Scratch.init(a, re.states());
+    var caps: regex.Captures = .{};
+    try testing.expect(re.match("/u/al ice/p?q", &s, &caps));
+    const req: Request = .{ .scheme = "http", .authority = "h", .default_host = "", .target = "/", .path = "/", .query = null, .remote_addr = "::1", .captures = &caps };
+    try testing.expectEqualStrings("/al%20ice/p%3Fq/[]x", try expand(a, "/$1/${2}/[$3]x", req));
+    try testing.expectEqualStrings("/u/al%20ice/p%3Fq1", try expand(a, "$01", req));
 }
 
 test "expand" {

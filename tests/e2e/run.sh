@@ -101,6 +101,15 @@ check slow-client "$($CURL --limit-rate 4M "$B/slow/big" | sha)" "$(sha < "$WORK
 # Default read timeout: the 1 s one on /slow/ is for the 504 check, and a
 # slow reader may still be draining its socket buffer that long.
 check slow-upstream-upload "$($CURL -X POST --data-binary @"$WORK/www/big.bin" "$B/slowup/up")" 3000000
+check match-exact "$($CURL "$B/m/exact") $($CURL "$B/m/exact/")" "exact first-regex"
+check match-prefix "$($CURL "$B/m/other") $($CURL "$B/m/a.PNG")" "prefix prefix"
+check match-no-regex "$($CURL "$B/m/stop/a.png") $($CURL "$B/m/a.png")" "stop png"
+check match-regex-order "$($CURL "$B/m/first")" "first-regex"
+check match-case-insensitive "$($CURL "$B/m/a.JPG") $($CURL "$B/m/b.jpeg")" "jpeg jpeg"
+check capture-proxy-path "$($CURL "$B/m/user/42/a%20b" | json '["path"]')" "/users/a%20b?id=42"
+check capture-redirect "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/m/go/x/y?q=1")" "302 https://example.com/x/y?q=1"
+check capture-header "$($CURL -D - -o /dev/null "$B/m/go/x/y" | grep -i '^x-cap' | tr -d '\r')" "x-cap: x/y"
+check proxy-pass-uri "$($CURL "$B/m/pp/a?q=1" | json '["path"]')" "/v2/a?q=1"
 [ "$SUITE" == http ] && check smuggling "$(python3 "$HERE/pipe.py" 'POST /api/x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n' | grep -o 'HTTP/1.1 [0-9]*')" "HTTP/1.1 400"
 
 }

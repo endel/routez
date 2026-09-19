@@ -19,6 +19,7 @@ const std = @import("std");
 const vars = @import("http/vars.zig");
 const access_log = @import("access_log.zig");
 const access = @import("access.zig");
+const regex = @import("regex.zig");
 
 pub const Config = struct {
     /// Worker threads, each with its own event loop and SO_REUSEPORT sockets.
@@ -180,9 +181,25 @@ pub const Server = struct {
     locations: []const Location,
 };
 
+/// A location matches the request path (decoded, dot segments resolved)
+/// by exactly one of `prefix`, `exact` or `regex`, chosen as nginx does:
+/// an `exact` match wins; else the longest `prefix` is remembered and wins
+/// at once if it has `no_regex`; else the first `regex`, in config order,
+/// that matches; else the remembered prefix.
 pub const Location = struct {
-    /// Longest matching prefix wins.
-    prefix: []const u8,
+    /// Matches paths starting with this.
+    prefix: ?[]const u8 = null,
+    /// With `prefix`: when this is the longest matching prefix, regexes
+    /// aren't tried (nginx `^~`).
+    no_regex: bool = false,
+    /// Matches this path only (nginx `=`).
+    exact: ?[]const u8 = null,
+    /// Matches paths this regular expression finds a match in (nginx `~`);
+    /// its groups are `$1`..`$9` for the location's variables. Syntax in
+    /// `regex.zig`.
+    regex: ?[]const u8 = null,
+    /// With `regex`: ASCII letters match either case (nginx `~*`).
+    case_insensitive: bool = false,
 
     /// Serve files from this directory.
     root: ?[]const u8 = null,
@@ -195,9 +212,14 @@ pub const Location = struct {
     /// status). `.{ "$uri", "$uri/", "/index.html" }` serves a single-page app.
     try_files: []const []const u8 = &.{},
 
-    /// Name of an upstream, or a literal `host:port`.
+    /// Name of an upstream, or a literal `host:port`, optionally followed by
+    /// a URI (`"backend/v2/"`), as in nginx: the part of the path the
+    /// `prefix` or `exact` matched is replaced by it. A URI with variables
+    /// (`"backend/img/$1"`, for a `regex` location) is the whole path and
+    /// query sent upstream.
     proxy_pass: ?[]const u8 = null,
-    /// Remove `prefix` from the path before proxying (keeps a leading '/').
+    /// Remove `prefix` (or `exact`) from the path before proxying (keeps a
+    /// leading '/').
     strip_prefix: bool = false,
 
     /// Relay WebTransport sessions to this upstream (HTTP/3 only).
@@ -234,6 +256,19 @@ pub const Location = struct {
     /// Serve counters in the Prometheus text format.
     metrics: bool = false,
 
+    pub const Match = enum { prefix, exact, regex };
+
+    pub fn match(self: *const Location) Match {
+        if (self.exact != null) return .exact;
+        if (self.regex != null) return .regex;
+        return .prefix;
+    }
+
+    /// The prefix, path or pattern, for messages.
+    pub fn pattern(self: *const Location) []const u8 {
+        return self.prefix orelse self.exact orelse self.regex orelse "";
+    }
+
     pub const LimitReq = struct {
         /// Sustained requests per second.
         rate: u32,
@@ -255,6 +290,15 @@ pub const Location = struct {
 };
 
 pub const HeaderKV = struct { name: []const u8, value: []const u8 };
+
+pub const ProxyPass = struct { target: []const u8, uri: ?[]const u8 };
+
+/// `proxy_pass` split into its upstream (or `host:port`) and URI.
+pub fn splitProxyPass(text: []const u8) ProxyPass {
+    const from: usize = if (std.mem.startsWith(u8, text, "http://")) "http://".len else 0;
+    const slash = std.mem.indexOfScalarPos(u8, text, from, '/') orelse return .{ .target = text, .uri = null };
+    return .{ .target = text[0..slash], .uri = text[slash..] };
+}
 
 pub const Upstream = struct {
     name: []const u8,
@@ -349,7 +393,7 @@ pub fn parse(arena: std.mem.Allocator, source: [:0]const u8, name: []const u8) e
             return error.InvalidConfig;
         },
     };
-    try validate(&cfg);
+    try validate(arena, &cfg);
     return cfg;
 }
 
@@ -359,7 +403,8 @@ fn fail(comptime fmt: []const u8, args: anytype) error{InvalidConfig} {
     return error.InvalidConfig;
 }
 
-pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
+/// `alloc` holds regexes compiled to check them, freed before returning.
+pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConfig, OutOfMemory }!void {
     if (cfg.workers == 0) return fail("workers must be at least 1", .{});
     // 0 would disable the idle timeout: dead peers would never be dropped.
     if (cfg.limits.quic_idle_timeout_ms == 0) return fail("limits.quic_idle_timeout_ms must be at least 1", .{});
@@ -410,7 +455,8 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
         }
         if (srv.tls) |t| try checkTls(cfg, srv, t);
         try checkAccess(srv.access, "server");
-        for (srv.locations) |loc| {
+        for (srv.locations) |*loc| {
+            try checkMatch(alloc, loc);
             var actions: u8 = 0;
             if (loc.root != null) actions += 1;
             if (loc.proxy_pass != null) actions += 1;
@@ -418,24 +464,62 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
             if (loc.@"return" != null) actions += 1;
             if (loc.stub_status) actions += 1;
             if (loc.metrics) actions += 1;
-            if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, return, stub_status, metrics", .{loc.prefix});
-            if (loc.prefix.len == 0 or loc.prefix[0] != '/') return fail("location prefix '{s}' must start with '/'", .{loc.prefix});
-            if (loc.proxy_pass) |p| try checkTarget(cfg, p);
+            if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, return, stub_status, metrics", .{loc.pattern()});
+            if (loc.proxy_pass) |p| try checkProxyPass(cfg, loc, p);
             for (loc.proxy_set_headers) |h| try checkHeader(h);
             for (loc.add_headers) |h| try checkHeader(h);
-            if (loc.try_files.len > 0) try checkTryFiles(loc);
+            if (loc.try_files.len > 0) try checkTryFiles(loc.*);
             if (loc.@"return") |r| {
-                if (r.status < 100 or r.status > 599) return fail("location '{s}': return status {d} is out of range", .{ loc.prefix, r.status });
+                if (r.status < 100 or r.status > 599) return fail("location '{s}': return status {d} is out of range", .{ loc.pattern(), r.status });
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
             }
-            if (loc.limit_req) |l| try checkLimitReq(cfg, loc.prefix, l);
-            try checkAccess(loc.access, loc.prefix);
-            if (loc.auth_basic) |ab| try checkAuthBasic(loc.prefix, ab);
+            if (loc.limit_req) |l| try checkLimitReq(cfg, loc.pattern(), l);
+            try checkAccess(loc.access, loc.pattern());
+            if (loc.auth_basic) |ab| try checkAuthBasic(loc.pattern(), ab);
             if (loc.require_client_cert and (srv.tls == null or srv.tls.?.client_ca == null))
-                return fail("location '{s}': require_client_cert needs the server's tls.client_ca", .{loc.prefix});
+                return fail("location '{s}': require_client_cert needs the server's tls.client_ca", .{loc.pattern()});
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkMatch(alloc: std.mem.Allocator, loc: *const Location) error{ InvalidConfig, OutOfMemory }!void {
+    const given = @as(u8, @intFromBool(loc.prefix != null)) + @intFromBool(loc.exact != null) + @intFromBool(loc.regex != null);
+    if (given != 1) return fail("location '{s}' needs exactly one of prefix, exact, regex", .{loc.pattern()});
+    if (loc.no_regex and loc.prefix == null) return fail("location '{s}': no_regex applies to prefix locations", .{loc.pattern()});
+    if (loc.case_insensitive and loc.regex == null) return fail("location '{s}': case_insensitive applies to regex locations", .{loc.pattern()});
+    if (loc.strip_prefix and loc.regex != null) return fail("location '{s}': strip_prefix needs a prefix or exact location", .{loc.pattern()});
+    if (loc.regex) |pattern| return checkRegex(alloc, "location", pattern, loc.case_insensitive);
+    const path = loc.pattern();
+    if (path.len == 0 or path[0] != '/') return fail("location '{s}' must start with '/'", .{path});
+}
+
+pub fn checkRegex(alloc: std.mem.Allocator, what: []const u8, pattern: []const u8, case_insensitive: bool) error{ InvalidConfig, OutOfMemory }!void {
+    var d: regex.Diagnostic = .{};
+    const re = regex.Regex.compile(alloc, pattern, .{ .case_insensitive = case_insensitive }, &d) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidPattern => return fail("{s} regex '{s}': {s} (at offset {d})", .{ what, pattern, d.message, d.offset }),
+    };
+    re.deinit(alloc);
+}
+
+fn checkProxyPass(cfg: *const Config, loc: *const Location, text: []const u8) error{InvalidConfig}!void {
+    const pp = splitProxyPass(text);
+    try checkTarget(cfg, pp.target);
+    const uri = pp.uri orelse return;
+    try checkUri(uri, "proxy_pass");
+    if (loc.strip_prefix) return fail("location '{s}': strip_prefix and a proxy_pass URI both rewrite the path; use one", .{loc.pattern()});
+    // What a regex matched has no fixed part to replace.
+    if (loc.regex != null and !vars.has(uri)) return fail("location '{s}': a proxy_pass URI in a regex location needs variables, such as $1", .{loc.pattern()});
+}
+
+/// A path template: no spaces or control characters, known variables.
+fn checkUri(uri: []const u8, what: []const u8) error{InvalidConfig}!void {
+    for (uri) |c| if (c <= 0x20 or c == 0x7f) return fail("{s} '{s}': spaces and control characters must be percent-encoded", .{ what, uri });
+    vars.validate(uri) catch |err| return fail("{s} '{s}': {s}", .{ what, uri, switch (err) {
+        error.UnknownVariable => "unknown variable",
+        error.BadVariable => "bad variable syntax",
+    } });
 }
 
 fn checkAccess(rules: []const AccessRule, where: []const u8) error{InvalidConfig}!void {
@@ -466,18 +550,18 @@ fn checkLimitReq(cfg: *const Config, prefix: []const u8, l: Location.LimitReq) e
 }
 
 fn checkTryFiles(loc: Location) error{InvalidConfig}!void {
-    if (loc.root == null) return fail("location '{s}': try_files needs root", .{loc.prefix});
+    if (loc.root == null) return fail("location '{s}': try_files needs root", .{loc.pattern()});
     for (loc.try_files, 0..) |entry, i| {
         if (tryFilesStatus(entry)) |status| {
-            if (i != loc.try_files.len - 1) return fail("location '{s}': try_files '{s}' must come last", .{ loc.prefix, entry });
-            if (status < 100 or status > 599) return fail("location '{s}': try_files '{s}' is not a status", .{ loc.prefix, entry });
+            if (i != loc.try_files.len - 1) return fail("location '{s}': try_files '{s}' must come last", .{ loc.pattern(), entry });
+            if (status < 100 or status > 599) return fail("location '{s}': try_files '{s}' is not a status", .{ loc.pattern(), entry });
             continue;
         }
-        const rest = if (std.mem.startsWith(u8, entry, "$uri")) entry["$uri".len..] else if (std.mem.startsWith(u8, entry, "/")) entry else return fail("location '{s}': try_files '{s}' must start with '/' or $uri", .{ loc.prefix, entry });
+        const rest = if (std.mem.startsWith(u8, entry, "$uri")) entry["$uri".len..] else if (std.mem.startsWith(u8, entry, "/")) entry else return fail("location '{s}': try_files '{s}' must start with '/' or $uri", .{ loc.pattern(), entry });
         // Appended to an already-normalized path, so these are all it takes
         // to keep the result under root.
         if (std.mem.indexOf(u8, rest, "..") != null or std.mem.indexOfAny(u8, rest, "$\x00") != null)
-            return fail("location '{s}': try_files '{s}' may only use $uri, at the start, and no '..'", .{ loc.prefix, entry });
+            return fail("location '{s}': try_files '{s}' may only use $uri, at the start, and no '..'", .{ loc.pattern(), entry });
     }
 }
 
@@ -820,4 +904,56 @@ test "access rules, auth_basic and client certificates" {
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "location match types and proxy_pass URIs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/", .root = "x" },
+        \\    .{ .exact = "/health", .@"return" = .{ .body = "ok" } },
+        \\    .{ .prefix = "/static/", .no_regex = true, .root = "x" },
+        \\    .{ .regex = "\\.(png|jpe?g)$", .case_insensitive = true, .root = "x" },
+        \\    .{ .regex = "^/u/(\\d+)$", .proxy_pass = "127.0.0.1:9/users/$1?full=1" },
+        \\    .{ .prefix = "/api/", .proxy_pass = "http://127.0.0.1:9/v2/" },
+        \\} }} }
+    , "test");
+    const locs = cfg.servers[0].locations;
+    try std.testing.expectEqual(Location.Match.exact, locs[1].match());
+    try std.testing.expectEqual(Location.Match.regex, locs[3].match());
+    try std.testing.expectEqualStrings("/static/", locs[2].pattern());
+
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .exact = "/", .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .exact = "health", .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .regex = "^/(a)\\1", .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .regex = "^/(?=a)", .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .regex = "/", .no_regex = true, .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .case_insensitive = true, .root = "x" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .regex = "/", .strip_prefix = true, .proxy_pass = "a:1" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .regex = "^/x", .proxy_pass = "a:1/y" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1/a b" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1/$nope" }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .strip_prefix = true, .proxy_pass = "a:1/y/" }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+
+    try std.testing.expectEqualDeep(ProxyPass{ .target = "backend", .uri = null }, splitProxyPass("backend"));
+    try std.testing.expectEqualDeep(ProxyPass{ .target = "http://h:1", .uri = "/" }, splitProxyPass("http://h:1/"));
+    try std.testing.expectEqualDeep(ProxyPass{ .target = "[::1]:80", .uri = "/x/$1" }, splitProxyPass("[::1]:80/x/$1"));
 }

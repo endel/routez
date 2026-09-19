@@ -14,6 +14,7 @@ const common = @import("../http/common.zig");
 const config = @import("../config.zig");
 const parser = @import("../http1/parser.zig");
 const router = @import("../router.zig");
+const vars = @import("../http/vars.zig");
 const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
@@ -97,17 +98,7 @@ pub const Proxy = struct {
 
         try head.appendSlice(a, ex.req.method);
         try head.append(a, ' ');
-        if (self.loc.strip_prefix) {
-            const rest = ex.req.path[self.loc.prefix.len..];
-            if (rest.len == 0 or rest[0] != '/') try head.append(a, '/');
-            try router.encodePath(rest, &head, a);
-            if (ex.req.query) |q| try head.print(a, "?{s}", .{q});
-        } else if (ex.req.target.len > 0 and ex.req.target[0] == '/') {
-            try head.appendSlice(a, ex.req.target);
-        } else {
-            try router.encodePath(ex.req.path, &head, a);
-            if (ex.req.query) |q| try head.print(a, "?{s}", .{q});
-        }
+        try self.appendTarget(&head);
         try head.appendSlice(a, " HTTP/1.1\r\n");
         const set = self.loc.proxy_set_headers;
         const host = if (findSet(set, "host")) |i| ex.setHeaderValue(i) else ex.req.authority;
@@ -161,6 +152,34 @@ pub const Proxy = struct {
         }
         try head.appendSlice(a, "\r\n");
         if (!self.send(head.items)) return error.OutOfMemory;
+    }
+
+    /// The request target sent upstream: what `proxy_pass`'s URI or
+    /// `strip_prefix` make of the path, else the client's.
+    fn appendTarget(self: *Proxy, head: *std.ArrayList(u8)) !void {
+        const ex = self.ex;
+        const a = self.alloc();
+        const path = ex.req.path;
+        // The part of the path the location matched, to replace or strip.
+        const matched: ?[]const u8 = self.loc.prefix orelse self.loc.exact;
+        if (config.splitProxyPass(self.loc.proxy_pass.?).uri) |uri| {
+            if (vars.has(uri)) {
+                const target = try ex.expand(uri);
+                if (std.mem.indexOfAny(u8, target, " \t") != null) return error.BadTarget;
+                return head.appendSlice(a, target);
+            }
+            try head.appendSlice(a, uri);
+            try router.encodePath(path[matched.?.len..], head, a);
+        } else if (self.loc.strip_prefix) {
+            const rest = path[matched.?.len..];
+            if (rest.len == 0 or rest[0] != '/') try head.append(a, '/');
+            try router.encodePath(rest, head, a);
+        } else if (ex.req.target.len > 0 and ex.req.target[0] == '/') {
+            return head.appendSlice(a, ex.req.target);
+        } else {
+            try router.encodePath(path, head, a);
+        }
+        if (ex.req.query) |q| try head.print(a, "?{s}", .{q});
     }
 
     fn findSet(set: []const config.HeaderKV, name: []const u8) ?usize {

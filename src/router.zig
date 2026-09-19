@@ -1,7 +1,8 @@
-//! Request routing: virtual host by Host/:authority, then the location with
-//! the longest matching prefix of the normalized path.
+//! Request routing: virtual host by Host/:authority, then the location for
+//! the normalized path, in nginx's order (see `config.Location`).
 const std = @import("std");
 const config = @import("config.zig");
+const regex = @import("regex.zig");
 
 pub const Target = struct {
     /// Percent-decoded path with dot segments resolved and slashes merged.
@@ -139,12 +140,71 @@ fn wildcardMatch(pattern: []const u8, host: []const u8) bool {
     return std.mem.indexOfScalar(u8, label, '.') == null;
 }
 
-pub fn matchLocation(server: *const config.Server, path: []const u8) ?*const config.Location {
-    var best: ?*const config.Location = null;
-    for (server.locations) |*loc| {
-        if (!std.mem.startsWith(u8, path, loc.prefix)) continue;
-        if (best == null or loc.prefix.len > best.?.prefix.len) best = loc;
+/// The compiled regexes of one config generation, built at load and read
+/// by every worker.
+pub const Routes = struct {
+    /// By the address of the `config.Location` (or rewrite rule) they belong to.
+    regexes: std.AutoHashMapUnmanaged(usize, regex.Regex) = .empty,
+    /// `regex.Scratch` capacity the largest program needs.
+    max_states: usize = 0,
+
+    pub fn build(arena: std.mem.Allocator, cfg: *const config.Config) !Routes {
+        var r: Routes = .{};
+        for (cfg.servers) |*srv| for (srv.locations) |*loc| {
+            if (loc.regex) |pattern| try r.add(arena, loc, pattern, loc.case_insensitive);
+        };
+        return r;
     }
+
+    fn add(self: *Routes, arena: std.mem.Allocator, owner: *const anyopaque, pattern: []const u8, ci: bool) !void {
+        // Checked when the config was parsed.
+        const re = regex.Regex.compile(arena, pattern, .{ .case_insensitive = ci }, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidPattern => return error.InvalidConfig,
+        };
+        try self.regexes.put(arena, @intFromPtr(owner), re);
+        self.max_states = @max(self.max_states, re.states());
+    }
+
+    pub fn get(self: *const Routes, owner: *const anyopaque) *const regex.Regex {
+        return self.regexes.getPtr(@intFromPtr(owner)).?;
+    }
+};
+
+/// What regex matching needs: the generation's regexes and a worker's
+/// scratch space. Prefix and exact matches use neither.
+pub const Matcher = struct {
+    routes: *const Routes,
+    scratch: *regex.Scratch,
+
+    /// Match `path` against `re`, into `caps` (whose input is then `path`).
+    pub fn find(self: Matcher, owner: *const anyopaque, path: []const u8, caps: *regex.Captures) bool {
+        return self.routes.get(owner).match(path, self.scratch, caps);
+    }
+};
+
+/// The location for `path`, in nginx's order: an exact match; else the
+/// longest prefix, if it has `no_regex`; else the first regex that matches,
+/// its groups left in `caps`; else the longest prefix.
+pub fn matchLocation(server: *const config.Server, path: []const u8, m: Matcher, caps: *regex.Captures) ?*const config.Location {
+    var best: ?*const config.Location = null;
+    var best_len: usize = 0;
+    var has_regex = false;
+    for (server.locations) |*loc| {
+        if (loc.exact) |e| {
+            if (std.mem.eql(u8, path, e)) return loc;
+        } else if (loc.prefix) |p| {
+            if (std.mem.startsWith(u8, path, p) and (best == null or p.len > best_len)) {
+                best = loc;
+                best_len = p.len;
+            }
+        } else has_regex = true;
+    }
+    if (best) |b| if (b.no_regex) return b;
+    if (has_regex) for (server.locations) |*loc| {
+        if (loc.regex == null) continue;
+        if (m.find(loc, path, caps)) return loc;
+    };
     return best;
 }
 
@@ -188,15 +248,53 @@ test "virtual hosts" {
     try testing.expectEqual(&a, vh.select(null));
 }
 
+/// The pattern of the location `path` matches, or "none".
+fn expectLocation(srv: *const config.Server, path: []const u8, want: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg: config.Config = .{ .servers = srv[0..1] };
+    const routes = try Routes.build(a, &cfg);
+    var scratch = try regex.Scratch.init(a, routes.max_states);
+    var caps: regex.Captures = .{};
+    const loc = matchLocation(srv, path, .{ .routes = &routes, .scratch = &scratch }, &caps);
+    try testing.expectEqualStrings(want, if (loc) |l| l.pattern() else "none");
+}
+
 test "longest prefix" {
     const srv: config.Server = .{ .listen = &.{}, .locations = &.{
         .{ .prefix = "/", .root = "x" },
         .{ .prefix = "/api/", .proxy_pass = "a:1" },
         .{ .prefix = "/api/v2/", .proxy_pass = "b:1" },
     } };
-    try testing.expectEqualStrings("/api/v2/", matchLocation(&srv, "/api/v2/x").?.prefix);
-    try testing.expectEqualStrings("/api/", matchLocation(&srv, "/api/x").?.prefix);
-    try testing.expectEqualStrings("/", matchLocation(&srv, "/apix").?.prefix);
+    try expectLocation(&srv, "/api/v2/x", "/api/v2/");
+    try expectLocation(&srv, "/api/x", "/api/");
+    try expectLocation(&srv, "/apix", "/");
+}
+
+test "nginx precedence: exact, ^~ prefix, regex in order, longest prefix" {
+    const srv: config.Server = .{ .listen = &.{}, .locations = &.{
+        .{ .prefix = "/", .root = "x" },
+        .{ .prefix = "/static/", .no_regex = true, .root = "x" },
+        .{ .prefix = "/images/", .root = "x" },
+        .{ .prefix = "/docs/", .root = "x" },
+        .{ .regex = "\\.(png|jpg)$", .case_insensitive = true, .root = "x" },
+        .{ .regex = "^/images/.*\\.png$", .root = "x" },
+        .{ .exact = "/", .root = "x" },
+        .{ .exact = "/images/logo.png", .root = "x" },
+        .{ .regex = "^/docs", .root = "x" },
+    } };
+    try expectLocation(&srv, "/", "/");
+    try expectLocation(&srv, "/x", "/");
+    try expectLocation(&srv, "/images/logo.png", "/images/logo.png");
+    // The first regex in config order, not the longest or most specific.
+    try expectLocation(&srv, "/images/a.png", "\\.(png|jpg)$");
+    try expectLocation(&srv, "/images/a.PNG", "\\.(png|jpg)$");
+    try expectLocation(&srv, "/images/a.gif", "/images/");
+    try expectLocation(&srv, "/static/a.png", "/static/");
+    try expectLocation(&srv, "/docs/a", "^/docs");
+    const none: config.Server = .{ .listen = &.{}, .locations = &.{.{ .exact = "/a", .root = "x" }} };
+    try expectLocation(&none, "/a/", "none");
 }
 
 test "encode path" {

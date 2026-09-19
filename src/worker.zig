@@ -24,6 +24,7 @@ const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
 const auth_pool = @import("auth/pool.zig");
+const regex = @import("regex.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -174,6 +175,8 @@ pub const Worker = struct {
     conns_head: ?*H1Conn = null,
     conn_count: u32 = 0,
     gzip_active: u32 = 0,
+    /// For regex locations and rewrites; sized for this generation's largest.
+    regex_scratch: regex.Scratch = .{},
 
     stop_async: xev.Async,
     /// QUIC datagrams other workers received for our connections.
@@ -212,6 +215,8 @@ pub const Worker = struct {
         clients: ?*client_limits.Table = null,
         /// IP rules, user files and client-certificate policies.
         guards: *const guard.Guards,
+        /// Compiled regexes of locations and rewrites.
+        routes: *const router.Routes,
         /// bcrypt verifier threads, shared with every other generation;
         /// null until a config uses `auth_basic`.
         auth_pool: ?*auth_pool.Pool = null,
@@ -255,6 +260,8 @@ pub const Worker = struct {
         };
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
+        w.regex_scratch = try regex.Scratch.init(alloc, shared.routes.max_states);
+        errdefer w.regex_scratch.deinit(alloc);
         errdefer w.closeSockets();
         try w.setupUpstreams();
         try w.setupListeners(prev);
@@ -264,6 +271,7 @@ pub const Worker = struct {
     }
 
     pub fn destroy(self: *Worker) void {
+        self.regex_scratch.deinit(self.alloc);
         for (self.groups.items) |g| g.deinit();
         self.groups.deinit(self.alloc);
         self.group_names.deinit(self.alloc);
@@ -294,7 +302,7 @@ pub const Worker = struct {
         // proxy_pass / webtransport_pass to a literal host:port gets an implicit group.
         for (self.cfg.servers) |srv| {
             for (srv.locations) |loc| {
-                const target = loc.proxy_pass orelse loc.webtransport_pass orelse continue;
+                const target = if (loc.proxy_pass) |p| config.splitProxyPass(p).target else loc.webtransport_pass orelse continue;
                 try self.addImplicitGroup(target, loc.webtransport_pass != null);
             }
         }

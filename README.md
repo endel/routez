@@ -31,6 +31,10 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Reload on SIGHUP: new workers start on the new config beside the old ones,
   taking over their TCP listening sockets, and the old ones drain. A config
   that fails to load is rejected and the running one kept.
+- Locations matched as nginx does: exact paths, longest prefix (optionally
+  ending the search, like `^~`) and regular expressions, case-sensitive or
+  not, on a linear-time engine, so no pattern can be turned into a ReDoS.
+  Regex groups feed `proxy_pass` URIs, redirects and header values.
 - Per location: gzip for text-like responses, `add_headers`,
   `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
   (per-client token bucket, optionally a named zone shared by locations).
@@ -101,8 +105,13 @@ A ZON file; see `src/config.zig` for every field and default.
 ```
 
 - A location has exactly one of `root`, `proxy_pass`, `return`,
-  `stub_status`, `metrics` or `webtransport_pass`; the longest matching
-  prefix wins.
+  `stub_status`, `metrics` or `webtransport_pass`, and matches by `prefix`,
+  `exact` or `regex` (see [Locations](#locations)).
+- `proxy_pass` may name a URI after the upstream, as in nginx:
+  `.{ .prefix = "/api/", .proxy_pass = "backend/v2/" }` sends `/api/x` as
+  `/v2/x`; `strip_prefix = true` is the same as `"backend/"`. A URI with
+  variables replaces the whole path and query:
+  `.{ .regex = "^/u/(\\d+)$", .proxy_pass = "backend/users?id=$1" }`.
 - `webtransport_pass` applies to WebTransport CONNECTs over HTTP/3. QUIC
   upstream certificates are not verified unless the upstream sets
   `tls_verify` or `tls_ca`.
@@ -132,6 +141,45 @@ A ZON file; see `src/config.zig` for every field and default.
 - TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
   not supported. A key that doesn't belong to the first certificate of its
   `cert` file fails the load.
+
+### Locations
+
+```zig
+.locations = .{
+    .{ .prefix = "/", .root = "/var/www" },
+    .{ .exact = "/health", .@"return" = .{ .body = "ok\n" } },            // nginx `=`
+    .{ .prefix = "/static/", .no_regex = true, .root = "/var/www" },     // nginx `^~`
+    .{ .regex = "\\.(png|jpe?g|gif)$", .case_insensitive = true,         // nginx `~*`
+       .root = "/var/www", .add_headers = .{.{ .name = "cache-control", .value = "max-age=86400" }} },
+    .{ .regex = "^/users/(\\d+)/avatar$", .proxy_pass = "backend/avatars/$1" },  // nginx `~`
+},
+```
+
+A location matches the path after percent-decoding and resolving dot
+segments, in nginx's order:
+
+1. An `exact` location equal to the path wins.
+2. Otherwise the longest matching `prefix` is remembered; if it has
+   `no_regex`, it wins.
+3. Otherwise the `regex` locations are tried in config order, and the
+   first that finds a match wins.
+4. Otherwise the remembered prefix wins, or the request gets a 404.
+
+A regex matches anywhere in the path unless anchored with `^`/`$`. Its
+groups are `$1`..`$9` (`$0` the whole match) in `return.location`,
+`add_headers`, `proxy_set_headers` and `proxy_pass` URIs, percent-encoded
+like `$uri`. Case-insensitive matching folds ASCII letters only.
+
+Regular expressions are a PCRE subset, matched without backtracking in time
+proportional to pattern size × path length: literals, `.`, classes
+(`[a-z_]`, `[^/]`, `\d \w \s \D \W \S`), anchors `^ $`, word boundaries
+`\b \B`, groups `( )` and `(?: )`, `|`, greedy and lazy `* + ? {n} {n,}
+{n,m}`, and the escapes `\t \n \r \f \v \xHH` and `\.`-style punctuation.
+Backreferences, lookahead and lookbehind, named groups, inline flags such as
+`(?i)`, atomic groups and possessive quantifiers fail the config check with
+the reason and offset. A pattern is at most 1024 bytes and compiles to at
+most 1000 instructions (so `x{1,1000}` fits only for a small `x`); only the
+first nine groups are captured.
 
 ### Client limits
 
@@ -283,7 +331,8 @@ HTTP/3 and WebTransport CONNECTs alike.
 ### Redirects and variables
 
 `return` takes a `location` for redirects, and it, `add_headers` and
-`proxy_set_headers` values may use variables, written `$name` or `${name}`:
+`proxy_set_headers` values and `proxy_pass` URIs may use variables, written
+`$name` or `${name}`:
 
 ```zig
 // Plain HTTP to HTTPS.
@@ -305,6 +354,7 @@ HTTP/3 and WebTransport CONNECTs alike.
 | `$ssl_client_s_dn`, `$ssl_client_i_dn` | its subject and issuer, RFC 4514 (`CN=alice,O=Example`) |
 | `$ssl_client_serial` | its serial number, hex |
 | `$ssl_client_fingerprint` | SHA-1 of the certificate, hex |
+| `$1`..`$9`, `$0` | groups of the regex location that matched, and its whole match, percent-encoded |
 
 Pass certificate details upstream with `proxy_set_headers`: it replaces
 any header the client sent under the same name (and an empty value removes
@@ -460,5 +510,8 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
 - IP rules see the TCP or QUIC peer only; there is no trusted-proxy
   (`real_ip_from`) support. A literal `proxy_pass` target is always plain HTTP;
   declare an upstream to use TLS.
+- Regular expressions lack backreferences, lookaround, named groups,
+  inline flags, Unicode classes and POSIX classes (`[[:alpha:]]`); they
+  match bytes, and case-insensitive matching is ASCII only.
 - macOS does not spread TCP connections across SO_REUSEPORT listeners, so
   extra workers only help on Linux.

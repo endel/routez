@@ -29,6 +29,7 @@ const client_cert = @import("net/client_cert.zig");
 const htpasswd = @import("auth/htpasswd.zig");
 const auth_pool = @import("auth/pool.zig");
 const basic = @import("auth/basic.zig");
+const regex = @import("regex.zig");
 
 pub const Response = struct {
     status: u16,
@@ -174,6 +175,8 @@ pub const Exchange = struct {
     remote_user: []const u8 = "",
     /// The user whose password a verifier thread is checking.
     pending_user: []const u8 = "",
+    /// Groups of the last regex that matched, `$1`..`$9`.
+    captures: regex.Captures = .{},
 
     pub fn create(worker: *Worker, down: Downstream, init: RequestInit) !*Exchange {
         const ex = try worker.alloc.create(Exchange);
@@ -249,7 +252,7 @@ pub const Exchange = struct {
                 }
             }
         }
-        const loc = router.matchLocation(self.server, self.req.path) orelse return self.sendError(404);
+        const loc = router.matchLocation(self.server, self.req.path, self.matcher(), &self.captures) orelse return self.sendError(404);
         self.add_values = self.expandAll(loc.add_headers) catch return self.sendError(400);
         self.location = loc;
         if (loc.limit_req) |lim| {
@@ -290,7 +293,7 @@ pub const Exchange = struct {
         }
         if (loc.metrics) return self.sendMetrics();
         if (loc.root) |root| return static.start(self, loc, root);
-        if (loc.proxy_pass) |target| return proxy.start(self, loc, target);
+        if (loc.proxy_pass) |target| return proxy.start(self, loc, config.splitProxyPass(target).target);
         // webtransport_pass only means something to a CONNECT over HTTP/3.
         return self.sendError(404);
     }
@@ -525,6 +528,10 @@ pub const Exchange = struct {
         d.vtable.startTunnel(d.ptr);
     }
 
+    fn matcher(self: *Exchange) router.Matcher {
+        return .{ .routes = self.worker.shared.routes, .scratch = &self.worker.regex_scratch };
+    }
+
     fn varRequest(self: *const Exchange) vars.Request {
         return .{
             .scheme = self.req.scheme,
@@ -536,6 +543,7 @@ pub const Exchange = struct {
             .remote_addr = self.req.client_addr,
             .remote_user = self.remote_user,
             .client_cert = self.client_cert,
+            .captures = &self.captures,
         };
     }
 

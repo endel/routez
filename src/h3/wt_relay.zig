@@ -18,6 +18,7 @@ const qpack = quic.qpack;
 const ConnEntry = quic.connection_manager.ConnEntry;
 const common = @import("../http/common.zig");
 const router = @import("../router.zig");
+const regex = @import("../regex.zig");
 const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
@@ -377,7 +378,9 @@ pub fn Relay(comptime Listener: type) type {
             const srv = l.vhosts.select(authority);
             var path_buf: [2048]u8 = undefined;
             const target = router.normalizeTarget(path, &path_buf) catch return refuse(session, session_id);
-            const loc = router.matchLocation(srv, target.path) orelse return refuse(session, session_id);
+            var caps: regex.Captures = .{};
+            const m: router.Matcher = .{ .routes = w.shared.routes, .scratch = &w.regex_scratch };
+            const loc = router.matchLocation(srv, target.path, m, &caps) orelse return refuse(session, session_id);
             if (loc.webtransport_pass == null) return refuse(session, session_id);
 
             // The checks `Exchange.start` makes of a request.
