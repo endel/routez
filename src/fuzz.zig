@@ -14,6 +14,7 @@ const common = @import("http/common.zig");
 const access = @import("access.zig");
 const htpasswd = @import("auth/htpasswd.zig");
 const client_cert = @import("net/client_cert.zig");
+const regex = @import("regex.zig");
 
 const request_seeds = [_][]const u8{
     "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
@@ -178,6 +179,60 @@ test "fuzz: client certificate names" {
     }.f, &name_seeds);
 }
 
+test "fuzz: regex compile and match" {
+    // One arena and scratch throughout: fresh allocations per input grow
+    // the testing allocator's footprint to gigabytes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    RegexTarget.arena = &arena_state;
+    RegexTarget.scratch = try regex.Scratch.init(testing.allocator, regex.max_insts * (regex.max_loop_levels + 1));
+    defer RegexTarget.scratch.deinit(testing.allocator);
+    try mutate(RegexTarget.f, &regex_seeds);
+}
+
+const RegexTarget = struct {
+    var arena: *std.heap.ArenaAllocator = undefined;
+    var scratch: regex.Scratch = .{};
+
+    fn f(input: []const u8) anyerror!void {
+        defer _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        // Pattern, NUL, subject; a subject starting with NUL is matched case-insensitively.
+        const sep = std.mem.indexOfScalar(u8, input, 0) orelse input.len;
+        const pattern = input[0..sep];
+        var subject = if (sep < input.len) input[sep + 1 ..] else "";
+        const ci = subject.len > 0 and subject[0] == 0;
+        if (ci) subject = subject[1..];
+        var d: regex.Diagnostic = .{};
+        const re = regex.Regex.compile(a, pattern, .{ .case_insensitive = ci }, &d) catch |err| {
+            try testing.expectEqual(error.InvalidPattern, err);
+            try testing.expect(d.message.len > 0);
+            return;
+        };
+        try testing.expect(re.insts.len <= regex.max_insts and re.states() <= scratch.cap);
+        var caps: regex.Captures = .{};
+        const hit = re.match(subject, &scratch, &caps);
+        if (hit) for (0..regex.max_groups + 1) |g| if (caps.get(g)) |sub| {
+            try testing.expect(@intFromPtr(sub.ptr) >= @intFromPtr(subject.ptr));
+            try testing.expect(@intFromPtr(sub.ptr) + sub.len <= @intFromPtr(subject.ptr) + subject.len);
+        };
+        try testing.expect(!hit or caps.get(0) != null);
+        // Scratch state never leaks from one match into the next.
+        var caps2: regex.Captures = .{};
+        try testing.expectEqual(hit, re.match(subject, &scratch, &caps2));
+        try testing.expectEqualSlices(u32, &caps.slots, &caps2.slots);
+    }
+};
+
+const regex_seeds = [_][]const u8{
+    "^/api/(v[0-9]+)/(.*)$\x00/api/v2/users?x",
+    "\\.(png|jpe?g|gif)$\x00\x00/img/A.PNG",
+    "(a+)+$\x00aaaaaaaaaaaaaaaaaaaaaaaa!",
+    "(?:(a|)*b?){2,5}[^/]{0,3}\\b\\w+\x00ab ab--c",
+    "^/(?:[a-z]{1,8}/)*([\\d_]+)\\.html$\x00/a/bb/ccc/12_3.html",
+    "((a)|b)*?c{3}|x\x00bbacccx",
+};
+
 const name_seeds = [_][]const u8{
     // SET { CN=alice }, SET { O=Example }
     "\x31\x0e\x30\x0c\x06\x03\x55\x04\x03\x0c\x05alice\x31\x10\x30\x0e\x06\x03\x55\x04\x0a\x0c\x07Example",
@@ -192,7 +247,7 @@ fn mutate(comptime target: fn ([]const u8) anyerror!void, seeds: []const []const
     for (seeds) |seed| try target(seed);
     var prng = std.Random.DefaultPrng.init(0x5eed_1e55);
     const r = prng.random();
-    const interesting = "\r\n:;, \t%./0123456789abcdefABCDEF-\x00\xff";
+    const interesting = "\r\n:;, \t%./0123456789abcdefABCDEF-\x00\xff()[]{}*+?|\\^$";
     var buf: [2048]u8 = undefined;
     var i: u64 = 0;
     while (i < options.iterations) : (i += 1) {

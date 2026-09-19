@@ -84,6 +84,19 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("h3-test-client", "Build the HTTP/3 e2e client").dependOn(&b.addInstallArtifact(h3_client, .{}).step);
 
+    // Driver for tests/regex/differential.py, which checks src/regex.zig against Python's re.
+    const regex_diff = b.addExecutable(.{ .name = "regex-diff", .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/regex/diff.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "regex", .module = b.createModule(.{
+            .root_source_file = b.path("src/regex.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) }},
+    }) });
+    b.step("regex-diff", "Build the regex differential-test driver").dependOn(&b.addInstallArtifact(regex_diff, .{}).step);
+
     const tests = b.addTest(.{ .root_module = root_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 }

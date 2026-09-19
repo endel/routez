@@ -396,4 +396,5 @@ test {
     _ = @import("auth/verify.zig");
     _ = @import("auth/pool.zig");
     _ = @import("net/client_cert.zig");
+    _ = @import("regex.zig");
 }
