@@ -245,7 +245,8 @@ pub const Exchange = struct {
             .req = undefined,
             .server = init.vhosts.select(init.authority),
             .location = null,
-            .start_ms = timers.nowMs(),
+            // Only the access log reads it.
+            .start_ms = if (worker.cfg.access_log) timers.nowMs() else 0,
         };
         errdefer ex.arena_state.deinit();
         const a = ex.arena_state.allocator();

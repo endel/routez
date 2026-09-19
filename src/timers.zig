@@ -65,6 +65,8 @@ pub const Timers = struct {
     }
 
     pub fn start(self: *Timers) void {
+        // `set` trusts the loop's time; it is as old as the loop until it runs.
+        self.loop.update_now();
         self.tick_timer.run(self.loop, &self.tick_c, tick_ms, Timers, self, onTick);
     }
 
@@ -75,9 +77,9 @@ pub const Timers = struct {
 
     /// Arm (or re-arm) `d` to fire `ms` from now.
     pub fn set(self: *Timers, d: *Deadline, ms: u32) void {
-        // The cached tick time can be up to a tick old; don't fire early.
-        self.now_ms = nowMs();
-        d.at_ms = self.now_ms + ms;
+        // The loop's time is from before its last poll, which the tick
+        // bounds to tick_ms: allow for that rather than read the clock.
+        d.at_ms = self.loop.now() + ms + tick_ms;
         if (d.state == .armed) return;
         d.state = .armed;
         d.prev = null;
