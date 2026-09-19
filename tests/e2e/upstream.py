@@ -24,7 +24,11 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._reply(200, bytes(i % 251 for i in range(n)), "application/octet-stream")
         if self.path == "/healthz":
             return self._reply(200, b"ok", "text/plain")
-        body = json.dumps({"path": self.path, "headers": dict(self.headers), "port": self.server.server_port, "peer_port": self.client_address[1]}).encode()
+        reply = {"path": self.path, "headers": dict(self.headers), "port": self.server.server_port, "peer_port": self.client_address[1]}
+        cert = self.connection.getpeercert() if hasattr(self.connection, "getpeercert") else None
+        if cert:
+            reply["client_cn"] = dict(x[0] for x in cert["subject"])["commonName"]
+        body = json.dumps(reply).encode()
         self._reply(200, body)
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -40,8 +44,11 @@ class H(http.server.BaseHTTPRequestHandler):
         self._reply(200, json.dumps({"received": len(data), "port": self.server.server_port}).encode())
     def log_message(self, *a): pass
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
-if len(sys.argv) > 3:  # HTTPS: upstream.py PORT CERT KEY
+if len(sys.argv) > 3:  # HTTPS: upstream.py PORT CERT KEY [CLIENT_CA]
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(sys.argv[2], sys.argv[3])
+    if len(sys.argv) > 4:  # clients must present a certificate from CLIENT_CA
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(sys.argv[4])
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()

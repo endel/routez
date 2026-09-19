@@ -18,7 +18,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   files, directory redirects, path normalization, `try_files` fallbacks for
   single-page apps.
 - Reverse proxy to HTTP/1.1 upstreams, plain or over TLS 1.3 (quic-zig's
-  sans-IO `tls_client`, with optional certificate verification): streaming
+  sans-IO `tls_client`, with optional certificate verification and client
+  certificates): streaming
   in both directions with backpressure, keep-alive connection pools, retries
   of replayable requests, connect/read timeouts, WebSocket (Upgrade)
   tunnels, X-Forwarded-* headers.
@@ -129,10 +130,16 @@ A ZON file; see `src/config.zig` for every field and default.
   address is matched against the certificate's IP addresses and gets no
   SNI. A failed handshake counts as a failed connect: the request moves to
   the next server, or gets a 502. Health checks use TLS too.
+  `tls_client_cert` and `tls_client_key` give a certificate to present when
+  the upstream asks for one (mutual TLS), in health checks too, and to
+  WebTransport (QUIC) upstreams; the key may be EC P-256, Ed25519 or RSA.
+  Both are read at start and on every reload, and `-t` checks that the key
+  belongs to the certificate.
 
   ```zig
   .{ .name = "api", .servers = .{"10.0.0.7:443"}, .tls = true,
-     .tls_verify = true, .tls_server_name = "api.internal.example" },
+     .tls_verify = true, .tls_server_name = "api.internal.example",
+     .tls_client_cert = "/etc/routez/api-client.pem", .tls_client_key = "/etc/routez/api-client.key" },
   ```
 - `root` follows nginx semantics: the full request path is appended.
 - `try_files = .{ "$uri", "$uri/", "/index.html" }` on a `root` location
@@ -610,8 +617,7 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   or change `user`, and SIGUSR1 can't reopen a log file where `user` can't
   write: nothing keeps root to do those, unlike nginx's master process.
 - TLS to upstreams: TLS 1.3 only, no session resumption (pooled keep-alive
-  connections avoid most handshakes), no client certificates and no
-  revocation checks.
+  connections avoid most handshakes) and no revocation checks.
 - Client certificates: no revocation checks (CRL, OCSP) and no
   post-handshake authentication, so a location can't ask for a certificate
   the handshake didn't; a server's `client_ca` applies to its whole name.

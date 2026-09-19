@@ -43,6 +43,7 @@ pub const Group = struct {
                 .server_name = cfg.tls_server_name orelse hp.host,
                 .alpn = &.{"http/1.1"},
                 .ca_bundle = worker.shared.upstreamCa(cfg.name),
+                .client_certificate = worker.shared.upstreamCert(cfg.name),
             };
         }
         if (cfg.health != null) worker.timers.set(&g.health_tick, 0);

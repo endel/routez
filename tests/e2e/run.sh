@@ -342,6 +342,9 @@ $OPENSSL req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyo
     -subj /CN=strict.test -addext subjectAltName=DNS:strict.test 2>/dev/null
 cat "$CERTS/ca.crt" "$ACL/strict.crt" > "$ACL/trust.pem"
 cp "$HERE/htpasswd" "$ACL/htpasswd"
+# An HTTPS upstream that insists on a client certificate from cca.
+"$PY_TLS" "$HERE/upstream.py" 19006 "$CERTS/server.crt" "$CERTS/server.key" "$ACL/cca.crt" & PIDS+=($!)
+wait_port 19006
 cat > "$ACL/routez.zon" <<EOF2
 .{ .access_log_path = "$ACL/access.log", .access_log_format = "\$request_uri \$remote_user \$ssl_client_verify \$status",
    .servers = .{
@@ -365,6 +368,8 @@ cat > "$ACL/routez.zon" <<EOF2
                    .{ .name = "x-client-verify", .value = "\$ssl_client_verify" },
                } },
             .{ .prefix = "/wt-denied", .webtransport_pass = "127.0.0.1:4450", .access = .{.{ .deny = "all" }} },
+            .{ .prefix = "/up-cert/", .proxy_pass = "cert-up", .strip_prefix = true },
+            .{ .prefix = "/up-nocert/", .proxy_pass = "nocert-up", .strip_prefix = true },
             .{ .prefix = "/.well-known/webtransport", .webtransport_pass = "127.0.0.1:4450", .auth_basic = .{ .user_file = "$ACL/htpasswd" } },
         },
     },
@@ -374,7 +379,13 @@ cat > "$ACL/routez.zon" <<EOF2
         .tls = .{ .cert = "$ACL/strict.crt", .key = "$ACL/strict.key", .client_ca = "$ACL/cca.crt" },
         .locations = .{.{ .prefix = "/", .@"return" = .{ .body = "strict" }, .add_headers = .{.{ .name = "x-dn", .value = "\$ssl_client_s_dn" }} }},
     },
-} }
+  },
+  .upstreams = .{
+    .{ .name = "cert-up", .servers = .{"127.0.0.1:19006"}, .tls = true, .tls_client_cert = "$ACL/alice.crt", .tls_client_key = "$ACL/alice.key",
+       .health = .{ .path = "/healthz", .interval_ms = 100 } },
+    .{ .name = "nocert-up", .servers = .{"127.0.0.1:19006"}, .tls = true },
+  },
+}
 EOF2
 "$ROOT/zig-out/bin/routez" "$ACL/routez.zon" 2> "$ACL/server.log" & ACLD=$!; PIDS+=($ACLD)
 wait_port 18480
@@ -410,6 +421,11 @@ mtls_suite() {
     check misdirected "$(code "$@" $ALICE -H 'Host: strict.test' https://localhost:18481/)" 421
 }
 SUITE=mtls-https mtls_suite
+# Client certificates to upstreams: health probes present it too, or three
+# failed ones (300 ms) would have taken the server down.
+perl -e 'select(undef,undef,undef,0.6)'
+SUITE=upstream-cert check with-cert "$($ACURL http://127.0.0.1:18480/up-cert/x | json '["client_cn"]')" "alice e2e"
+SUITE=upstream-cert check without-cert "$(code http://127.0.0.1:18480/up-nocert/x)" 502
 if $CURL_BIN --version | grep -q HTTP3; then SUITE=mtls-h3 mtls_suite --http3-only; fi
 # No session tickets where client certificates are asked for: nothing to resume.
 echo | $OPENSSL s_client -connect 127.0.0.1:18481 -servername strict.test -tls1_3 -CAfile "$ACL/trust.pem" -cert "$ACL/alice.crt" -key "$ACL/alice.key" -sess_out "$ACL/sess" >/dev/null 2>&1
@@ -441,6 +457,9 @@ SUITE=acl check test-rejects-apr1 "$? $(grep -c 'apr1.*htpasswd -B' "$ACL/t.log"
 sed "s|$ACL/cca.crt|$ACL/missing.crt|g" "$ACL/routez.zon" > "$ACL/noca.zon"
 "$ROOT/zig-out/bin/routez" -t "$ACL/noca.zon" 2> "$ACL/t.log"
 SUITE=acl check test-needs-client-ca "$? $(grep -c 'client_ca' "$ACL/t.log")" "1 1"
+sed "s|\"$ACL/alice.key\"|\"$ACL/mallory.key\"|" "$ACL/routez.zon" > "$ACL/wrongkey.zon"
+"$ROOT/zig-out/bin/routez" -t "$ACL/wrongkey.zon" 2> "$ACL/t.log"
+SUITE=upstream-cert check test-key-mismatch "$? $(grep -c 'mallory.key is not the key' "$ACL/t.log")" "1 1"
 
 # Trusted proxies: 127.0.0.1 is one, ::1 isn't. X-Forwarded-For from a
 # trusted peer names the client; PROXY protocol listeners take only trusted

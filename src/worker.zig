@@ -206,8 +206,11 @@ pub const Worker = struct {
         /// Same in every worker and generation: a Retry token or stateless
         /// reset from one worker must hold up at any other.
         quic_keys: QuicKeys,
-        /// Trust anchors for each verified TLS upstream, by upstream name.
+        /// Trust anchors for each verified TLS upstream, and QUIC ones with a
+        /// client certificate, by upstream name.
         upstream_cas: []const UpstreamCa = &.{},
+        /// Client certificates presented to upstreams, by upstream name.
+        upstream_certs: []const UpstreamCert = &.{},
         /// Proxies trusted to name the client.
         real_ip: realip.Trust = .{},
         access_format: access_log.Format = .main,
@@ -229,6 +232,15 @@ pub const Worker = struct {
         pub const TlsListener = struct { address: []const u8, port: u16, cfg: *const tls.ServerConfig };
 
         pub const UpstreamCa = struct { upstream: []const u8, bundle: *const std.crypto.Certificate.Bundle };
+
+        pub const UpstreamCert = struct { upstream: []const u8, cert: *const quic.tls13.ServerCertificate };
+
+        pub fn upstreamCert(self: *const Shared, upstream_name: []const u8) ?quic.tls13.ServerCertificate {
+            for (self.upstream_certs) |u| {
+                if (std.mem.eql(u8, u.upstream, upstream_name)) return u.cert.*;
+            }
+            return null;
+        }
 
         pub fn upstreamCa(self: *const Shared, upstream_name: []const u8) ?*const std.crypto.Certificate.Bundle {
             for (self.upstream_cas) |u| {

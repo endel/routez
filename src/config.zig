@@ -392,6 +392,12 @@ pub const Upstream = struct {
     /// QUIC upstreams. Defaults to each server's host; an IP address is
     /// matched against the certificate's IP addresses and not sent as SNI.
     tls_server_name: ?[]const u8 = null,
+    /// PEM certificate chain (leaf first) presented to TLS and QUIC
+    /// upstreams that ask for a client certificate, health checks included.
+    /// Needs `tls_client_key`. Read at start and on every reload.
+    tls_client_cert: ?[]const u8 = null,
+    /// Its private key: EC P-256, Ed25519, or RSA of 2048 to 4096 bits.
+    tls_client_key: ?[]const u8 = null,
     health: ?Health = null,
 
     pub const Balance = enum { round_robin, least_conn, ip_hash };
@@ -507,6 +513,8 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
         if (up.servers.len == 0) return fail("upstream '{s}' has no servers", .{up.name});
         if (up.tls and up.h3) return fail("upstream '{s}': tls and h3 are exclusive (h3 is always encrypted)", .{up.name});
         if (up.tls_server_name) |n| if (n.len == 0 or n.len > 255) return fail("upstream '{s}': bad tls_server_name", .{up.name});
+        if ((up.tls_client_cert == null) != (up.tls_client_key == null)) return fail("upstream '{s}': tls_client_cert and tls_client_key go together", .{up.name});
+        if (up.tls_client_cert != null and !up.tls and !up.h3) return fail("upstream '{s}': a client certificate needs tls or h3", .{up.name});
         for (up.servers) |s| _ = parseHostPort(s) catch return fail("upstream '{s}': bad server '{s}'", .{ up.name, s });
         for (cfg.upstreams[0..i]) |prev| {
             if (std.mem.eql(u8, prev.name, up.name)) return fail("duplicate upstream '{s}'", .{up.name});
@@ -1120,6 +1128,28 @@ test "trusted proxies and the PROXY protocol" {
         \\    .{ .listen = .{.{ .port = 1, .proxy_protocol = true }}, .locations = .{.{ .prefix = "/", .root = "x" }} },
         \\    .{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} },
         \\} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "upstream client certificates" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    _ = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "b" }} }},
+        \\   .upstreams = .{
+        \\       .{ .name = "b", .servers = .{"10.0.0.1:443"}, .tls = true, .tls_client_cert = "c.pem", .tls_client_key = "c.key" },
+        \\       .{ .name = "q", .servers = .{"10.0.0.1:443"}, .h3 = true, .tls_client_cert = "c.pem", .tls_client_key = "c.key" },
+        \\   } }
+    , "test");
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "b" }} }},
+        \\   .upstreams = .{.{ .name = "b", .servers = .{"10.0.0.1:443"}, .tls = true, .tls_client_cert = "c.pem" }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "b" }} }},
+        \\   .upstreams = .{.{ .name = "b", .servers = .{"10.0.0.1:80"}, .tls_client_cert = "c.pem", .tls_client_key = "c.key" }} }
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));

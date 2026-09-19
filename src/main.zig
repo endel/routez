@@ -251,6 +251,7 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
         .tls_listeners = tls_listeners.items,
         .quic_keys = quic_keys,
         .upstream_cas = try loadUpstreamCas(arena, cfg),
+        .upstream_certs = try loadUpstreamCerts(arena, cfg),
         .real_ip = try realIpTrust(arena, cfg),
         .guards = guards,
         .routes = routes,
@@ -264,13 +265,28 @@ fn realIpTrust(arena: std.mem.Allocator, cfg: *const config.Config) !realip.Trus
     return .{ .from = rules, .header = cfg.real_ip_header, .recursive = cfg.real_ip_recursive };
 }
 
+fn loadUpstreamCerts(arena: std.mem.Allocator, cfg: *const config.Config) ![]const Worker.Shared.UpstreamCert {
+    var out: std.ArrayListUnmanaged(Worker.Shared.UpstreamCert) = .empty;
+    for (cfg.upstreams) |up| {
+        const cert_path = up.tls_client_cert orelse continue;
+        const cert = try arena.create(quic.tls13.ServerCertificate);
+        cert.* = tls.loadCertificate(arena, cert_path, up.tls_client_key.?) catch |err| {
+            log.err("upstream '{s}': client certificate: {s}", .{ up.name, @errorName(err) });
+            return err;
+        };
+        try out.append(arena, .{ .upstream = up.name, .cert = cert });
+    }
+    return out.items;
+}
+
 /// One bundle per `tls_ca` file, and the system store at most once.
 fn loadUpstreamCas(arena: std.mem.Allocator, cfg: *const config.Config) ![]const Worker.Shared.UpstreamCa {
     const Bundle = std.crypto.Certificate.Bundle;
     var out: std.ArrayListUnmanaged(Worker.Shared.UpstreamCa) = .empty;
     var loaded: std.ArrayListUnmanaged(struct { path: ?[]const u8, bundle: *const Bundle }) = .empty;
     for (cfg.upstreams) |up| {
-        if (!up.tls or (!up.tls_verify and up.tls_ca == null)) continue;
+        if (!up.tls and !(up.h3 and up.tls_client_cert != null)) continue;
+        if (!up.tls_verify and up.tls_ca == null) continue;
         const bundle = for (loaded.items) |l| {
             const same = if (l.path) |p| up.tls_ca != null and std.mem.eql(u8, p, up.tls_ca.?) else up.tls_ca == null;
             if (same) break l.bundle;

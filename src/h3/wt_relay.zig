@@ -522,18 +522,32 @@ pub fn Relay(comptime Listener: type) type {
             });
 
             const cfg = group.cfg;
+            const server_name = try arena.dupe(u8, cfg.tls_server_name orelse peer.host);
+            const verify = cfg.tls_ca != null or cfg.tls_verify;
+            // ClientConfig has no client certificate field; a TLS config of our own carries one.
+            const tls_config: ?quic.tls13.TlsConfig = if (w.shared.upstreamCert(cfg.name)) |cert| .{
+                .cert_chain_der = &.{},
+                .private_key_bytes = &.{},
+                .alpn = &.{"h3"},
+                .server_name = server_name,
+                .skip_cert_verify = !verify,
+                // Loaded at start with the certificate; verification only reads it.
+                .ca_bundle = if (verify) @constCast(w.shared.upstreamCa(cfg.name) orelse return error.NoTrustAnchors) else null,
+                .client_certificate = cert,
+            } else null;
             const up = try a.create(Up);
             errdefer a.destroy(up);
             up.* = .{ .rs = r, .worker = w, .handler = .{ .up = up }, .client = undefined };
             up.client = try UpClient.init(a, &up.handler, .{
                 .address = addr_text,
                 .port = peer.addr.getPort(),
-                .server_name = try arena.dupe(u8, cfg.tls_server_name orelse peer.host),
+                .server_name = server_name,
                 .path = try arena.dupe(u8, path),
                 .connect_headers = fwd.items,
                 .ipv6 = peer.addr == .ip6,
                 .ca = if (cfg.tls_ca) |ca| .{ .file = ca } else if (cfg.tls_verify) .system else .none,
-                .skip_cert_verify = cfg.tls_ca == null and !cfg.tls_verify,
+                .skip_cert_verify = !verify,
+                .tls_config = tls_config,
                 .loop = &w.loop,
             });
             r.up = up;
