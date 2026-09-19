@@ -317,6 +317,10 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   (30 s by default). Each end uses the smaller of the two advertised values,
   so raising it only helps clients that advertise more; a client that
   vanishes holds its connection slot until the timeout.
+- With several workers, a stateless reset from a client that changed address
+  can reach a worker that doesn't own its connection and is dropped: its
+  connection ID is random by design, so QUIC-LB can't steer it. The
+  connection then closes at the idle timeout instead of at once.
 - `limit_req` and per-IP limits count per worker, so the effective limit is
   multiplied by the number of workers.
 - Static files are read on the worker thread; fine for page-cached files,
