@@ -754,6 +754,49 @@ if grep -qiE "panic|segmentation" "$PRIV/logs/error.log" "$PRIV/stderr.log"; the
 $SUDO rm -rf "$PRIV"
 fi
 
+# Reload and stop let responses still being sent finish: ones fully
+# produced but queued on our side (a small send buffer keeps them there),
+# file ranges mid-sendfile, a reader too slow for the close's old 5 s
+# linger, and HTTP/3 streams.
+SUITE=drain
+DR="$WORK/drain"; mkdir -p "$DR"
+cat > "$DR/routez.zon" <<EOF2
+.{ .access_log = false, .servers = .{.{
+    .listen = .{ .{ .address = "127.0.0.1", .port = 18530 }, .{ .address = "127.0.0.1", .port = 18531, .tls = true, .quic = true } },
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{ .{ .prefix = "/", .root = "$WORK/www" }, .{ .prefix = "/drain-sync/", .proxy_pass = "sync" } },
+  }},
+  .upstreams = .{.{ .name = "sync", .servers = .{"127.0.0.1:19010"} }},
+}
+EOF2
+"$ROOT/zig-out/bin/routez" "$DR/routez.zon" 2> "$DR/stderr.log" & DRD=$!; PIDS+=($DRD)
+wait_port 18530
+drain_clients() { WWW="$WORK/www" "$PY_TLS" "$HERE/drain_client.py" $DRD "$@"; }
+# Downloads of big.bin taking ~3 s, across the signal.
+DCURL="$CURL_BIN -s --max-time 20 --cacert $CERTS/ca.crt --limit-rate 1M"
+curls_start() {
+    $DCURL -o "$DR/plain.bin" http://127.0.0.1:18530/big.bin & CP=$!
+    $DCURL -o "$DR/tls.bin" https://127.0.0.1:18531/big.bin & CT=$!
+    CH=
+    if $CURL_BIN --version | grep -q HTTP3; then $DCURL --http3-only -o "$DR/h3.bin" https://127.0.0.1:18531/big.bin & CH=$!; fi
+}
+curls_check() {
+    wait $CP; wait $CT; [ -n "$CH" ] && wait $CH
+    local want; want=$(sha < "$WORK/www/big.bin")
+    check "$1-curl" "$(sha < "$DR/plain.bin") $(sha < "$DR/tls.bin")" "$want $want"
+    [ -n "$CH" ] && check "$1-curl-h3" "$(sha < "$DR/h3.bin")" "$want"
+}
+curls_start
+check reload "$(drain_clients HUP 19010 plain:18530:/small-sndbuf-700k.bin:200000:sync tls:18531:/small-sndbuf-700k.bin:200000:sync \
+    plain:18530:/small-sndbuf-700k.bin:90000:nosync)" "ok ok ok"
+curls_check reload
+for _ in $(seq 1 100); do grep -q "worker 0 stopped" "$DR/stderr.log" && break; perl -e 'select(undef,undef,undef,0.1)'; done
+curls_start
+check stop "$(drain_clients TERM 19010 plain:18530:/small-sndbuf-700k.bin:200000:sync tls:18531:/small-sndbuf-700k.bin:200000:sync)" "ok ok"
+curls_check stop
+for _ in $(seq 1 100); do kill -0 $DRD 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+check stopped "$(kill -0 $DRD 2>/dev/null && echo running || echo stopped) $(grep -c 'still open at shutdown' "$DR/stderr.log")" "stopped 0"
+
 # WebTransport through the relay: a stream and a datagram, echoed.
 (cd "$ROOT" && zig build wt-test-client) || exit 1
 "$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" > "$WORK/wt.log" 2>&1 & WT=$!

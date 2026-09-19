@@ -30,8 +30,10 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   tracking and active HTTP health checks.
 - Layer-4 UDP proxy for QUIC traffic, with QUIC-LB connection-ID routing.
 - Worker threads with SO_REUSEPORT. Graceful shutdown on SIGINT/SIGTERM:
-  keep-alive connections close when idle, HTTP/3 connections get GOAWAY and
-  finish their requests, with a 10 s limit.
+  keep-alive connections close once idle, after the client has been sent
+  every byte of its last response (queued output and `sendfile` ranges
+  included); HTTP/3 connections get GOAWAY and finish their requests. All
+  within a 10 s limit, after which what is left is closed.
 - Reload on SIGHUP: new workers start on the new config beside the old ones,
   taking over their TCP listening sockets, and the old ones drain. A config
   that fails to load is rejected and the running one kept.

@@ -10,6 +10,8 @@
 //!   - `onSocketEof(owner)`: the peer finished sending, or the connection
 //!     failed. The owner usually aborts.
 //!   - `onSocketWritable(owner)`: output drained below `low_water`.
+//!   - `onSocketSent(owner)`, optional: a queued write went (partly) out,
+//!     also while flushing before a close.
 //!   - `onSocketConnect(owner, ?anyerror)`: outcome of `connect`.
 //!   - `onSocketClosed(owner)`: the fd is closed and no callback will follow;
 //!     the owner may free itself. Always called from a deferred callback,
@@ -332,6 +334,7 @@ pub fn Socket(comptime Owner: type) type {
                 self.active_off = 0;
             }
             self.kickWrite();
+            if (@hasDecl(Owner, "onSocketSent") and self.state != .closing and self.state != .closed) Owner.onSocketSent(self.owner);
             if (self.state == .open and self.buffered() < low_water) Owner.onSocketWritable(self.owner);
             return .disarm;
         }

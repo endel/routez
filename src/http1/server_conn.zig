@@ -221,6 +221,11 @@ pub const Conn = struct {
         if (self.ex) |ex| ex.onDownstreamWritable();
     }
 
+    pub fn onSocketSent(self: *Conn) void {
+        // Closing after a flush: a client still taking the output isn't idle.
+        if (self.phase == .closing) self.armClosingDeadline();
+    }
+
     pub fn onSocketConnect(_: *Conn, _: ?anyerror) void {}
 
     pub fn onSocketClosed(self: *Conn) void {
@@ -269,7 +274,13 @@ pub const Conn = struct {
             self.flushTls();
         }
         self.sock.closeAfterFlush();
-        self.worker.timers.set(&self.deadline, linger_ms);
+        self.armClosingDeadline();
+    }
+
+    /// While output is flushing, the I/O timeout since the last progress;
+    /// after it, a short linger for the client's FIN.
+    fn armClosingDeadline(self: *Conn) void {
+        self.worker.timers.set(&self.deadline, if (self.sock.state == .flushing) self.limits().io_timeout_ms else linger_ms);
     }
 
     // ---- request processing ----
@@ -521,10 +532,18 @@ pub const Conn = struct {
 
     /// Close an idle keep-alive connection during shutdown. One that hasn't
     /// had a request yet is kept unless `fresh_too`: it may be mid-TLS-
-    /// handshake, or its request still in the socket buffer.
+    /// handshake, or its request still in the socket buffer. A finished
+    /// response may still be queued (or a file range being sent): that is
+    /// flushed first.
     pub fn closeIfIdle(self: *Conn, fresh_too: bool) void {
-        if (self.phase == .head and self.in.items.len == 0 and (self.requests > 0 or fresh_too)) self.sock.abort();
         self.keep_alive = false;
+        if (self.phase != .head or self.in.items.len > 0 or (self.requests == 0 and !fresh_too)) return;
+        if (self.tls) |t| {
+            t.close();
+            self.flushTls();
+        }
+        if (self.sock.buffered() == 0) return self.sock.abort();
+        self.closeGracefully();
     }
 
     // ---- Downstream interface ----
