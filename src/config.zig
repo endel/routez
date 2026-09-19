@@ -52,6 +52,19 @@ pub const Config = struct {
     /// Group to run as (a name or a numeric id); `user`'s primary group
     /// when null. Needs `user`.
     group: ?[]const u8 = null,
+    /// Proxies trusted to name the client (load balancers, CDNs): addresses
+    /// or CIDR networks, IPv4 or IPv6. A request from one of them takes its
+    /// client from `real_ip_header`, and only they may connect to a
+    /// `proxy_protocol` listener. Global because the PROXY protocol is read
+    /// before a server is chosen.
+    real_ip_from: []const []const u8 = &.{},
+    /// Header a `real_ip_from` peer names the client in: a comma-separated
+    /// list of addresses, ports allowed. The rightmost address is the
+    /// client. Null ignores headers, for the PROXY protocol alone.
+    real_ip_header: ?[]const u8 = "x-forwarded-for",
+    /// Take the rightmost address in `real_ip_header` that isn't itself in
+    /// `real_ip_from` (the leftmost when all are), for a chain of proxies.
+    real_ip_recursive: bool = false,
 };
 
 pub const LogEscape = enum { default, json };
@@ -93,6 +106,12 @@ pub const Listen = struct {
     quic: bool = false,
     /// Plain TCP listener disabled; only meaningful together with `quic`.
     tcp: bool = true,
+    /// Connections start with a PROXY protocol header (v1 or v2, before
+    /// TLS) naming the client. Only `real_ip_from` peers may connect; others
+    /// are closed at once, as is one whose header is malformed or doesn't
+    /// arrive within `limits.header_timeout_ms`. TCP only: QUIC on the same
+    /// port doesn't use it.
+    proxy_protocol: bool = false,
 };
 
 /// Either `cert` and `key`, or `acme`.
@@ -288,7 +307,7 @@ pub const Location = struct {
     /// IP allow/deny rules, nginx-style: the first rule matching the client
     /// decides, and a client no rule matches is allowed; denied ones get 403.
     /// Replaces the server's `access` when not empty. The client is the TCP
-    /// or QUIC peer; forwarded-for headers are not trusted.
+    /// or QUIC peer, or the one a `real_ip_from` proxy names.
     access: []const AccessRule = &.{},
     /// Ask for a user and password (401 until they match).
     auth_basic: ?AuthBasic = null,
@@ -494,12 +513,14 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
         }
     }
 
+    try checkRealIp(cfg);
     for (cfg.servers) |*srv| {
         if (srv.listen.len == 0) return fail("server without listen", .{});
         for (srv.listen) |l| {
             if ((l.tls or l.quic) and srv.tls == null) return fail("listen :{d} needs server tls", .{l.port});
             if (!l.tcp and !l.quic) return fail("listen :{d} has neither tcp nor quic", .{l.port});
             if (!l.tcp and l.tls) return fail("listen :{d}: tls without tcp", .{l.port});
+            if (!l.tcp and l.proxy_protocol) return fail("listen :{d}: proxy_protocol without tcp", .{l.port});
         }
         if (srv.tls) |t| try checkTls(cfg, srv, t);
         try checkAccess(srv.access, "server");
@@ -531,6 +552,27 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkRealIp(cfg: *const Config) error{InvalidConfig}!void {
+    for (cfg.real_ip_from) |text| {
+        _ = access.parse(.allow, text) catch return fail("real_ip_from '{s}' is not an address or a network", .{text});
+        if (access.hostBitsSet(.allow, text) and !@import("builtin").is_test)
+            std.log.scoped(.config).warn("real_ip_from '{s}' has bits set past its prefix; they are ignored", .{text});
+    }
+    if (cfg.real_ip_header) |h| if (!@import("http/common.zig").isToken(h)) return fail("real_ip_header '{s}' is not a header name", .{h});
+    for (cfg.servers) |srv| for (srv.listen) |l| {
+        if (!l.proxy_protocol) continue;
+        if (cfg.real_ip_from.len == 0) return fail("listen :{d}: proxy_protocol needs real_ip_from, the proxies allowed to send it", .{l.port});
+    };
+    // One TCP socket serves every server naming the address and port.
+    for (cfg.servers, 0..) |srv, i| for (srv.listen) |l| {
+        if (!l.tcp) continue;
+        for (cfg.servers[0 .. i + 1]) |other| for (other.listen) |ol| {
+            if (!ol.tcp or ol.port != l.port or !std.mem.eql(u8, ol.address, l.address)) continue;
+            if (ol.proxy_protocol != l.proxy_protocol) return fail("listen {s}:{d}: servers disagree on proxy_protocol", .{ l.address, l.port });
+        };
+    };
 }
 
 fn checkMatch(alloc: std.mem.Allocator, loc: *const Location) error{ InvalidConfig, OutOfMemory }!void {
@@ -1044,6 +1086,40 @@ test "rewrite rules" {
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .rewrite = .{.{ .regex = "a", .replacement = "/$bad" }} }} }} }
         ,
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .rewrite = .{.{ .regex = "a", .replacement = "/a b" }} }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "trusted proxies and the PROXY protocol" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .real_ip_from = .{ "10.0.0.0/8", "2001:db8::/32", "192.0.2.1" }, .real_ip_recursive = true,
+        \\   .servers = .{.{ .listen = .{ .{ .port = 1, .proxy_protocol = true }, .{ .port = 2 } }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test");
+    try std.testing.expectEqualStrings("x-forwarded-for", cfg.real_ip_header.?);
+    try std.testing.expect(cfg.servers[0].listen[0].proxy_protocol);
+    _ = try parse(a,
+        \\.{ .real_ip_from = .{"10.0.0.1"}, .real_ip_header = null, .servers = .{.{ .listen = .{.{ .port = 1, .proxy_protocol = true }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test");
+
+    const bad = [_][:0]const u8{
+        // proxy_protocol without anyone trusted to send it
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1, .proxy_protocol = true }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        \\.{ .real_ip_from = .{"10.0.0.0/33"}, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        \\.{ .real_ip_from = .{"10.0.0.1"}, .real_ip_header = "x forwarded", .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        \\.{ .real_ip_from = .{"10.0.0.1"}, .servers = .{.{ .listen = .{.{ .port = 1, .quic = true, .tcp = false, .proxy_protocol = true }}, .tls = .{ .cert = "c", .key = "k" }, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+        ,
+        // two servers on one port, one with the PROXY protocol
+        \\.{ .real_ip_from = .{"10.0.0.1"}, .servers = .{
+        \\    .{ .listen = .{.{ .port = 1, .proxy_protocol = true }}, .locations = .{.{ .prefix = "/", .root = "x" }} },
+        \\    .{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} },
+        \\} }
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));

@@ -371,14 +371,18 @@ pub fn formatSockaddr(storage: *const std.posix.sockaddr.storage, buf: []u8) []c
         },
         std.posix.AF.INET6 => {
             const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
-            // IPv4-mapped addresses read better in their v4 form.
-            if (std.mem.eql(u8, in6.addr[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
-                return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ in6.addr[12], in6.addr[13], in6.addr[14], in6.addr[15] }) catch "-";
-            }
-            return formatIp6(in6.addr, buf);
+            return formatIpKey(in6.addr, buf);
         },
         else => return "-",
     }
+}
+
+/// An `ipKey` as text; IPv4-mapped addresses read better in their v4 form.
+pub fn formatIpKey(key: [16]u8, buf: []u8) []const u8 {
+    if (std.mem.eql(u8, key[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
+        return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ key[12], key[13], key[14], key[15] }) catch "-";
+    }
+    return formatIp6(key, buf);
 }
 
 /// RFC 5952 text form: lowercase, longest zero run compressed.

@@ -22,8 +22,11 @@ pub const Var = enum {
     args,
     /// `?` when there is a query string, else empty.
     is_args,
-    /// Client IP address.
+    /// Client IP address: the one a `real_ip_from` proxy names, else the
+    /// TCP or QUIC peer.
     remote_addr,
+    /// The TCP or QUIC peer, whoever it names as the client.
+    realip_remote_addr,
     /// The user `auth_basic` let in; empty otherwise.
     remote_user,
     /// `SUCCESS` when the client presented a certificate that verified
@@ -64,6 +67,7 @@ pub const Request = struct {
     path: []const u8,
     query: ?[]const u8,
     remote_addr: []const u8,
+    realip_remote_addr: []const u8 = "",
     remote_user: []const u8 = "",
     client_cert: ?*const ClientCert = null,
     captures: ?*const regex.Captures = null,
@@ -167,6 +171,7 @@ pub fn append(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Var, req: Re
         .args => try out.appendSlice(alloc, req.query orelse ""),
         .is_args => if (req.query != null) try out.append(alloc, '?'),
         .remote_addr => try out.appendSlice(alloc, req.remote_addr),
+        .realip_remote_addr => try out.appendSlice(alloc, req.realip_remote_addr),
         .remote_user => try out.appendSlice(alloc, req.remote_user),
         .ssl_client_verify => try out.appendSlice(alloc, if (req.client_cert != null) "SUCCESS" else "NONE"),
         .ssl_client_s_dn => if (req.client_cert) |c| try out.appendSlice(alloc, c.s_dn),

@@ -25,6 +25,7 @@ const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
 const auth_pool = @import("auth/pool.zig");
 const regex = @import("regex.zig");
+const realip = @import("realip.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -207,6 +208,8 @@ pub const Worker = struct {
         quic_keys: QuicKeys,
         /// Trust anchors for each verified TLS upstream, by upstream name.
         upstream_cas: []const UpstreamCa = &.{},
+        /// Proxies trusted to name the client.
+        real_ip: realip.Trust = .{},
         access_format: access_log.Format = .main,
         /// Where access log lines go.
         access_fd: std.posix.fd_t = 2,
@@ -607,8 +610,10 @@ pub const Worker = struct {
         if (c.ip_key) |k| self.releaseIp(k);
     }
 
-    /// Count a connection against its client address, process-wide.
-    fn acquireIp(self: *Worker, key: [16]u8) client_limits.Table.Admit {
+    /// Count a connection against its client address, process-wide. A
+    /// trusted proxy isn't: it speaks for many clients.
+    pub fn admitIp(self: *Worker, key: [16]u8) client_limits.Table.Admit {
+        if (self.cfg.limits.max_connections_per_ip == 0 or self.shared.real_ip.trusted(key)) return .untracked;
         const t = self.shared.clients orelse return .untracked;
         return t.acquireConn(self.io, key, self.cfg.limits.max_connections_per_ip, quic.sys.nanoTimestamp());
     }
@@ -648,6 +653,8 @@ pub const Listener = struct {
     servers: std.ArrayListUnmanaged(*const config.Server) = .empty,
     vhosts: router.VirtualHosts = .{ .servers = &.{} },
     tls_config: ?*const tls.ServerConfig,
+    /// Connections open with a PROXY protocol header.
+    proxy_protocol: bool,
     alt_svc: ?[]const u8 = null,
     alt_svc_buf: [48]u8 = undefined,
     retry: timers.Deadline = .{ .callback = onRetryAccept },
@@ -667,7 +674,7 @@ pub const Listener = struct {
         errdefer _ = std.c.close(tcp.fd);
 
         const self = try w.alloc.create(Listener);
-        self.* = .{ .worker = w, .address = l.address, .port = l.port, .tcp = tcp, .tls_config = tc };
+        self.* = .{ .worker = w, .address = l.address, .port = l.port, .tcp = tcp, .tls_config = tc, .proxy_protocol = l.proxy_protocol };
         if (l.quic) {
             self.alt_svc = std.fmt.bufPrint(&self.alt_svc_buf, "h3=\":{d}\"; ma=86400", .{l.port}) catch null;
         }
@@ -784,8 +791,16 @@ pub const Listener = struct {
         }
         stats.inc(&stats.accepted);
         var ip_key: ?[16]u8 = null;
-        if (w.cfg.limits.max_connections_per_ip != 0) {
-            if (socket.peerIpKey(tcp.fd)) |k| switch (w.acquireIp(k)) {
+        if (self.proxy_protocol) {
+            // Counted per IP once the header names the client.
+            const peer = socket.peerIpKey(tcp.fd);
+            if (peer == null or !w.shared.real_ip.trusted(peer.?)) {
+                stats.inc(&stats.refused_proxy_protocol);
+                _ = std.c.close(tcp.fd);
+                return;
+            }
+        } else if (w.cfg.limits.max_connections_per_ip != 0) {
+            if (socket.peerIpKey(tcp.fd)) |k| switch (w.admitIp(k)) {
                 .counted => ip_key = k,
                 .untracked => {},
                 .refused => {

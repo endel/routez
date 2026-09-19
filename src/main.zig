@@ -13,6 +13,8 @@ const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
 const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
+const realip = @import("realip.zig");
+const access = @import("access.zig");
 const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
@@ -245,7 +247,21 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
             try tls_listeners.append(arena, .{ .address = l.address, .port = l.port, .cfg = tc });
         }
     }
-    return .{ .tls_listeners = tls_listeners.items, .quic_keys = quic_keys, .upstream_cas = try loadUpstreamCas(arena, cfg), .guards = guards, .routes = routes };
+    return .{
+        .tls_listeners = tls_listeners.items,
+        .quic_keys = quic_keys,
+        .upstream_cas = try loadUpstreamCas(arena, cfg),
+        .real_ip = try realIpTrust(arena, cfg),
+        .guards = guards,
+        .routes = routes,
+    };
+}
+
+fn realIpTrust(arena: std.mem.Allocator, cfg: *const config.Config) !realip.Trust {
+    const rules = try arena.alloc(access.Rule, cfg.real_ip_from.len);
+    // Validated at parse.
+    for (cfg.real_ip_from, rules) |text, *r| r.* = access.parse(.allow, text) catch return error.InvalidConfig;
+    return .{ .from = rules, .header = cfg.real_ip_header, .recursive = cfg.real_ip_recursive };
 }
 
 /// One bundle per `tls_ca` file, and the system store at most once.
@@ -400,4 +416,6 @@ test {
     _ = @import("auth/pool.zig");
     _ = @import("net/client_cert.zig");
     _ = @import("regex.zig");
+    _ = @import("realip.zig");
+    _ = @import("net/proxy_protocol.zig");
 }

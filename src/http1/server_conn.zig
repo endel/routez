@@ -10,6 +10,8 @@ const timers = @import("../timers.zig");
 const exchange = @import("../exchange.zig");
 const router = @import("../router.zig");
 const tls_transport = @import("../net/tls.zig");
+const proxy_protocol = @import("../net/proxy_protocol.zig");
+const stats = @import("../stats.zig");
 const worker_mod = @import("../worker.zig");
 const Worker = worker_mod.Worker;
 const Listener = worker_mod.Listener;
@@ -51,9 +53,15 @@ pub const Conn = struct {
     processing: bool = false,
     again: bool = false,
 
+    /// The client: the TCP peer, or the one a PROXY protocol header names.
     addr_buf: [64]u8 = undefined,
     addr_len: usize = 0,
     client_ip: [16]u8 = @splat(0),
+    /// The TCP peer, once a PROXY protocol header named another client.
+    peer_buf: [64]u8 = undefined,
+    peer_len: usize = 0,
+    /// Waiting for the PROXY protocol header, ahead of anything else.
+    proxy_pending: bool = false,
 
     next: ?*Conn = null,
     prev: ?*Conn = null,
@@ -80,7 +88,7 @@ pub const Conn = struct {
 
     pub fn create(worker: *Worker, listener: *Listener, tcp: anytype) !*Conn {
         const self = try worker.alloc.create(Conn);
-        self.* = .{ .worker = worker, .listener = listener, .sock = undefined };
+        self.* = .{ .worker = worker, .listener = listener, .sock = undefined, .proxy_pending = listener.proxy_protocol };
         self.sock.init(self, &worker.loop, &worker.timers, worker.alloc, tcp);
         var peer: std.posix.sockaddr.storage = undefined;
         var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
@@ -106,6 +114,10 @@ pub const Conn = struct {
         return self.addr_buf[0..self.addr_len];
     }
 
+    fn peerAddr(self: *const Conn) []const u8 {
+        return if (self.peer_len == 0) self.clientAddr() else self.peer_buf[0..self.peer_len];
+    }
+
     fn limits(self: *const Conn) @TypeOf(self.worker.cfg.limits) {
         return self.worker.cfg.limits;
     }
@@ -113,6 +125,7 @@ pub const Conn = struct {
     // ---- transport ----
 
     pub fn onSocketData(self: *Conn, data: []const u8) void {
+        if (self.proxy_pending) return self.readProxyHeader(data);
         if (self.tls) |t| {
             t.feed(data) catch |err| {
                 log.debug("tls from {s}: {s}", .{ self.clientAddr(), @errorName(err) });
@@ -135,6 +148,36 @@ pub const Conn = struct {
         }
         if (self.phase == .body or self.phase == .tunnel) self.worker.timers.set(&self.deadline, self.limits().io_timeout_ms);
         self.process();
+    }
+
+    /// Buffer the PROXY protocol header and take the client from it; the
+    /// connection's own bytes (TLS or HTTP) follow.
+    fn readProxyHeader(self: *Conn, data: []const u8) void {
+        self.in.appendSlice(self.worker.alloc, data) catch return self.fatal();
+        const h = proxy_protocol.parse(self.in.items) catch {
+            log.debug("bad PROXY protocol header from {s}", .{self.clientAddr()});
+            stats.inc(&stats.refused_proxy_protocol);
+            return self.clientGone();
+        } orelse return;
+        self.proxy_pending = false;
+        if (h.source) |src| {
+            @memcpy(self.peer_buf[0..self.addr_len], self.clientAddr());
+            self.peer_len = self.addr_len;
+            self.client_ip = src.ip;
+            self.addr_len = socket.formatIpKey(src.ip, &self.addr_buf).len;
+        }
+        switch (self.worker.admitIp(self.client_ip)) {
+            .counted => self.ip_key = self.client_ip,
+            .untracked => {},
+            .refused => {
+                stats.inc(&stats.refused_per_ip);
+                return self.clientGone();
+            },
+        }
+        var raw = self.in;
+        self.in = .empty;
+        defer raw.deinit(self.worker.alloc);
+        if (raw.items.len > h.len) self.onSocketData(raw.items[h.len..]);
     }
 
     /// Send plaintext to the client.
@@ -344,6 +387,7 @@ pub const Conn = struct {
             .scheme = if (self.tls != null) "https" else "http",
             .client_addr = self.clientAddr(),
             .client_ip = self.client_ip,
+            .peer_addr = self.peerAddr(),
             .vhosts = &self.listener.vhosts,
             .client_cert = if (self.tls) |t| t.clientCert() else .{},
         }) catch {
@@ -452,7 +496,11 @@ pub const Conn = struct {
     fn onDeadline(d: *timers.Deadline) void {
         const self: *Conn = @fieldParentPtr("deadline", d);
         switch (self.phase) {
-            .head, .closing => self.sock.abort(),
+            .head => {
+                if (self.proxy_pending) stats.inc(&stats.refused_proxy_protocol);
+                self.sock.abort();
+            },
+            .closing => self.sock.abort(),
             .body => self.clientGone(),
             .wait => {
                 // Waiting on the upstream is not the client's fault.

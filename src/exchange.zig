@@ -35,6 +35,8 @@ const htpasswd = @import("auth/htpasswd.zig");
 const auth_pool = @import("auth/pool.zig");
 const basic = @import("auth/basic.zig");
 const regex = @import("regex.zig");
+const realip = @import("realip.zig");
+const socket = @import("net/socket.zig");
 
 pub const Response = struct {
     status: u16,
@@ -105,9 +107,15 @@ pub const Request = struct {
     upgrade: ?[]const u8,
     protocol: Protocol,
     scheme: []const u8,
+    /// The client: the one a trusted proxy names, else the connection's.
     client_addr: []const u8,
     /// The client's IP (IPv4 mapped), keying per-client limits.
     client_ip: [16]u8,
+    /// Where the request came from before `real_ip_header` was applied: the
+    /// PROXY protocol's client or the TCP/QUIC peer. X-Forwarded-For gets it.
+    hop_addr: []const u8,
+    /// The TCP or QUIC peer (`$realip_remote_addr`).
+    peer_addr: []const u8,
 
     pub fn get(self: *const Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -133,8 +141,11 @@ pub const RequestInit = struct {
     upgrade: ?[]const u8 = null,
     protocol: Protocol,
     scheme: []const u8,
+    /// The connection's client: the PROXY protocol's, else the peer.
     client_addr: []const u8,
     client_ip: [16]u8,
+    /// The TCP peer, when the PROXY protocol named another client.
+    peer_addr: ?[]const u8 = null,
     vhosts: *const router.VirtualHosts,
     /// The connection's client certificate; meaningful over TLS and QUIC.
     client_cert: tls.ClientCert = .{},
@@ -207,6 +218,14 @@ pub const Exchange = struct {
         for (init.headers, headers) |src, *dst| {
             dst.* = .{ .name = try a.dupe(u8, src.name), .value = try a.dupe(u8, src.value) };
         }
+        const hop_addr = try a.dupe(u8, init.client_addr);
+        var client_addr = hop_addr;
+        var client_ip = init.client_ip;
+        if (realip.fromHeaders(&worker.shared.real_ip, init.client_ip, init.headers)) |ip| {
+            var buf: [64]u8 = undefined;
+            client_ip = ip;
+            client_addr = try a.dupe(u8, socket.formatIpKey(ip, &buf));
+        }
         const target = try a.dupe(u8, init.target);
         const path_buf = try a.alloc(u8, target.len + 2);
         const norm = router.normalizeTarget(target, path_buf) catch router.Target{ .path = "", .query = null };
@@ -223,8 +242,10 @@ pub const Exchange = struct {
             .upgrade = if (init.upgrade) |u| try a.dupe(u8, u) else null,
             .protocol = init.protocol,
             .scheme = init.scheme,
-            .client_addr = try a.dupe(u8, init.client_addr),
-            .client_ip = init.client_ip,
+            .client_addr = client_addr,
+            .client_ip = client_ip,
+            .hop_addr = hop_addr,
+            .peer_addr = if (init.peer_addr) |p| try a.dupe(u8, p) else hop_addr,
         };
         // By transport: an HTTP/3 request may claim any :scheme.
         if (init.client_cert.secure) {
@@ -653,6 +674,7 @@ pub const Exchange = struct {
             .path = self.req.path,
             .query = self.req.query,
             .remote_addr = self.req.client_addr,
+            .realip_remote_addr = self.req.peer_addr,
             .remote_user = self.remote_user,
             .client_cert = self.client_cert,
             .captures = &self.captures,

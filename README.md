@@ -45,6 +45,9 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Access control: IP allow/deny rules, Basic auth against htpasswd files
   (bcrypt checked off the event loop), and client certificates (mutual TLS)
   over TLS and HTTP/3, with the client's identity in variables.
+- Trusted proxies: behind a load balancer, the client's address comes from
+  `X-Forwarded-For` (nginx's `real_ip_from`) or the PROXY protocol (v1 and
+  v2), for IP rules, limits, variables and logs alike.
 - Operations: drops root after binding (`user`, `group`), access and error
   log files reopened on SIGUSR1 for rotation, access log formats (nginx's
   `combined`, JSON lines, or a template of variables), a runtime log level,
@@ -242,7 +245,9 @@ apply to WebTransport CONNECTs.
   share each client's bucket (they must agree on `rate`; each has its own
   `burst`); a location without one has its own.
 - `limits.max_connections_per_ip` caps the TCP connections (HTTP and TLS)
-  one address holds; more are closed at accept.
+  one address holds; more are closed at accept. A `real_ip_from` proxy
+  isn't counted, and on a `proxy_protocol` listener the client its header
+  names is (see [Trusted proxies](#trusted-proxies)).
 - Both count across all workers, and across a reload: buckets carry over
   (a zone by name, an unnamed one by server name, listen address and
   prefix), and connections accepted by the old workers count until they
@@ -289,8 +294,8 @@ HTTP/3 and WebTransport CONNECTs alike.
   IPv4 or IPv6; the first rule matching the client decides, and a client
   none matches is allowed (as in nginx). A location's `access` replaces its
   server's. IPv4 rules also match IPv4-mapped IPv6 peers. The client is the
-  TCP or QUIC peer: `X-Forwarded-For` is not trusted, and there is no
-  `real_ip_from` yet, so behind another proxy the rules see that proxy.
+  TCP or QUIC peer, or the one a trusted proxy names (see
+  [Trusted proxies](#trusted-proxies)).
 - **Basic auth**: `auth_basic` answers 401 with
   `WWW-Authenticate: Basic realm="..."` until the credentials match the
   htpasswd file. Entries may be bcrypt (`htpasswd -B`; cost 4 to 16) or
@@ -323,6 +328,60 @@ HTTP/3 and WebTransport CONNECTs alike.
   for such a server, so a resumed session can never skip the certificate.
   `client_verify` means nothing on a plain-HTTP listener: don't serve the
   same locations there, or mark them `require_client_cert`.
+
+### Trusted proxies
+
+Behind a load balancer every client is the balancer, unless routez is told
+which proxies to believe:
+
+```zig
+.{
+    .real_ip_from = .{ "10.0.0.0/8", "2001:db8::/32" },
+    .real_ip_header = "x-forwarded-for", // the default; null for the PROXY protocol alone
+    .real_ip_recursive = true,           // for a chain of proxies
+    .servers = .{.{
+        .listen = .{
+            .{ .port = 80 },
+            // Behind an L4 balancer: HAProxy's send-proxy, AWS NLB, ...
+            .{ .port = 443, .tls = true, .proxy_protocol = true },
+        },
+        ...
+    }},
+}
+```
+
+- **Header**: a request from a `real_ip_from` peer takes its client from
+  `real_ip_header`, a comma-separated list of addresses (ports allowed,
+  several header lines read as one list). Without `real_ip_recursive` the
+  rightmost address is the client; with it, the rightmost that isn't itself
+  in `real_ip_from` (the leftmost if they all are), so
+  `X-Forwarded-For: client, proxy1` from `proxy2` names `client` when
+  `proxy1` is trusted. From any other peer the header means nothing. An
+  address in the walk that doesn't parse leaves the peer as the client, as
+  in nginx.
+- **PROXY protocol**: on a TCP listener with `proxy_protocol = true`, every
+  connection opens with a v1 or v2 header, ahead of TLS, and the client it
+  names is the connection's for its lifetime. Only `real_ip_from` peers may
+  connect; others are closed at accept. So is a connection whose header is
+  malformed (a v1 line over 107 bytes, a v2 header over 4 KiB, anything the
+  spec doesn't allow) or hasn't arrived within `limits.header_timeout_ms`;
+  `routez_connections_refused_proxy_protocol_total` counts them. `LOCAL`
+  connections (the balancer's health checks), `UNKNOWN` and UNIX-socket
+  sources keep the peer's address; TLVs are skipped. If the client the
+  header names is itself in `real_ip_from`, its `X-Forwarded-For` counts.
+- **Where it applies**: IP rules, `limit_req`, `auth_basic`'s per-client
+  rate limit, `ip_hash`, `$remote_addr`, access logs and the `X-Real-IP`
+  sent upstream all see the real client, over HTTP/1.1, HTTPS, HTTP/3 and
+  WebTransport CONNECTs. `$realip_remote_addr` is the TCP or QUIC peer.
+  `X-Forwarded-For` upstream gets the address the request came from
+  appended (the peer, or the PROXY protocol's client), so the list stays
+  one entry per hop.
+- `max_connections_per_ip` is decided at accept, before any header: a
+  `real_ip_from` peer isn't counted, and on a `proxy_protocol` listener the
+  client the header names is counted instead. Clients a proxy names in a
+  header are bound by `limit_req` and `max_connections` only.
+- These settings are global, not per server: the PROXY header is read
+  before SNI or `Host` has chosen a server.
 
 ### Operations
 
@@ -366,7 +425,7 @@ HTTP/3 and WebTransport CONNECTs alike.
   upstream server requests, failures and health-check state, reloads,
   QUIC datagrams steered between workers, workers, start time and version,
   connections and requests refused by the client limits and the occupancy
-  of their table.
+  of their table, and connections refused on PROXY protocol listeners.
   Counters are process-wide and survive reloads. Restrict it like any
   location, for instance on a listener bound to a private address.
 
@@ -390,7 +449,8 @@ HTTP/3 and WebTransport CONNECTs alike.
 | `$request_uri` | path and query as the client sent them |
 | `$uri` | normalized path (dot segments resolved), percent-encoded; after a rewrite, the new one |
 | `$args`, `$is_args` | query string without the `?`; `?` if there is one |
-| `$remote_addr` | client IP |
+| `$remote_addr` | client IP: the one a trusted proxy names, else the TCP or QUIC peer |
+| `$realip_remote_addr` | the TCP or QUIC peer, whoever it names |
 | `$remote_user` | the user `auth_basic` let in |
 | `$ssl_client_verify` | `SUCCESS` for a verified client certificate, else `NONE` |
 | `$ssl_client_s_dn`, `$ssl_client_i_dn` | its subject and issuer, RFC 4514 (`CN=alice,O=Example`) |
@@ -556,9 +616,10 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   post-handshake authentication, so a location can't ask for a certificate
   the handshake didn't; a server's `client_ca` applies to its whole name.
   Connections to a `client_ca` server are never resumed from a ticket.
-- IP rules see the TCP or QUIC peer only; there is no trusted-proxy
-  (`real_ip_from`) support. A literal `proxy_pass` target is always plain HTTP;
-  declare an upstream to use TLS.
+- The PROXY protocol is read on TCP listeners only: not by QUIC on the same
+  port or by the UDP proxy, and routez doesn't send it to upstreams.
+- A literal `proxy_pass` target is always plain HTTP; declare an upstream
+  to use TLS.
 - Regular expressions lack backreferences, lookaround, named groups,
   inline flags, Unicode classes and POSIX classes (`[[:alpha:]]`); they
   match bytes, and case-insensitive matching is ASCII only.

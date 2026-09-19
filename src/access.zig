@@ -3,8 +3,8 @@
 //! allowed. Addresses are compared as IPv6, IPv4 in its mapped form, so
 //! `10.0.0.0/8` also matches a dual-stack socket's `::ffff:10.1.2.3`.
 //!
-//! The client is the TCP or QUIC peer. `X-Forwarded-For` and the like are
-//! never trusted: behind another proxy, every client is that proxy.
+//! The client is the TCP or QUIC peer, or the one a `real_ip_from` proxy
+//! names (`realip.zig`).
 const std = @import("std");
 
 pub const Action = enum { allow, deny };

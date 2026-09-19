@@ -442,6 +442,68 @@ sed "s|$ACL/cca.crt|$ACL/missing.crt|g" "$ACL/routez.zon" > "$ACL/noca.zon"
 "$ROOT/zig-out/bin/routez" -t "$ACL/noca.zon" 2> "$ACL/t.log"
 SUITE=acl check test-needs-client-ca "$? $(grep -c 'client_ca' "$ACL/t.log")" "1 1"
 
+# Trusted proxies: 127.0.0.1 is one, ::1 isn't. X-Forwarded-For from a
+# trusted peer names the client; PROXY protocol listeners take only trusted
+# peers, the header ahead of TLS or HTTP.
+RIP="$WORK/realip"; mkdir -p "$RIP"
+cat > "$RIP/routez.zon" <<EOF2
+.{ .access_log_path = "$RIP/access.log", .access_log_format = "\$remote_addr \$realip_remote_addr \$request_uri",
+   .real_ip_from = .{ "127.0.0.1", "10.0.0.0/8" },
+   .limits = .{ .header_timeout_ms = 1500 },
+   .servers = .{.{
+    .listen = .{
+        .{ .address = "127.0.0.1", .port = 18520 },
+        .{ .address = "::1", .port = 18521 },
+        .{ .address = "127.0.0.1", .port = 18522, .proxy_protocol = true },
+        .{ .address = "127.0.0.1", .port = 18523, .tls = true, .proxy_protocol = true },
+        .{ .address = "::1", .port = 18524, .proxy_protocol = true },
+        .{ .address = "127.0.0.1", .port = 18525, .tls = true, .quic = true },
+    },
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{
+        .{ .prefix = "/echo/", .proxy_pass = "127.0.0.1:19001",
+           .proxy_set_headers = .{ .{ .name = "x-remote", .value = "\$remote_addr" }, .{ .name = "x-realip", .value = "\$realip_remote_addr" } } },
+        .{ .prefix = "/deny/", .@"return" = .{ .body = "in" }, .access = .{ .{ .deny = "203.0.113.7" }, .{ .deny = "2001:db8::7" }, .{ .allow = "all" } } },
+        .{ .prefix = "/limited", .@"return" = .{ .body = "ok" }, .limit_req = .{ .rate = 1 } },
+    },
+  }},
+}
+EOF2
+"$ROOT/zig-out/bin/routez" "$RIP/routez.zon" 2> "$RIP/server.log" & RIPD=$!; PIDS+=($RIPD)
+wait_port 18520
+RCURL="$CURL_BIN -s --max-time 10"
+hdrs() { python3 -c 'import json,sys; h=json.load(sys.stdin)["headers"]; print(" | ".join(str(h.get(k)) for k in sys.argv[1:]))' "$@"; }
+PP="$PY_TLS $HERE/proxy_protocol.py"
+SUITE=realip check header-trusted "$($RCURL -H 'X-Forwarded-For: 198.51.100.1, 203.0.113.9' http://127.0.0.1:18520/echo/ | hdrs x-remote x-realip X-Forwarded-For X-Real-IP)" \
+    "203.0.113.9 | 127.0.0.1 | 198.51.100.1, 203.0.113.9, 127.0.0.1 | 203.0.113.9"
+SUITE=realip check header-deny "$($RCURL -o /dev/null -w '%{http_code} ' -H 'X-Forwarded-For: 203.0.113.7' http://127.0.0.1:18520/deny/)$($RCURL -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 203.0.113.8' http://127.0.0.1:18520/deny/)" "403 200"
+SUITE=realip check header-untrusted "$($RCURL -g -H 'X-Forwarded-For: 203.0.113.7' 'http://[::1]:18521/echo/' | hdrs x-remote) $($RCURL -g -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 203.0.113.7' 'http://[::1]:18521/deny/')" "::1 200"
+SUITE=realip check header-rightmost "$($RCURL -H 'X-Forwarded-For: 203.0.113.9, 10.1.2.3' http://127.0.0.1:18520/echo/ | hdrs x-remote)" "10.1.2.3"
+SUITE=realip check header-limit-req "$(for ip in 192.0.2.1 192.0.2.1 192.0.2.2; do $RCURL -o /dev/null -w '%{http_code} ' -H "X-Forwarded-For: $ip" http://127.0.0.1:18520/limited; done)" "200 429 200 "
+if $CURL_BIN --version | grep -q HTTP3; then
+    SUITE=realip check header-h3 "$($RCURL --http3-only --cacert $CERTS/ca.crt -H 'X-Forwarded-For: 203.0.113.9' https://127.0.0.1:18525/echo/ | hdrs x-remote x-realip)" "203.0.113.9 | 127.0.0.1"
+fi
+SUITE=realip check proxy-v1 "$($PP 127.0.0.1 18522 v1:198.51.100.4 /echo/ | hdrs x-remote x-realip X-Forwarded-For)" "198.51.100.4 | 127.0.0.1 | 198.51.100.4"
+SUITE=realip check proxy-v2-tls "$($PP 127.0.0.1 18523 v2:2001:db8::5 /echo/ --tls | hdrs x-remote x-realip)" "2001:db8::5 | 127.0.0.1"
+SUITE=realip check proxy-v2-deny "$($PP 127.0.0.1 18522 v2:2001:db8::7 /deny/ --status) $($PP 127.0.0.1 18522 v1:203.0.113.8 /deny/ --status)" "403 200"
+SUITE=realip check proxy-v2-local "$($PP 127.0.0.1 18522 v2-local /echo/ | hdrs x-remote)" "127.0.0.1"
+# The PROXY protocol's client is itself a trusted proxy: its header counts.
+SUITE=realip check proxy-then-header "$($PP 127.0.0.1 18522 v2:10.0.0.9 /echo/ --xff 203.0.113.9 | hdrs x-remote x-realip X-Forwarded-For) / $($PP 127.0.0.1 18522 v1:198.51.100.4 /echo/ --xff 203.0.113.9 | hdrs x-remote)" \
+    "203.0.113.9 | 127.0.0.1 | 203.0.113.9, 10.0.0.9 / 198.51.100.4"
+SUITE=realip check proxy-untrusted-peer "$($PP ::1 18524 v1:198.51.100.4 /echo/)" "closed"
+SUITE=realip check proxy-missing "$($PP 127.0.0.1 18522 none /echo/) $($PP 127.0.0.1 18523 none /echo/ --tls)" "closed closed"
+SUITE=realip check proxy-timeout "$($PP 127.0.0.1 18522 silent /)" "closed"
+SUITE=realip check access-log "$(grep -c '^203.0.113.9 127.0.0.1 /echo/$' "$RIP/access.log") $(grep -c '^198.51.100.4 127.0.0.1 /echo/$' "$RIP/access.log")" "$($CURL_BIN --version | grep -q HTTP3 && echo '3 2' || echo '2 2')"
+sed 's|\.real_ip_from|.real_ip_recursive = true, .real_ip_from|' "$RIP/routez.zon" > "$RIP/r.zon" && mv "$RIP/r.zon" "$RIP/routez.zon"
+kill -HUP $RIPD
+for _ in $(seq 1 50); do [ "$($RCURL -H 'X-Forwarded-For: 203.0.113.9, 10.1.2.3' http://127.0.0.1:18520/echo/ | hdrs x-remote)" == 203.0.113.9 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
+SUITE=realip check recursive "$($RCURL -H 'X-Forwarded-For: 198.51.100.1, 203.0.113.9, 10.1.2.3' -H 'X-Forwarded-For: 10.0.0.2' http://127.0.0.1:18520/echo/ | hdrs x-remote) $($RCURL -H 'X-Forwarded-For: 10.0.0.5, 10.0.0.6' http://127.0.0.1:18520/echo/ | hdrs x-remote)" "203.0.113.9 10.0.0.5"
+kill $RIPD; wait $RIPD 2>/dev/null
+if grep -qiE "panic|segmentation" "$RIP/server.log"; then fail=$((fail+1)); echo "FAIL realip server crashed:"; tail -20 "$RIP/server.log"; fi
+sed 's|\.real_ip_from = .{ "127.0.0.1", "10.0.0.0/8" },||' "$RIP/routez.zon" > "$RIP/untrusted.zon"
+"$ROOT/zig-out/bin/routez" -t "$RIP/untrusted.zon" 2> "$RIP/t.log"
+SUITE=realip check test-needs-real-ip-from "$? $(grep -c 'proxy_protocol needs real_ip_from' "$RIP/t.log")" "1 1"
+
 # Operations: JSON access log to a file, reopened on SIGUSR1; error log at
 # warn; Prometheus metrics; a key that isn't the certificate's.
 OPS="$WORK/ops"; mkdir -p "$OPS"

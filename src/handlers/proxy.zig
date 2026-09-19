@@ -126,9 +126,9 @@ pub const Proxy = struct {
         // Configured values replace these too.
         if (findSet(set, "x-forwarded-for") == null) {
             if (xff) |prev| {
-                try head.print(a, "X-Forwarded-For: {s}, {s}\r\n", .{ prev, ex.req.client_addr });
+                try head.print(a, "X-Forwarded-For: {s}, {s}\r\n", .{ prev, ex.req.hop_addr });
             } else {
-                try head.print(a, "X-Forwarded-For: {s}\r\n", .{ex.req.client_addr});
+                try head.print(a, "X-Forwarded-For: {s}\r\n", .{ex.req.hop_addr});
             }
         }
         if (findSet(set, "x-real-ip") == null) try head.print(a, "X-Real-IP: {s}\r\n", .{ex.req.client_addr});

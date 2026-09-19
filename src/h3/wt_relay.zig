@@ -25,6 +25,7 @@ const upstream = @import("../upstream.zig");
 const stats = @import("../stats.zig");
 const Worker = @import("../worker.zig").Worker;
 const access = @import("../access.zig");
+const realip = @import("../realip.zig");
 const guard = @import("../guard.zig");
 const htpasswd = @import("../auth/htpasswd.zig");
 const auth_pool = @import("../auth/pool.zig");
@@ -385,7 +386,7 @@ pub fn Relay(comptime Listener: type) type {
 
             // The checks `Exchange.start` makes of a request.
             const pol = w.shared.guards.policy(loc);
-            const ip = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
+            const ip = clientIp(w, session, headers);
             if (access.check(pol.rules, ip) == .deny) return answer(session, session_id, "403", null);
             const want = w.shared.guards.clientAuth(srv);
             if (want != null and session.clientAuth() != want) return answer(session, session_id, "421", null);
@@ -412,7 +413,7 @@ pub fn Relay(comptime Listener: type) type {
             const w = l.worker;
             const group = w.findGroup(loc.webtransport_pass.?) orelse return refuse(session, session_id);
             var client_buf: [64]u8 = undefined;
-            const client_addr = socket.formatSockaddr(session.entry.conn.peerAddress(), &client_buf);
+            const client_addr = socket.formatIpKey(clientIp(w, session, headers), &client_buf);
             const peer = group.pick(client_addr, &.{}) orelse return refuse(session, session_id);
             stats.inc(&peer.stats.requests);
 
@@ -420,6 +421,12 @@ pub fn Relay(comptime Listener: type) type {
                 log.warn("relay to {s}: {s}", .{ peer.label, @errorName(err) });
                 refuse(session, session_id);
             };
+        }
+
+        /// The one a trusted proxy names in the CONNECT's headers, else the peer.
+        fn clientIp(w: *Worker, session: *event_loop.Session, headers: []const qpack.Header) [16]u8 {
+            const peer = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
+            return realip.fromHeaders(&w.shared.real_ip, peer, headers) orelse peer;
         }
 
         fn refuse(session: *event_loop.Session, session_id: u64) void {

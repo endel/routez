@@ -12,6 +12,9 @@ pub var active_quic: std.atomic.Value(u64) = .init(0);
 pub var requests: std.atomic.Value(u64) = .init(0);
 pub var requests_h3: std.atomic.Value(u64) = .init(0);
 pub var refused_per_ip: std.atomic.Value(u64) = .init(0);
+/// Connections to a `proxy_protocol` listener from an untrusted peer, or
+/// whose header was malformed or late.
+pub var refused_proxy_protocol: std.atomic.Value(u64) = .init(0);
 /// Requests answered 429 by `limit_req`.
 pub var requests_limited: std.atomic.Value(u64) = .init(0);
 /// QUIC datagrams handed to the worker owning their connection.
@@ -135,6 +138,8 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_connections_active{{protocol=\"quic\"}} {d}\n", .{load(&active_quic)});
     try header(w, "routez_connections_refused_per_ip_total", "counter", "TCP connections refused by limits.max_connections_per_ip.");
     try w.print("routez_connections_refused_per_ip_total {d}\n", .{load(&refused_per_ip)});
+    try header(w, "routez_connections_refused_proxy_protocol_total", "counter", "TCP connections refused on proxy_protocol listeners: an untrusted peer, or a bad or missing header.");
+    try w.print("routez_connections_refused_proxy_protocol_total {d}\n", .{load(&refused_proxy_protocol)});
     try header(w, "routez_http_requests_limited_total", "counter", "Requests refused with 429 by limit_req.");
     try w.print("routez_http_requests_limited_total {d}\n", .{load(&requests_limited)});
     try header(w, "routez_limit_table_entries", "gauge", "Client entries held for max_connections_per_ip and limit_req.");

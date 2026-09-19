@@ -15,6 +15,9 @@ const access = @import("access.zig");
 const htpasswd = @import("auth/htpasswd.zig");
 const client_cert = @import("net/client_cert.zig");
 const regex = @import("regex.zig");
+const proxy_protocol = @import("net/proxy_protocol.zig");
+const realip = @import("realip.zig");
+const socket = @import("net/socket.zig");
 
 const request_seeds = [_][]const u8{
     "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
@@ -136,6 +139,49 @@ test "fuzz: access rules" {
             if (r.bits <= 120) try testing.expect(r.matches(ip));
         }
     }.f, &.{ "10.0.0.0/8", "2001:db8::/32", "all", "::ffff:10.0.0.0/104", "192.0.2.1", "fe80::1/64" });
+}
+
+test "fuzz: PROXY protocol header" {
+    try mutate(struct {
+        fn f(input: []const u8) anyerror!void {
+            const h = (proxy_protocol.parse(input) catch return) orelse {
+                // Incomplete: so is every shorter prefix.
+                if (input.len > 0) try testing.expect((proxy_protocol.parse(input[0 .. input.len / 2]) catch return error.PrefixRejected) == null);
+                return;
+            };
+            try testing.expect(h.len > 0 and h.len <= input.len);
+            try testing.expect(h.len <= @as(usize, if (input[0] == 'P') proxy_protocol.v1_max else proxy_protocol.v2_max));
+            // The header alone parses the same; one byte short, it's incomplete.
+            const alone = (try proxy_protocol.parse(input[0..h.len])).?;
+            try testing.expectEqual(h.len, alone.len);
+            try testing.expectEqualDeep(h.source, alone.source);
+            try testing.expectEqual(@as(?proxy_protocol.Header, null), try proxy_protocol.parse(input[0 .. h.len - 1]));
+        }
+    }.f, &.{
+        "PROXY TCP4 198.51.100.4 192.0.2.1 56324 443\r\nGET / HTTP/1.1\r\n",
+        "PROXY TCP6 2001:db8::5 2001:db8::1 65535 80\r\n",
+        "PROXY UNKNOWN\r\n",
+        proxy_protocol.v2_signature ++ "\x21\x11\x00\x0c\xcb\x00\x71\x07\xc0\x00\x02\x01\x1f\x90\x01\xbb",
+        proxy_protocol.v2_signature ++ "\x21\x21\x00\x27" ++ "\x20\x01\x0d\xb8" ++ "\x00" ** 32 ++ "\x00\x50\x01\xbb\x04\x00\x00",
+        proxy_protocol.v2_signature ++ "\x20\x00\x00\x00",
+    });
+}
+
+test "fuzz: forwarded-for" {
+    try mutate(struct {
+        fn f(input: []const u8) anyerror!void {
+            const rules = [_]access.Rule{ try access.parse(.allow, "10.0.0.0/8"), try access.parse(.allow, "2001:db8::/32") };
+            const peer: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
+            const hs = [_]common.Header{ .{ .name = "x-forwarded-for", .value = input }, .{ .name = "X-Forwarded-For", .value = "10.0.0.2" } };
+            for ([_]bool{ false, true }) |recursive| {
+                const trust: realip.Trust = .{ .from = &rules, .header = "x-forwarded-for", .recursive = recursive };
+                const ip = realip.fromHeaders(&trust, peer, &hs) orelse continue;
+                // Whatever it names prints as an address that parses back to it.
+                var buf: [64]u8 = undefined;
+                try testing.expectEqual(ip, realip.parseEntry(socket.formatIpKey(ip, &buf)).?);
+            }
+        }
+    }.f, &.{ "203.0.113.9", "198.51.100.1, 10.0.0.3", "[2001:db8::1]:443, 192.0.2.1:80", " , ::ffff:10.1.1.1 ,", "2001:db9::1" });
 }
 
 test "fuzz: htpasswd and Authorization" {
