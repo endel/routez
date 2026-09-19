@@ -14,6 +14,7 @@ const guard = @import("guard.zig");
 const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
 const file_io = @import("file_io.zig");
+const open_file_cache = @import("open_file_cache.zig");
 const realip = @import("realip.zig");
 const access = @import("access.zig");
 const build_options = @import("build_options");
@@ -105,7 +106,10 @@ const Generation = struct {
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
         if (g.shared.guards.any_auth) g.shared.auth_pool = try authPool(io);
-        if (servesFiles(&g.cfg)) g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
+        if (servesFiles(&g.cfg)) {
+            g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
+            g.shared.open_file_cache_max = open_file_cache.effectiveMax(g.cfg.open_file_cache.max, g.cfg.workers);
+        }
         g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
         if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
             g.access_file = logs.acquire(io, p) catch |err| {
@@ -453,6 +457,7 @@ test {
     _ = @import("auth/verify.zig");
     _ = @import("auth/pool.zig");
     _ = @import("file_io.zig");
+    _ = @import("open_file_cache.zig");
     _ = @import("net/client_cert.zig");
     _ = @import("regex.zig");
     _ = @import("realip.zig");

@@ -18,7 +18,7 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   files, directory redirects, path normalization, `try_files` fallbacks for
   single-page apps. Opened and read on I/O threads, so a slow disk stalls
   only the requests reading from it; what the page cache holds is served
-  straight from the worker.
+  straight from the worker, with an open-file cache.
 - Reverse proxy to HTTP/1.1 upstreams, plain or over TLS 1.3 (quic-zig's
   sans-IO `tls_client`, with optional certificate verification and client
   certificates): streaming
@@ -161,6 +161,25 @@ A ZON file; see `src/config.zig` for every field and default.
   (`RWF_NOWAIT`, or `mincore` on filesystems without it, such as overlayfs).
   When 1024 new lookups are already waiting for a thread, further requests
   get 503.
+- Each worker keeps what its lookups found, like nginx's `open_file_cache`
+  with `open_file_cache_errors on`: open descriptors with their size, mtime
+  and inode, and paths that don't exist or are directories. `try_files`
+  entries and precompressed variants are cached the same way. On by
+  default:
+
+  ```zig
+  .open_file_cache = .{ .max = 1000, .valid_ms = 1000, .inactive_ms = 60_000 },
+  ```
+
+  An entry is used for `valid_ms`; after that the path is opened and
+  stat-ed again, and a file replaced (renamed over), created or deleted
+  shows. `max` counts entries per worker (0 turns the cache off) and is
+  lowered at start, with a log line, so that all workers' cached
+  descriptors stay within a quarter of `RLIMIT_NOFILE`. Entries unused for
+  `inactive_ms` are closed. A reload starts with empty caches. Within
+  `valid_ms`, a file edited in place is served with its old length and
+  ETag: truncated, its response is cut short (the connection closes); grown,
+  the extra bytes are left out.
 - Servers sharing a listen address are virtual hosts, chosen by `Host`
   (exact name, then one-label wildcard, then the first server).
 - TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
@@ -636,7 +655,7 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
 | TLS: new connection per request | 12k | 10k | 16k |
 
 - HAProxy isn't a file server. nginx has `sendfile` on; routez copies files
-  through userspace.
+  through userspace. The static rows predate routez's open-file cache.
 - TLS is 1.3 with AES-128-GCM and X25519 everywhere, routez's own choice;
   nginx and HAProxy are pinned to it.
 - The last row measures resumed handshakes: wrk reuses the session on each
@@ -670,8 +689,9 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   `max_connections` and `limit_req` bound QUIC clients instead.
 - A disk that stalls for good ties up an I/O thread per request reading
   from it; once all are taken, other static requests wait too (proxied
-  ones don't). On macOS every static request takes a round trip to an I/O
-  thread to open its file: nothing there can tell that an open won't wait.
+  ones don't). On macOS a lookup the open-file cache can't answer (a path's
+  first request, or its first after `valid_ms`) takes a round trip to an
+  I/O thread: nothing there can tell that an open won't wait.
 - Compression on the fly is gzip only: Zig's standard library has no
   Brotli or zstd encoder, and a small one written here would compress worse
   than gzip. Precompress with `brotli` or `zstd` at build time and serve the

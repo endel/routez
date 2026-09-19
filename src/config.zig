@@ -29,6 +29,8 @@ pub const Config = struct {
     /// slow disk stalls only the requests reading from it. Read at start;
     /// a reload doesn't change it.
     file_io_threads: u16 = 4,
+    /// Descriptors and metadata of static files kept by each worker.
+    open_file_cache: OpenFileCache = .{},
     servers: []const Server = &.{},
     upstreams: []const Upstream = &.{},
     /// Layer-4 UDP forwarding, for QUIC traffic we don't terminate.
@@ -73,6 +75,21 @@ pub const Config = struct {
 };
 
 pub const LogEscape = enum { default, json };
+
+/// nginx's `open_file_cache`, with its `open_file_cache_errors` always on:
+/// paths that don't exist are remembered too.
+pub const OpenFileCache = struct {
+    /// Entries per worker, least recently used evicted first; 0 turns the
+    /// cache off. Lowered at start so all workers' cached descriptors stay
+    /// within a quarter of RLIMIT_NOFILE.
+    max: u32 = 1000,
+    /// How long an entry is served before the path is opened and stat-ed
+    /// again: the longest a change on disk (a file replaced, created or
+    /// deleted) can go unseen.
+    valid_ms: u32 = 1000,
+    /// Entries unused this long are closed.
+    inactive_ms: u32 = 60_000,
+};
 
 pub const Limits = struct {
     /// Largest request or response head (request line + headers) accepted.

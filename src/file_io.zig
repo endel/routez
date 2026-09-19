@@ -169,9 +169,10 @@ pub const Meta = struct {
     kind: std.Io.File.Kind,
     size: u64,
     mtime_s: i64,
+    inode: u64,
 
     pub fn of(st: std.Io.File.Stat) Meta {
-        return .{ .kind = st.kind, .size = st.size, .mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s)) };
+        return .{ .kind = st.kind, .size = st.size, .mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s)), .inode = @intCast(st.inode) };
     }
 };
 
@@ -231,11 +232,11 @@ const linux_cached = struct {
     /// a network filesystem isn't asked.
     pub fn stat(file: std.Io.File) error{WouldBlock}!Meta {
         var stx: linux.Statx = undefined;
-        const rc = linux.statx(file.handle, "", linux.AT.EMPTY_PATH | linux.AT.STATX_DONT_SYNC, .{ .TYPE = true, .SIZE = true, .MTIME = true }, &stx);
+        const rc = linux.statx(file.handle, "", linux.AT.EMPTY_PATH | linux.AT.STATX_DONT_SYNC, .{ .TYPE = true, .SIZE = true, .MTIME = true, .INO = true }, &stx);
         if (linux.errno(rc) != .SUCCESS) return error.WouldBlock;
-        if (!stx.mask.TYPE or !stx.mask.SIZE or !stx.mask.MTIME) return error.WouldBlock;
+        if (!stx.mask.TYPE or !stx.mask.SIZE or !stx.mask.MTIME or !stx.mask.INO) return error.WouldBlock;
         const kind: std.Io.File.Kind = if (linux.S.ISREG(stx.mode)) .file else if (linux.S.ISDIR(stx.mode)) .directory else .unknown;
-        return .{ .kind = kind, .size = stx.size, .mtime_s = stx.mtime.sec };
+        return .{ .kind = kind, .size = stx.size, .mtime_s = stx.mtime.sec, .inode = stx.ino };
     }
 
     /// preadv2 with RWF_NOWAIT: only what's in the page cache, possibly

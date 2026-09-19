@@ -8,10 +8,10 @@
 //! further chunk. At most one read is out at a time, and the next is only
 //! asked for while the downstream has room.
 //!
-//! Where the kernel can tell an answer is cached, the loop takes it itself:
-//! the lookup on Linux (openat2 with RESOLVE_CACHED), and reads everywhere
-//! (RWF_NOWAIT, else mincore). A cached file then costs no round trip on
-//! Linux, and one on macOS.
+//! Most requests take none: every path looked at goes into the worker's
+//! open-file cache (`open_file_cache.zig`), and where the kernel can tell an
+//! answer is cached, the loop takes it itself: the lookup on Linux (openat2
+//! with RESOLVE_CACHED), reads everywhere (RWF_NOWAIT, else mincore).
 const std = @import("std");
 const build_options = @import("build_options");
 const common = @import("../http/common.zig");
@@ -22,11 +22,19 @@ const Header = common.Header;
 const encoding = @import("../encoding.zig");
 const gzip = @import("../gzip.zig");
 const file_io = @import("../file_io.zig");
+const ofc = @import("../open_file_cache.zig");
+const timers = @import("../timers.zig");
 const Coding = encoding.Coding;
 
 const chunk_size = 32 * 1024;
 const n_codings = std.meta.fields(Coding).len;
 const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
+
+/// A path looked at for this response, and what was there.
+const Probe = struct {
+    path: [:0]const u8,
+    answer: ofc.Answer,
+};
 
 /// One response's file work. Kept on the heap until its last job is back,
 /// so a request that goes away mid-read leaves the I/O thread nothing
@@ -39,8 +47,9 @@ pub const Transfer = struct {
     loc: *const config.Location,
     io: std.Io,
     gpa: std.mem.Allocator,
-    /// Holds `candidates`: the I/O thread reads them, so they can't live in
-    /// the exchange's arena.
+    cache: *ofc.Cache,
+    /// Holds `candidates` and `probes`: the I/O thread reads them, so they
+    /// can't live in the exchange's arena.
     arena: std.heap.ArenaAllocator,
     /// A job is out: until it's back, the fields below are the I/O thread's.
     busy: bool = false,
@@ -61,9 +70,14 @@ pub const Transfer = struct {
     prefetch: bool = false,
 
     // What was found.
+    /// Paths answered so far, each holding its entry: a lookup that the
+    /// loop gave up on continues on an I/O thread from here.
+    probes: std.ArrayListUnmanaged(Probe) = .empty,
     result: Result = .{ .status = 500 },
-    file: ?std.Io.File = null,
-    meta: file_io.Meta = undefined,
+    /// The file served, while looking: an entry of `probes`.
+    found: ?*ofc.Entry = null,
+    /// The file served, once looked up; holds a reference.
+    entry: ?*ofc.Entry = null,
     coding: ?Coding = null,
     /// The candidate served (or whose variant is), which gives the type.
     chosen: usize = 0,
@@ -76,11 +90,6 @@ pub const Transfer = struct {
     end: u64 = 0,
     /// Bytes the last read left in `buf`; 0 when it failed.
     filled: usize = 0,
-    /// The filesystem answers cache-only reads.
-    nowait: bool = true,
-    /// Where it doesn't: what of the file is cached; set up on first need.
-    residency: ?file_io.Residency = null,
-    mapped: bool = false,
     /// Its own allocation: with it inline the transfer would outgrow the
     /// allocator's slabs and cost an mmap per request.
     buf: ?*[chunk_size]u8 = null,
@@ -100,6 +109,7 @@ pub const Transfer = struct {
             .loc = loc,
             .io = ex.worker.io,
             .gpa = gpa,
+            .cache = &ex.worker.files,
             .arena = .init(gpa),
             .try_files = loc.try_files.len > 0,
             .dir_request = ex.req.path[ex.req.path.len - 1] == '/',
@@ -136,26 +146,52 @@ pub const Transfer = struct {
         // Only when the whole body will go out from byte 0.
         t.prefetch = !ex.req.isHead() and ex.req.get("range") == null and
             ex.req.get("if-none-match") == null and ex.req.get("if-modified-since") == null;
-        if (t.prefetch) t.buf = try gpa.create([chunk_size]u8);
         return t;
     }
 
     fn destroy(t: *Transfer) void {
         std.debug.assert(!t.busy);
-        if (t.file) |f| f.close(t.io);
+        t.dropProbes();
+        if (t.entry) |e| e.release();
         if (t.buf) |b| t.gpa.destroy(b);
-        if (t.residency) |r| r.deinit();
         t.arena.deinit();
         t.gpa.destroy(t);
     }
 
-    /// Forget a lookup that has to start over on an I/O thread.
+    fn dropProbes(t: *Transfer) void {
+        for (t.probes.items) |p| switch (p.answer) {
+            .entry => |e| e.release(),
+            else => {},
+        };
+        t.probes.clearRetainingCapacity();
+        t.found = null;
+    }
+
+    /// Forget a lookup's conclusions, to run it again on an I/O thread;
+    /// the paths it answered stay answered.
     fn resetLookup(t: *Transfer) void {
-        if (t.file) |f| f.close(t.io);
-        t.file = null;
+        t.found = null;
         t.coding = null;
         t.chosen = 0;
         t.varied = false;
+    }
+
+    /// Hand the paths looked at to the cache and keep the file served.
+    fn settle(t: *Transfer) void {
+        const now = timers.nowMs();
+        for (t.probes.items) |*p| switch (p.answer) {
+            .entry => |*e| {
+                const kept = t.cache.adopt(p.path, e.*, now);
+                if (t.found == e.*) t.found = kept;
+                e.* = kept;
+            },
+            else => {},
+        };
+        if (t.found) |f| {
+            f.retain();
+            t.entry = f;
+        }
+        t.dropProbes();
     }
 
     // ---- on an I/O thread, or cache-only on the loop ----
@@ -163,115 +199,90 @@ pub const Transfer = struct {
     fn lookupWork(job: *file_io.Job) void {
         const t: *Transfer = @alignCast(@fieldParentPtr("job", job));
         t.result = t.lookup(false) catch unreachable;
-        if (t.result == .found and t.prefetch) t.read(0, t.meta.size);
+        if (t.result == .found and t.prefetch) t.read(t.found.?, 0, t.found.?.meta.size);
     }
 
     fn readWork(job: *file_io.Job) void {
         const t: *Transfer = @alignCast(@fieldParentPtr("job", job));
-        t.read(t.offset, t.end);
+        t.read(t.entry.?, t.offset, t.end);
     }
 
-    const OpenError = error{ WouldBlock, FileNotFound, NotDir, NameTooLong, BadPathName, IsDir, AccessDenied, PermissionDenied, Other };
+    /// What's at `path`: answered before, from the cache, or by the kernel.
+    /// `on_loop`: without waiting, else WouldBlock.
+    fn probe(t: *Transfer, path: [:0]const u8, comptime on_loop: bool) error{WouldBlock}!ofc.Answer {
+        for (t.probes.items) |p| if (std.mem.eql(u8, p.path, path)) return p.answer;
+        const answer = if (on_loop) blk: {
+            if (t.cache.get(path, timers.nowMs())) |e| break :blk ofc.Answer{ .entry = e };
+            if (slowRead(path) or !file_io.cached.enabled()) return error.WouldBlock;
+            break :blk try ofc.probeCached(t.gpa, path);
+        } else ofc.probe(t.gpa, t.io, path);
+        const a = t.arena.allocator();
+        const stored = a.dupeZ(u8, path) catch return drop(answer);
+        t.probes.append(a, .{ .path = stored, .answer = answer }) catch return drop(answer);
+        return answer;
+    }
 
-    fn open(t: *Transfer, path: [:0]const u8, comptime cached: bool) OpenError!std.Io.File {
-        if (cached) {
-            if (slowRead(path)) return error.WouldBlock;
-            return file_io.cached.open(path);
+    fn drop(answer: ofc.Answer) ofc.Answer {
+        switch (answer) {
+            .entry => |e| e.release(),
+            else => {},
         }
-        return std.Io.Dir.cwd().openFile(t.io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => error.FileNotFound,
-            error.NotDir => error.NotDir,
-            error.NameTooLong => error.NameTooLong,
-            error.BadPathName => error.BadPathName,
-            error.IsDir => error.IsDir,
-            error.AccessDenied => error.AccessDenied,
-            error.PermissionDenied => error.PermissionDenied,
-            else => error.Other,
-        };
-    }
-
-    fn stat(t: *Transfer, file: std.Io.File, comptime cached: bool) error{ WouldBlock, Other }!file_io.Meta {
-        if (cached) return file_io.cached.stat(file);
-        return file_io.Meta.of(file.stat(t.io) catch return error.Other);
+        return .other;
     }
 
     /// The first candidate naming a regular file, or with a variant the
-    /// client takes. `cached`: on the loop, giving up with WouldBlock
-    /// (leaving `resetLookup` to the caller) where the answer isn't cached.
-    fn lookup(t: *Transfer, comptime cached: bool) error{WouldBlock}!Result {
-        const io = t.io;
+    /// client takes. `on_loop`: giving up with WouldBlock (leaving
+    /// `resetLookup` to the caller) where the answer isn't cached.
+    fn lookup(t: *Transfer, comptime on_loop: bool) error{WouldBlock}!Result {
         for (t.candidates, 0..) |path, i| {
             const last = i + 1 == t.candidates.len and t.fallback == null;
-            const file = t.open(path, cached) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
-                error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName => {
-                    if (try t.openVariant(path, i, cached)) return .found;
-                    if (last) return .{ .status = 404 };
-                    continue;
-                },
-                error.IsDir => {
-                    if (!t.try_files) return .redirect_dir;
-                    if (last) return .{ .status = 404 };
-                    continue;
-                },
-                error.AccessDenied, error.PermissionDenied => {
+            const e = switch (try t.probe(path, on_loop)) {
+                .entry => |e| e,
+                .denied => {
                     if (last) return .{ .status = 403 };
                     continue;
                 },
-                error.Other => return .{ .status = 500 },
+                .special => {
+                    if (last) return .{ .status = 404 };
+                    continue;
+                },
+                .other => return .{ .status = 500 },
             };
-            const meta = t.stat(file, cached) catch |err| {
-                file.close(io);
-                if (err == error.WouldBlock) return error.WouldBlock;
-                return .{ .status = 500 };
-            };
-            if (meta.kind != .file) {
-                file.close(io);
-                if (!t.try_files and meta.kind == .directory) return if (t.dir_request) .{ .status = 403 } else .redirect_dir;
-                if (last) return .{ .status = 404 };
-                continue;
+            switch (e.outcome) {
+                .missing => {
+                    if (try t.variant(path, i, on_loop)) return .found;
+                    if (last) return .{ .status = 404 };
+                },
+                .directory => {
+                    if (!t.try_files) return if (t.dir_request) .{ .status = 403 } else .redirect_dir;
+                    if (last) return .{ .status = 404 };
+                },
+                .file => {
+                    if (try t.variant(path, i, on_loop)) return .found;
+                    t.found = e;
+                    t.chosen = i;
+                    return .found;
+                },
             }
-            const variant = t.openVariant(path, i, cached) catch |err| {
-                file.close(io);
-                return err;
-            };
-            if (variant) {
-                file.close(io);
-                return .found;
-            }
-            t.file = file;
-            t.meta = meta;
-            t.chosen = i;
-            return .found;
         }
         return .{ .status = t.fallback orelse 404 };
     }
 
-    /// Open the best variant of `path` the client takes, if one exists as
+    /// Find the best variant of `path` the client takes, if one exists as
     /// a regular file. It sits beside `path`, so it's no further from root.
     /// Also notes whether any variant exists, taken or not.
-    fn openVariant(t: *Transfer, path: []const u8, i: usize, comptime cached: bool) error{WouldBlock}!bool {
+    fn variant(t: *Transfer, path: []const u8, i: usize, comptime on_loop: bool) error{WouldBlock}!bool {
         if (t.offered_len == 0) return false;
-        const io = t.io;
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         for (t.accepted[0..t.accepted_len]) |c| {
             const vpath = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, c.suffix() }) catch continue;
-            const file = t.open(vpath, cached) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
+            const e = switch (try t.probe(vpath, on_loop)) {
+                .entry => |e| e,
                 else => continue,
             };
-            const meta = t.stat(file, cached) catch |err| {
-                file.close(io);
-                if (err == error.WouldBlock) return error.WouldBlock;
-                continue;
-            };
-            if (meta.kind != .file) {
-                file.close(io);
-                continue;
-            }
+            if (e.outcome != .file) continue;
             t.varied = true;
-            t.file = file;
-            t.meta = meta;
+            t.found = e;
             t.coding = c;
             t.chosen = i;
             return true;
@@ -279,55 +290,45 @@ pub const Transfer = struct {
         if (!t.varied) for (t.offered[0..t.offered_len]) |c| {
             if (std.mem.indexOfScalar(Coding, t.accepted[0..t.accepted_len], c) != null) continue;
             const vpath = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, c.suffix() }) catch continue;
-            const file = t.open(vpath, cached) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
-                else => continue,
-            };
-            defer file.close(io);
-            const meta = t.stat(file, cached) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
-                else => continue,
-            };
-            if (meta.kind == .file) {
-                t.varied = true;
-                break;
+            switch (try t.probe(vpath, on_loop)) {
+                .entry => |e| if (e.outcome == .file) {
+                    t.varied = true;
+                    break;
+                },
+                else => {},
             }
         };
         return false;
     }
 
-    fn read(t: *Transfer, offset: u64, end: u64) void {
+    fn read(t: *Transfer, e: *ofc.Entry, offset: u64, end: u64) void {
         const want: usize = @intCast(@min(end -| offset, chunk_size));
         if (want == 0) {
             t.filled = 0;
             return;
         }
         if (slowRead(t.candidates[t.chosen])) std.Io.sleep(t.io, .fromMilliseconds(1000), .awake) catch {};
-        t.filled = t.file.?.readPositional(t.io, &.{t.buf.?[0..want]}, offset) catch 0;
+        t.filled = e.file.readPositional(t.io, &.{t.buf.?[0..want]}, offset) catch 0;
     }
 
     /// The next chunk from the page cache, on the loop; false when it isn't
     /// there to take without waiting.
     fn readCached(t: *Transfer) bool {
         if (slowRead(t.candidates[t.chosen])) return false;
+        const e = t.entry.?;
         const want: usize = @intCast(@min(t.end - t.offset, chunk_size));
         const buf = t.buf.?[0..want];
-        if (t.nowait and file_io.cached.enabled()) {
-            if (file_io.cached.read(t.file.?, buf, t.offset)) |n| {
+        if (e.nowait and file_io.cached.enabled()) {
+            if (file_io.cached.read(e.file, buf, t.offset)) |n| {
                 t.filled = n;
                 return true;
             } else |err| switch (err) {
                 error.WouldBlock => return false,
-                error.Unsupported => t.nowait = false,
+                error.Unsupported => e.nowait = false,
             }
         }
-        if (!t.mapped) {
-            t.mapped = true;
-            t.residency = file_io.Residency.init(t.file.?, t.meta.size);
-        }
-        const r = t.residency orelse return false;
-        if (!r.cached(t.offset, want)) return false;
-        t.filled = t.file.?.readPositional(t.io, &.{buf}, t.offset) catch 0;
+        if (!e.resident(t.offset, want)) return false;
+        t.filled = e.file.readPositional(t.io, &.{buf}, t.offset) catch 0;
         return true;
     }
 
@@ -341,6 +342,7 @@ pub const Transfer = struct {
     }
 
     fn looked(t: *Transfer, ex: *Exchange) void {
+        t.settle();
         switch (t.result) {
             .found => serve(ex, t),
             .status => |status| {
@@ -379,12 +381,14 @@ pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void 
     const pool = ex.worker.shared.file_pool orelse return ex.sendError(500);
     const t = Transfer.create(ex, loc, root) catch return ex.sendError(500);
     ex.handler = .{ .static = t };
-    if (file_io.cached.enabled()) {
-        if (t.lookup(true)) |result| {
-            t.result = result;
-            return t.looked(ex);
-        } else |_| t.resetLookup();
-    }
+    if (t.lookup(true)) |result| {
+        t.result = result;
+        return t.looked(ex);
+    } else |_| t.resetLookup();
+    if (t.prefetch) t.buf = t.gpa.create([chunk_size]u8) catch {
+        release(ex);
+        return ex.sendError(500);
+    };
     t.busy = true;
     if (!pool.submit(&t.job, true)) {
         t.busy = false;
@@ -418,7 +422,7 @@ fn tryPath(a: std.mem.Allocator, entry: []const u8, path: []const u8, index: []c
 fn serve(ex: *Exchange, t: *Transfer) void {
     const a = ex.arena();
     const loc = t.loc;
-    const st = t.meta;
+    const st = t.entry.?.meta;
     const is_head = ex.req.isHead();
     const content_type = mimeType(t.candidates[t.chosen]);
     const mtime_s = st.mtime_s;
@@ -554,15 +558,14 @@ fn send(ex: *Exchange, t: *Transfer) bool {
 /// `onDownstreamWritable`.
 pub fn pump(ex: *Exchange) void {
     const t = ex.handler.static;
-    if (t.busy) return;
-    if (t.buf == null) t.buf = t.gpa.create([chunk_size]u8) catch {
-        release(ex);
-        return ex.respondAbort();
-    };
     while (true) {
         if (t.busy) return;
         if (t.offset >= t.end) return finish(ex);
         if (ex.downstreamBuffered() > socket.high_water) return;
+        if (t.buf == null) t.buf = t.gpa.create([chunk_size]u8) catch {
+            release(ex);
+            return ex.respondAbort();
+        };
         if (!t.readCached()) break;
         if (!send(ex, t)) return;
     }

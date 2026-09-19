@@ -215,6 +215,31 @@ echo | $OPENSSL s_client -connect 127.0.0.1:18443 -tls1_3 -CAfile $CERTS/ca.crt 
 SUITE=https check tls-resumption "$(echo | $OPENSSL s_client -connect 127.0.0.1:18443 -tls1_3 -CAfile $CERTS/ca.crt -sess_in "$WORK/sess" 2>/dev/null | grep -c '^Reused')" 1
 SUITE=https check tls-alpn "$($CURL_BIN -s -o /dev/null -w '%{http_version}' --cacert $CERTS/ca.crt https://127.0.0.1:18443/ping)" "1.1"
 SUITE=https check plain-http-on-tls-port "$($CURL_BIN -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18443/ping)" "000"
+# Open-file cache: a change on disk shows within valid_ms (1 s by default).
+# The body if 200, else the status.
+ofc_get() {
+    local out; out=$($CURL_BIN -s -w '\n%{http_code}' http://127.0.0.1:18080/ofc.txt)
+    if [ "${out##*$'\n'}" == 200 ]; then echo "${out%%$'\n'*}"; else echo "${out##*$'\n'}"; fi
+}
+pause() { perl -e "select(undef,undef,undef,$1)"; }
+echo v1 > "$WORK/www/ofc.txt"
+ofc_get > /dev/null
+echo v2 > "$WORK/www/ofc.tmp" && mv "$WORK/www/ofc.tmp" "$WORK/www/ofc.txt"
+before=$(ofc_get); pause 1.2
+SUITE=open-file-cache check renamed-over "$before, $(ofc_get)" "v1, v2"
+rm "$WORK/www/ofc.txt"
+before=$(ofc_get); pause 1.2
+SUITE=open-file-cache check deleted "$before, $(ofc_get)" "v2, 404"
+echo v3 > "$WORK/www/ofc.txt"
+before=$(ofc_get); pause 1.2
+SUITE=open-file-cache check created "$before, $(ofc_get)" "404, v3"
+# Truncated in place while cached: the old length is announced, and the
+# response ends early.
+head -c 2000000 /dev/urandom > "$WORK/www/trunc.bin"
+$CURL_BIN -s -o /dev/null http://127.0.0.1:18080/trunc.bin
+python3 -c 'import sys; open(sys.argv[1], "r+b").truncate(1000)' "$WORK/www/trunc.bin"
+$CURL_BIN -s -o /dev/null http://127.0.0.1:18080/trunc.bin; code=$?
+SUITE=open-file-cache check truncated "$code $($CURL_BIN -s http://127.0.0.1:18080/sub/a.txt)" "18 sub file"
 SUITE=features check gzip-encoding "$($CURL_BIN -s -H 'Accept-Encoding: gzip' -D - -o /dev/null http://127.0.0.1:18080/gz/text.txt | grep -i '^content-encoding' | tr -d '\r' | tr A-Z a-z)" "content-encoding: gzip"
 SUITE=features check gzip-content "$($CURL_BIN -s --compressed http://127.0.0.1:18080/gz/text.txt | sha)" "$(sha < "$WORK/gz/text.txt")"
 SUITE=features check gzip-smaller "$([ "$($CURL_BIN -s -H 'Accept-Encoding: gzip' http://127.0.0.1:18080/gz/text.txt | wc -c)" -lt 20000 ] && echo yes)" yes

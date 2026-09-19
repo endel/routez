@@ -25,6 +25,7 @@ const client_limits = @import("client_limits.zig");
 const guard = @import("guard.zig");
 const auth_pool = @import("auth/pool.zig");
 const file_io = @import("file_io.zig");
+const ofc = @import("open_file_cache.zig");
 const regex = @import("regex.zig");
 const realip = @import("realip.zig");
 pub const H3Listener = h3_server.Listener(.h3);
@@ -187,6 +188,8 @@ pub const Worker = struct {
     auth_inbox: auth_pool.Inbox,
     /// File work the I/O threads finished for our requests.
     file_inbox: file_io.Inbox,
+    /// Static files looked up lately.
+    files: ofc.Cache,
     inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
@@ -232,6 +235,8 @@ pub const Worker = struct {
         /// File I/O threads, shared with every other generation; null
         /// until a config serves files.
         file_pool: ?*file_io.Pool = null,
+        /// `open_file_cache.max` within the descriptor budget.
+        open_file_cache_max: u32 = 0,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -279,6 +284,11 @@ pub const Worker = struct {
             .inbox = try steering.Inbox.init(io, alloc),
             .auth_inbox = try auth_pool.Inbox.init(io),
             .file_inbox = try file_io.Inbox.init(io),
+            .files = .init(alloc, .{
+                .max = shared.open_file_cache_max,
+                .valid_ms = cfg.open_file_cache.valid_ms,
+                .inactive_ms = cfg.open_file_cache.inactive_ms,
+            }),
         };
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
@@ -458,6 +468,7 @@ pub const Worker = struct {
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
         try self.loop.run(.until_done);
+        self.files.deinit();
         log.info("worker {d} stopped", .{self.id});
     }
 
@@ -525,6 +536,7 @@ pub const Worker = struct {
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
         if (self.shared.clients) |tbl| tbl.sweepStep(self.io, quic.sys.nanoTimestamp());
+        self.files.sweep(self.timers.now_ms);
         self.publishQuicStats();
         for (self.quic_listeners.items) |q| switch (q) {
             .wt => |l| l.relay.checkPaused(),
