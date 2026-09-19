@@ -155,6 +155,9 @@ SUITE=reload check reload-applied "$($CURL_BIN -s http://127.0.0.1:18080/ping)" 
 SUITE=reload check reload-no-errors "$(sort -u "$WORK/reload_codes.txt" | tr '\n' ' ')" "200 "
 
 SUITE=limits check per-ip-limit "$(python3 "$HERE/conn_limit.py" 25)" 5
+# The held connections' closes race the next accept, which the per-IP
+# limit refuses until they are processed.
+for _ in $(seq 1 20); do $CURL_BIN -s http://127.0.0.1:18080/status | grep -q '^Active connections: ' && break; perl -e 'select(undef,undef,undef,0.05)'; done
 SUITE=limits check stub-status "$($CURL_BIN -s http://127.0.0.1:18080/status | grep -c '^Active connections: ')" 1
 
 # QUIC connection migration across workers: four workers share UDP 18444;
@@ -330,7 +333,8 @@ if [ -d /proc ]; then
     nu=${NOBODY% *}; ng=${NOBODY#* }
     check all-threads-dropped "$ids" "$nu $nu $nu $nu $ng $ng $ng $ng"
 else
-    check dropped "$(ps -o uid= -o rgid= -p $PPID_ | awk '{print $1, $2}')" "$NOBODY"
+    # macOS's ps prints nobody's ids as -2.
+    check dropped "$(ps -o uid= -o rgid= -p $PPID_ | awk '{u=$1; g=$2; if (u < 0) u += 4294967296; if (g < 0) g += 4294967296; print u, g}')" "$NOBODY"
 fi
 check serves "$($PCURL http://127.0.0.1:881/) $($PCURL https://127.0.0.1:880/)" "priv priv"
 "$ROOT/zig-out/bin/h3-test-client" 880 "$CERTS/ca.crt" 3 > "$PRIV/h3.log" 2>&1
