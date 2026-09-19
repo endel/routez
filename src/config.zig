@@ -20,6 +20,7 @@ const vars = @import("http/vars.zig");
 const access_log = @import("access_log.zig");
 const access = @import("access.zig");
 const regex = @import("regex.zig");
+const encoding = @import("encoding.zig");
 
 pub const Config = struct {
     /// Worker threads, each with its own event loop and SO_REUSEPORT sockets.
@@ -301,7 +302,14 @@ pub const Location = struct {
     /// variables.
     add_headers: []const HeaderKV = &.{},
     /// Compress text-like responses with gzip for clients that accept it.
+    /// Such responses carry `Vary: Accept-Encoding`, compressed or not.
     gzip: bool = false,
+    /// With `root`: serve `file.br`, `file.zst` or `file.gz` in place of
+    /// `file` when it exists and the client accepts that coding (nginx
+    /// `gzip_static`/`brotli_static`). The client's q-values pick among
+    /// them; equal ones go by this list's order. `.{ .br, .zstd, .gzip }`
+    /// offers all three.
+    precompressed: []const encoding.Coding = &.{},
     /// Per-client request rate limit, shared by all workers.
     limit_req: ?LimitReq = null,
     /// IP allow/deny rules, nginx-style: the first rule matching the client
@@ -548,6 +556,7 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
             for (loc.proxy_set_headers) |h| try checkHeader(h);
             for (loc.add_headers) |h| try checkHeader(h);
             if (loc.try_files.len > 0) try checkTryFiles(loc.*);
+            if (loc.precompressed.len > 0 and loc.root == null) return fail("location '{s}': precompressed needs root", .{loc.pattern()});
             if (loc.@"return") |r| {
                 if (r.status < 100 or r.status > 599) return fail("location '{s}': return status {d} is out of range", .{ loc.pattern(), r.status });
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
@@ -939,6 +948,23 @@ test "variables in return and headers" {
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1", .proxy_set_headers = .{.{ .name = "x", .value = "$nope" }} }} }} }
         ,
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .@"return" = .{ .status = 3010 } }} }} }
+        ,
+    };
+    for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));
+}
+
+test "precompressed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/", .root = "x", .precompressed = .{ .br, .zstd, .gzip } },
+        \\} }} }
+    , "test");
+    try std.testing.expectEqualSlices(encoding.Coding, &.{ .br, .zstd, .gzip }, cfg.servers[0].locations[0].precompressed);
+    const bad = [_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .proxy_pass = "a:1", .precompressed = .{.gzip} }} }} }
         ,
     };
     for (bad) |src| try std.testing.expectError(error.InvalidConfig, parse(a, src, "test"));

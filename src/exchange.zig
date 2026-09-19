@@ -22,6 +22,7 @@ const stats = @import("stats.zig");
 /// locations again) before it is taken for a loop: nginx's limit.
 const max_uri_changes = 10;
 const gzip = @import("gzip.zig");
+const encoding = @import("encoding.zig");
 const vars = @import("http/vars.zig");
 const access_log = @import("access_log.zig");
 const timers = @import("timers.zig");
@@ -552,35 +553,31 @@ pub const Exchange = struct {
         for (loc.add_headers, 0..) |h, i| {
             list.appendAssumeCapacity(.{ .name = h.name, .value = if (self.add_values) |v| v[i] else h.value });
         }
-        if (loc.gzip and self.startGzip(&resp, list.items)) {
-            for (list.items) |*h| {
-                // The compressed body is a different representation.
-                if (std.ascii.eqlIgnoreCase(h.name, "etag") and !std.mem.startsWith(u8, h.value, "W/")) {
-                    h.value = std.fmt.allocPrint(a, "W/{s}", .{h.value}) catch h.value;
+        if (loc.gzip and gzip.negotiable(resp.status, list.items)) {
+            encoding.addVary(a, &list);
+            if (self.startGzip(&resp)) {
+                for (list.items) |*h| {
+                    // The compressed body is a different representation.
+                    if (std.ascii.eqlIgnoreCase(h.name, "etag") and !std.mem.startsWith(u8, h.value, "W/")) {
+                        h.value = std.fmt.allocPrint(a, "W/{s}", .{h.value}) catch h.value;
+                    }
                 }
+                list.appendAssumeCapacity(.{ .name = "content-encoding", .value = "gzip" });
+                resp.content_length = null;
             }
-            list.appendAssumeCapacity(.{ .name = "content-encoding", .value = "gzip" });
-            if (gzip.findHeader(list.items, "vary")) |v| {
-                for (list.items) |*h| if (std.ascii.eqlIgnoreCase(h.name, "vary")) {
-                    h.value = std.fmt.allocPrint(a, "{s}, Accept-Encoding", .{v}) catch v;
-                };
-            } else {
-                list.appendAssumeCapacity(.{ .name = "vary", .value = "Accept-Encoding" });
-            }
-            resp.content_length = null;
         }
         resp.headers = list.items;
         d.vtable.sendHead(d.ptr, &resp);
     }
 
-    /// Start compressing this response if it qualifies.
-    fn startGzip(self: *Exchange, resp: *const Response, headers: []const Header) bool {
-        if (self.req.isHead()) return false;
-        if (resp.status < 200 or resp.status >= 300 or resp.status == 204 or resp.status == 206) return false;
+    /// Start compressing this negotiable response if the client takes gzip
+    /// and it's worth it. HEAD gets the headers GET would, and no encoder.
+    fn startGzip(self: *Exchange, resp: *const Response) bool {
+        // A range of the compressed body isn't what the client asked for.
+        if (resp.status == 206) return false;
         if (resp.content_length) |n| if (n < gzip.min_length) return false;
-        if (gzip.findHeader(headers, "content-encoding") != null) return false;
-        if (!gzip.compressible(gzip.findHeader(headers, "content-type"))) return false;
         if (!gzip.clientAccepts(self.req.get("accept-encoding"))) return false;
+        if (self.req.isHead()) return true;
         if (self.worker.gzip_active >= gzip.max_active) return false;
         self.gz = gzip.Encoder.create(self.worker.alloc) catch return false;
         self.worker.gzip_active += 1;

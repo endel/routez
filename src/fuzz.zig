@@ -18,6 +18,7 @@ const regex = @import("regex.zig");
 const proxy_protocol = @import("net/proxy_protocol.zig");
 const realip = @import("realip.zig");
 const socket = @import("net/socket.zig");
+const encoding = @import("encoding.zig");
 
 const request_seeds = [_][]const u8{
     "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
@@ -125,6 +126,21 @@ test "fuzz: range header" {
             }
         }
     }.f, &.{ "bytes=0-9", "bytes=-5", "bytes=10-" });
+}
+
+test "fuzz: accept-encoding" {
+    try mutate(struct {
+        fn f(input: []const u8) anyerror!void {
+            const a = encoding.Accept.parse(input);
+            for ([_]?u16{ a.br, a.zstd, a.gzip, a.identity, a.star }) |w| try testing.expect((w orelse 0) <= 1000);
+            var buf: [3]encoding.Coding = undefined;
+            const ranked = a.rank(&.{ .br, .zstd, .gzip }, &buf);
+            for (ranked, 0..) |c, i| {
+                try testing.expect(a.weight(c) > 0);
+                if (i > 0) try testing.expect(a.weight(ranked[i - 1]) >= a.weight(c));
+            }
+        }
+    }.f, &.{ "gzip, deflate, br;q=0.8", "br;q=1.0, gzip;q=0.5, *;q=0", "identity;q=0, zstd" });
 }
 
 test "fuzz: access rules" {

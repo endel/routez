@@ -38,9 +38,12 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   Regex groups feed `proxy_pass` URIs, redirects and header values.
 - `rewrite` rules at server and location level with nginx's flags (`last`,
   `break`, `redirect`, `permanent`) and query-string handling.
-- Per location: gzip for text-like responses, `add_headers`,
-  `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
-  (per-client token bucket, optionally a named zone shared by locations).
+- Compression: precompressed `.br`, `.zst` and `.gz` files served in place
+  of the original (nginx `gzip_static`), chosen by the client's
+  `Accept-Encoding` q-values, and on-the-fly gzip for text-like responses.
+- Per location: `add_headers`, `proxy_set_headers` (set, replace, remove,
+  override Host) and `limit_req` (per-client token bucket, optionally a
+  named zone shared by locations).
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
 - Access control: IP allow/deny rules, Basic auth against htpasswd files
@@ -232,6 +235,49 @@ rewritten ones. A proxied request sends the rewritten path in full,
 ignoring the `proxy_pass` URI unless that has variables, as nginx does. A
 request whose URI changes more than 10 times gets a 500. Rewrites don't
 apply to WebTransport CONNECTs.
+
+### Compression
+
+```zig
+.{ .prefix = "/assets/", .root = "/var/www", .precompressed = .{ .br, .zstd, .gzip }, .gzip = true },
+```
+
+`precompressed` serves `app.js.br`, `app.js.zst` or `app.js.gz` for a
+request for `app.js`, when that file exists as a regular file beside it and
+the client's `Accept-Encoding` takes the coding. Among the codings it
+takes, the highest q-value wins and equal ones go by the list's order. A
+coding below an explicit `identity` q-value is passed over, `*` stands for
+codings the header doesn't name, and an entry with a malformed q-value is
+ignored. With no acceptable variant the original is served, even to a
+client that sent `identity;q=0`.
+
+The variant is its own representation: `Content-Encoding` names the
+coding, `Content-Type` comes from the original's name, and `Content-Length`,
+`Last-Modified` and the ETag come from the compressed file, whose ETag also
+ends in the coding (`"…-br"`) so it never matches the original's. `Range`
+requests count bytes of the compressed file, as in nginx; `If-None-Match`,
+`If-Modified-Since`, `If-Range` and HEAD work on it as on any file.
+Precompress at build time, for example `brotli -k -q 11 app.js`,
+`zstd -k -19 app.js`, `gzip -k -9 app.js`, and keep each variant in step
+with its original: routez doesn't compare them.
+
+A variant counts as the file, so it's served even when the original is
+missing; a client that doesn't take it gets a 404. With `try_files`, an
+entry matches if its file exists or has a variant the client takes, so for
+such a client a lone `.gz` stops the fallback.
+
+`gzip = true` compresses text-like responses (`text/*`, JSON, JavaScript,
+XML, SVG, wasm) not known to be under 1 KiB, for clients that take gzip, up
+to 64 at once per worker; beyond that, responses go uncompressed. It leaves
+alone responses that already have a `Content-Encoding` (such as a
+precompressed file or an upstream's), 206 partial responses, and responses
+marked `Cache-Control: no-transform`. The compressed response gets a weak
+ETag and no `Content-Length`; a HEAD request gets the same headers.
+
+Every response that could be encoded differently for another client,
+compressed or not, carries `Vary: Accept-Encoding` (a static file's 304s
+too), so caches keep the variants apart. An original served in place of a
+precompressed variant gets it when its type is text-like, as for `gzip`.
 
 ### Client limits
 
@@ -610,6 +656,10 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   `max_connections` and `limit_req` bound QUIC clients instead.
 - Static files are read on the worker thread; fine for page-cached files,
   slow disks stall that worker.
+- Compression on the fly is gzip only: Zig's standard library has no
+  Brotli or zstd encoder, and a small one written here would compress worse
+  than gzip. Precompress with `brotli` or `zstd` at build time and serve the
+  files with `precompressed` instead.
 - Upstream pools and health state are per worker, so health checks run once
   per worker per interval; the `routez_upstream_healthy` metric is the
   verdict of whichever worker probed last.

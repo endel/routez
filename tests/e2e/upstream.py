@@ -1,9 +1,13 @@
-import http.server, sys, json, ssl
+import http.server, sys, json, ssl, gzip, random
+# Text that doesn't shrink much: gzipped, still past routez's 1 KiB minimum.
+NOISE = "".join(random.Random(1).choice("0123456789abcdef") for _ in range(8000)).encode()
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    def _reply(self, code, body, ctype="application/json", chunked=False):
+    def _reply(self, code, body, ctype="application/json", chunked=False, headers=()):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        for k, v in headers:
+            self.send_header(k, v)
         self.send_header("X-Upstream-Port", str(self.server.server_port))
         if chunked:
             self.send_header("Transfer-Encoding", "chunked")
@@ -22,6 +26,12 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/bytes/"):
             n = int(self.path[len("/bytes/"):])
             return self._reply(200, bytes(i % 251 for i in range(n)), "application/octet-stream")
+        if self.path == "/gzipped":
+            return self._reply(200, gzip.compress(NOISE, mtime=0), "text/plain", headers=[("Content-Encoding", "gzip")])
+        if self.path == "/no-transform":
+            return self._reply(200, NOISE, "text/plain", headers=[("Cache-Control", "public, no-transform")])
+        if self.path == "/noise":
+            return self._reply(200, NOISE, "text/plain")
         if self.path == "/healthz":
             return self._reply(200, b"ok", "text/plain")
         reply = {"path": self.path, "headers": dict(self.headers), "port": self.server.server_port, "peer_port": self.client_address[1]}

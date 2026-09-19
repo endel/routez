@@ -8,6 +8,7 @@ const std = @import("std");
 const flate = std.compress.flate;
 const common = @import("http/common.zig");
 const Header = common.Header;
+const encoding = @import("encoding.zig");
 
 pub const max_active = 64;
 /// Bodies known to be smaller than this aren't worth the CPU.
@@ -57,24 +58,19 @@ pub const Encoder = struct {
     }
 };
 
-/// Whether the client takes gzip: listed in Accept-Encoding with q > 0.
+/// Whether the client takes gzip over the original.
 pub fn clientAccepts(accept_encoding: ?[]const u8) bool {
-    const v = accept_encoding orelse return false;
-    var it = std.mem.splitScalar(u8, v, ',');
-    while (it.next()) |raw| {
-        var parts = std.mem.splitScalar(u8, std.mem.trim(u8, raw, " \t"), ';');
-        const coding = std.mem.trim(u8, parts.first(), " \t");
-        if (!std.ascii.eqlIgnoreCase(coding, "gzip") and !std.mem.eql(u8, coding, "*")) continue;
-        while (parts.next()) |param| {
-            const p = std.mem.trim(u8, param, " \t");
-            if (std.ascii.startsWithIgnoreCase(p, "q=")) {
-                const q = std.fmt.parseFloat(f32, p[2..]) catch return false;
-                return q > 0;
-            }
-        }
-        return true;
-    }
-    return false;
+    var buf: [3]encoding.Coding = undefined;
+    return encoding.Accept.parse(accept_encoding).rank(&.{.gzip}, &buf).len > 0;
+}
+
+/// Whether a response is one gzip would compress for a client that takes
+/// it. Such a response varies by Accept-Encoding, compressed or not.
+pub fn negotiable(status: u16, headers: []const Header) bool {
+    if (status < 200 or status >= 300 or status == 204) return false;
+    if (findHeader(headers, "content-encoding") != null) return false;
+    if (encoding.noTransform(findHeader(headers, "cache-control"))) return false;
+    return compressible(findHeader(headers, "content-type"));
 }
 
 /// Text-like types that compress well. Streams (SSE) are left alone: a
@@ -104,6 +100,21 @@ test "accept-encoding" {
     try std.testing.expect(!clientAccepts("br"));
     try std.testing.expect(!clientAccepts(null));
     try std.testing.expect(clientAccepts("*"));
+    try std.testing.expect(!clientAccepts("gzip;q=0.5, identity"));
+    try std.testing.expect(!clientAccepts("gzip;q=abc"));
+}
+
+test "negotiable responses" {
+    const t = std.testing;
+    const text = [_]Header{.{ .name = "Content-Type", .value = "text/plain" }};
+    try t.expect(negotiable(200, &text));
+    try t.expect(negotiable(206, &text));
+    try t.expect(!negotiable(204, &text));
+    try t.expect(!negotiable(304, &text));
+    try t.expect(!negotiable(404, &text));
+    try t.expect(!negotiable(200, &.{.{ .name = "content-type", .value = "image/png" }}));
+    try t.expect(!negotiable(200, &.{ text[0], .{ .name = "Content-Encoding", .value = "br" } }));
+    try t.expect(!negotiable(200, &.{ text[0], .{ .name = "cache-control", .value = "public, no-transform" } }));
 }
 
 test "compressible types" {

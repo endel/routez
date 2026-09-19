@@ -418,6 +418,7 @@ test {
     _ = @import("udp_proxy.zig");
     _ = @import("h3/server.zig");
     _ = @import("gzip.zig");
+    _ = @import("encoding.zig");
     _ = @import("acme.zig");
     _ = @import("steering.zig");
     _ = @import("access_log.zig");

@@ -10,6 +10,8 @@ const config = @import("../config.zig");
 const Exchange = @import("../exchange.zig").Exchange;
 const socket = @import("../net/socket.zig");
 const Header = common.Header;
+const encoding = @import("../encoding.zig");
+const gzip = @import("../gzip.zig");
 
 pub const State = struct {
     file: std.Io.File,
@@ -34,7 +36,10 @@ pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void 
     const io = ex.worker.io;
 
     const file = std.Io.Dir.cwd().openFile(io, full, .{}) catch |err| return ex.sendError(switch (err) {
-        error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName => 404,
+        error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName => {
+            if (openVariant(ex, loc, full)) |v| return serve(ex, loc, v, full);
+            return ex.sendError(404);
+        },
         error.AccessDenied, error.PermissionDenied => 403,
         error.IsDir => return redirectToDir(ex),
         else => 500,
@@ -55,10 +60,11 @@ pub fn start(ex: *Exchange, loc: *const config.Location, root: []const u8) void 
             return ex.sendError(404);
         },
     }
-    serve(ex, file, st, full);
+    serveOrVariant(ex, loc, .{ .file = file, .st = st }, full);
 }
 
-/// `try_files`: serve the first entry naming a regular file.
+/// `try_files`: serve the first entry naming a regular file, or one with a
+/// precompressed variant the client takes.
 fn tryFiles(ex: *Exchange, loc: *const config.Location, root: []const u8) void {
     const a = ex.arena();
     const io = ex.worker.io;
@@ -69,6 +75,7 @@ fn tryFiles(ex: *Exchange, loc: *const config.Location, root: []const u8) void {
         const full = std.mem.concat(a, u8, &.{ root, rel }) catch return ex.sendError(500);
         const file = std.Io.Dir.cwd().openFile(io, full, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName, error.IsDir => {
+                if (err != error.IsDir) if (openVariant(ex, loc, full)) |v| return serve(ex, loc, v, full);
                 if (last) return ex.sendError(404);
                 continue;
             },
@@ -87,8 +94,46 @@ fn tryFiles(ex: *Exchange, loc: *const config.Location, root: []const u8) void {
             if (last) return ex.sendError(404);
             continue;
         }
-        return serve(ex, file, st, full);
+        return serveOrVariant(ex, loc, .{ .file = file, .st = st }, full);
     }
+}
+
+/// An open regular file to answer with, and the coding it's stored in.
+const Opened = struct {
+    file: std.Io.File,
+    st: std.Io.File.Stat,
+    coding: ?encoding.Coding = null,
+};
+
+fn serveOrVariant(ex: *Exchange, loc: *const config.Location, original: Opened, full: []const u8) void {
+    if (openVariant(ex, loc, full)) |v| {
+        original.file.close(ex.worker.io);
+        return serve(ex, loc, v, full);
+    }
+    serve(ex, loc, original, full);
+}
+
+/// The best precompressed variant of `full` the client takes, if one exists
+/// as a regular file. It sits beside `full`, so it's no further from root.
+fn openVariant(ex: *Exchange, loc: *const config.Location, full: []const u8) ?Opened {
+    if (loc.precompressed.len == 0) return null;
+    const io = ex.worker.io;
+    var buf: [3]encoding.Coding = undefined;
+    const ranked = encoding.Accept.parse(ex.req.get("accept-encoding")).rank(loc.precompressed, &buf);
+    for (ranked) |c| {
+        const path = std.mem.concat(ex.arena(), u8, &.{ full, c.suffix() }) catch return null;
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
+        const st = file.stat(io) catch {
+            file.close(io);
+            continue;
+        };
+        if (st.kind != .file) {
+            file.close(io);
+            continue;
+        }
+        return .{ .file = file, .st = st, .coding = c };
+    }
+    return null;
 }
 
 /// A `try_files` entry as a path under root. Config validation keeps `..`
@@ -110,19 +155,32 @@ fn tryPath(a: std.mem.Allocator, entry: []const u8, path: []const u8, index: []c
 }
 
 /// Answer with an open regular file: conditional requests, ranges, body.
-fn serve(ex: *Exchange, file: std.Io.File, st: std.Io.File.Stat, full: []const u8) void {
+/// A precompressed variant is its own representation: its size, mtime and
+/// ETag, and ranges count its bytes. `full` names the original, which
+/// gives the type.
+fn serve(ex: *Exchange, loc: *const config.Location, opened: Opened, full: []const u8) void {
     const a = ex.arena();
     const io = ex.worker.io;
+    const file = opened.file;
+    const st = opened.st;
     const is_head = ex.req.isHead();
+    const content_type = mimeType(full);
     const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    const etag = std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime_s, st.size }) catch return closeAndFail(ex, file);
+    const etag = (if (opened.coding) |c|
+        std.fmt.allocPrint(a, "\"{x}-{x}-{s}\"", .{ mtime_s, st.size, c.token() })
+    else
+        std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime_s, st.size })) catch return closeAndFail(ex, file);
     const lm_buf = a.create([29]u8) catch return closeAndFail(ex, file);
     const last_modified = common.formatHttpDate(mtime_s, lm_buf);
+    // Whether another client could get another coding of this path.
+    const varies = opened.coding != null or
+        ((loc.precompressed.len > 0 or loc.gzip) and gzip.compressible(content_type));
+    const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
 
     if (notModified(ex, etag, mtime_s)) {
         file.close(io);
-        const headers = [_]Header{ .{ .name = "etag", .value = etag }, .{ .name = "last-modified", .value = last_modified } };
-        ex.respondHead(&.{ .status = 304, .headers = &headers });
+        const headers = [_]Header{ .{ .name = "etag", .value = etag }, .{ .name = "last-modified", .value = last_modified }, vary };
+        ex.respondHead(&.{ .status = 304, .headers = headers[0..if (varies) 3 else 2] });
         return ex.respondEnd();
     }
 
@@ -150,9 +208,9 @@ fn serve(ex: *Exchange, file: std.Io.File, st: std.Io.File.Stat, full: []const u
         };
     }
 
-    var headers: [6]Header = undefined;
+    var headers: [7]Header = undefined;
     var n: usize = 0;
-    headers[n] = .{ .name = "content-type", .value = mimeType(full) };
+    headers[n] = .{ .name = "content-type", .value = content_type };
     n += 1;
     headers[n] = .{ .name = "etag", .value = etag };
     n += 1;
@@ -162,6 +220,14 @@ fn serve(ex: *Exchange, file: std.Io.File, st: std.Io.File.Stat, full: []const u
     n += 1;
     if (content_range) |cr| {
         headers[n] = .{ .name = "content-range", .value = cr };
+        n += 1;
+    }
+    if (opened.coding) |c| {
+        headers[n] = .{ .name = "content-encoding", .value = c.token() };
+        n += 1;
+    }
+    if (varies) {
+        headers[n] = vary;
         n += 1;
     }
 

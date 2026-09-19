@@ -20,6 +20,17 @@ mkdir -p "$WORK/spa/assets" "$WORK/spa/docs"
 echo '<h1>spa</h1>' > "$WORK/spa/index.html"
 echo 'console.log(1)' > "$WORK/spa/assets/app.js"
 echo 'docs' > "$WORK/spa/docs/index.html"
+# Precompressed files: committed .br/.zst fixtures, .gz made here.
+mkdir -p "$WORK/pc/d" "$WORK/pcspa"
+cp "$HERE"/precompressed/x.js* "$WORK/pc/"
+gz() { python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.compress(open(sys.argv[1],"rb").read(), mtime=0))' "$1" > "$2"; }
+gz "$WORK/pc/x.js" "$WORK/pc/x.js.gz"
+cp "$WORK/pc/x.js" "$WORK/pc/d/index.html"; gz "$WORK/pc/d/index.html" "$WORK/pc/d/index.html.gz"
+gz "$WORK/pc/x.js" "$WORK/pc/only.js.gz"
+cp "$WORK/gz/text.txt" "$WORK/pc/plain.txt"
+mkdir "$WORK/pc/dir.js.gz"
+echo '<h1>pcspa</h1>' > "$WORK/pcspa/index.html"
+gz "$WORK/pc/x.js" "$WORK/pcspa/only.js.gz"
 CERTS="$ROOT/../quic-zig/interop/certs"
 sed "s|WWW|$WORK/www|; s|CERTS|$CERTS|g" "$HERE/routez.zon" > "$WORK/routez.zon"
 
@@ -64,6 +75,50 @@ pass=0; fail=0
 check() { if [ "$2" == "$3" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL [$SUITE] $1: got '$2' want '$3'"; fi; }
 json() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)" 2>/dev/null; }
 sha() { shasum | cut -c1-40; }
+noise() { python3 -c 'import random,sys; sys.stdout.write("".join(random.Random(1).choice("0123456789abcdef") for _ in range(8000)))'; }
+
+# Response headers of the last `enc` request, one by name.
+hdr() { grep -i "^$1:" "$WORK/enc.h" | tr -d '\r' | cut -d' ' -f2- | tr '\n' ' ' | sed 's/ $//'; }
+# GET (or curl flags) with an Accept-Encoding; prints encoding, vary and the body's hash.
+enc() { local ae=$1 path=$2; shift 2; local body; body=$($CURL -H "Accept-Encoding: $ae" -D "$WORK/enc.h" "$@" "$B$path" | sha); echo "$(hdr content-encoding)|$(hdr vary)|$body"; }
+PC="$WORK/pc"
+encoding_suite() {
+check pc-br "$(enc br /pc/x.js)" "br|Accept-Encoding|$(sha < "$PC/x.js.br")"
+check pc-br-headers "$(hdr content-type)|$(hdr content-length)|$(hdr etag | grep -c -- '-br"$')" "text/javascript; charset=utf-8|$(wc -c < "$PC/x.js.br" | tr -d ' ')|1"
+check pc-zstd "$(enc zstd /pc/x.js)" "zstd|Accept-Encoding|$(sha < "$PC/x.js.zst")"
+check pc-gzip "$(enc gzip /pc/x.js)" "gzip|Accept-Encoding|$(sha < "$PC/x.js.gz")"
+check pc-server-order "$(enc 'gzip, zstd, br' /pc/x.js | cut -d'|' -f1) $(enc '*' /pc/x.js | cut -d'|' -f1)" "br br"
+check pc-qvalues "$(enc 'br;q=0.5, gzip' /pc/x.js | cut -d'|' -f1) $(enc 'br;q=0, zstd;q=0.2, gzip;q=0.1' /pc/x.js | cut -d'|' -f1)" "gzip zstd"
+check pc-identity "$(enc 'br;q=0.5, identity' /pc/x.js) $(enc '' /pc/x.js)" "|Accept-Encoding|$(sha < "$PC/x.js") |Accept-Encoding|$(sha < "$PC/x.js")"
+enc identity /pc/x.js > /dev/null; ET_ID=$(hdr etag)
+enc br /pc/x.js > /dev/null; ET_BR=$(hdr etag); LM_BR=$(hdr last-modified)
+check pc-etags-differ "$([ -n "$ET_ID" ] && [ "$ET_ID" != "$ET_BR" ] && echo yes)" yes
+check pc-304 "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: br' -H "If-None-Match: $ET_BR" -D "$WORK/enc.h" "$B/pc/x.js") $(hdr etag) $(hdr vary)" "304 $ET_BR Accept-Encoding"
+check pc-304-since "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: br' -H "If-Modified-Since: $LM_BR" "$B/pc/x.js")" 304
+check pc-other-coding-not-304 "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: gzip' -H "If-None-Match: $ET_BR" "$B/pc/x.js")" 200
+check pc-head "$(enc br /pc/x.js -I | cut -d'|' -f1,2) $(hdr content-length)" "br|Accept-Encoding $(wc -c < "$PC/x.js.br" | tr -d ' ')"
+check pc-range "$(enc br /pc/x.js -H 'Range: bytes=10-19') $(hdr content-range)" "br|Accept-Encoding|$(dd if="$PC/x.js.br" bs=1 skip=10 count=10 2>/dev/null | sha) bytes 10-19/$(wc -c < "$PC/x.js.br" | tr -d ' ')"
+check pc-if-range "$($CURL -H 'Accept-Encoding: br' -H 'Range: bytes=0-9' -H "If-Range: $ET_ID" "$B/pc/x.js" | sha)" "$(sha < "$PC/x.js.br")"
+check pc-compressed "$($CURL --compressed "$B/pc/x.js" | sha)" "$(sha < "$PC/x.js")"
+check pc-gunzip "$($CURL -H 'Accept-Encoding: gzip' "$B/pc/x.js" | gunzip | sha)" "$(sha < "$PC/x.js")"
+check pc-index "$(enc gzip /pc/d/)" "gzip|Accept-Encoding|$(sha < "$PC/d/index.html.gz")"
+check pc-only-compressed "$(enc gzip /pc/only.js | cut -d'|' -f1) $($CURL -o /dev/null -w '%{http_code}' "$B/pc/only.js")" "gzip 404"
+check pc-variant-not-file "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: gzip' "$B/pc/dir.js")" 404
+check pc-try-files "$(enc gzip /pcspa/only.js | cut -d'|' -f1) $($CURL "$B/pcspa/only.js")" "gzip <h1>pcspa</h1>"
+check pc-traversal "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: gzip' --path-as-is "$B/pc/../../etc/passwd")" 400
+enc gzip /pc/x.js > /dev/null
+check pc-not-recompressed "$(grep -ci '^content-encoding' "$WORK/enc.h")" 1
+# On-the-fly gzip: Vary on both variants, and on 304s.
+check gzip-vary "$(enc gzip /pc/plain.txt | cut -d'|' -f1,2) $(enc '' /pc/plain.txt | cut -d'|' -f1,2)" "gzip|Accept-Encoding |Accept-Encoding"
+check gzip-vary-type "$(enc gzip /pc/x.js.br | cut -d'|' -f1,2)" "|"
+check gzip-head "$(enc gzip /pc/plain.txt -I | cut -d'|' -f1) $(hdr content-length)" "gzip "
+ET_TXT=$($CURL -D - -o /dev/null "$B/pc/plain.txt" | grep -i '^etag' | tr -d '\r' | cut -d' ' -f2)
+check gzip-304 "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: gzip' -H "If-None-Match: W/$ET_TXT" -D "$WORK/enc.h" "$B/pc/plain.txt") $(hdr vary)" "304 Accept-Encoding"
+check gzip-range-uncompressed "$(enc gzip /pc/plain.txt -H 'Range: bytes=0-9' | cut -d'|' -f1,2) $(hdr content-length)" "|Accept-Encoding 10"
+check proxy-encoded-once "$($CURL -H 'Accept-Encoding: gzip' -D "$WORK/enc.h" "$B/gzapi/gzipped" | gunzip | sha) $(hdr content-encoding) $(hdr vary)" "$(noise | sha) gzip "
+check proxy-no-transform "$(enc gzip /gzapi/no-transform)" "||$(noise | sha)"
+check proxy-gzip "$(enc gzip /gzapi/noise | cut -d'|' -f1,2) $($CURL --compressed "$B/gzapi/noise" | sha)" "gzip|Accept-Encoding $(noise | sha)"
+}
 
 suite() {
 B=$1
@@ -121,6 +176,7 @@ check rewrite-redirect "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "
 check rewrite-permanent "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/rwp/permanent/x?q=1")" "301 https://example.com/x?q=1"
 check rewrite-scheme "$($CURL -o /dev/null -w '%{http_code} %{redirect_url}' "$B/rwp/abs/x")" "302 ${B%%:*}://example.com/x"
 check rewrite-loop "$($CURL -o /dev/null -w '%{http_code}' "$B/rwp/loop/x")" 500
+encoding_suite
 [ "$SUITE" == http ] && check smuggling "$(python3 "$HERE/pipe.py" 'POST /api/x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n' | grep -o 'HTTP/1.1 [0-9]*')" "HTTP/1.1 400"
 
 }
