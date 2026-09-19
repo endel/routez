@@ -33,7 +33,7 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   that fails to load is rejected and the running one kept.
 - Per location: gzip for text-like responses, `add_headers`,
   `proxy_set_headers` (set, replace, remove, override Host) and `limit_req`
-  (per-client token bucket).
+  (per-client token bucket, optionally a named zone shared by locations).
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
 - Operations: drops root after binding (`user`, `group`), access and error
@@ -130,6 +130,40 @@ A ZON file; see `src/config.zig` for every field and default.
   not supported. A key that doesn't belong to the first certificate of its
   `cert` file fails the load.
 
+### Client limits
+
+```zig
+.{
+    .limits = .{ .max_connections_per_ip = 100 },
+    .servers = .{.{ .listen = ..., .locations = .{
+        .{ .prefix = "/login", .proxy_pass = "backend", .limit_req = .{ .rate = 2, .burst = 5 } },
+        .{ .prefix = "/api/", .proxy_pass = "backend", .limit_req = .{ .zone = "api", .rate = 50, .burst = 100 } },
+        .{ .prefix = "/v2/", .proxy_pass = "backend", .limit_req = .{ .zone = "api", .rate = 50 } },
+    } }},
+}
+```
+
+- `limit_req` allows each client address `rate` requests per second, and
+  `burst` more at once; the rest get 429 with `Retry-After: 1`. It applies
+  to HTTP/1.1, HTTPS and HTTP/3 alike. Locations naming the same `zone`
+  share each client's bucket (they must agree on `rate`; each has its own
+  `burst`); a location without one has its own.
+- `limits.max_connections_per_ip` caps the TCP connections (HTTP and TLS)
+  one address holds; more are closed at accept.
+- Both count across all workers, and across a reload: buckets carry over
+  (a zone by name, an unnamed one by server name, listen address and
+  prefix), and connections accepted by the old workers count until they
+  close.
+- The counts live in a table of `limits.max_tracked_clients` entries
+  (100 000 by default, about 32 bytes each): one per address holding
+  connections, one per address and zone being limited. Entries are dropped
+  once a bucket has refilled or the last connection closes. When the table
+  is full of live entries, new clients go unlimited, with a warning at most
+  once a minute and the `routez_limit_table_untracked_total` counter,
+  rather than being refused: refusing would let anyone with enough
+  addresses lock out every new client, and those addresses already let
+  them sidestep per-address limits.
+
 ### Operations
 
 ```zig
@@ -170,7 +204,9 @@ A ZON file; see `src/config.zig` for every field and default.
   connections accepted and open (TCP and QUIC), requests by protocol,
   responses by protocol and status class, body bytes in and out, per
   upstream server requests, failures and health-check state, reloads,
-  QUIC datagrams steered between workers, workers, start time and version.
+  QUIC datagrams steered between workers, workers, start time and version,
+  connections and requests refused by the client limits and the occupancy
+  of their table.
   Counters are process-wide and survive reloads. Restrict it like any
   location, for instance on a listener bound to a private address.
 
@@ -323,8 +359,10 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   can reach a worker that doesn't own its connection and is dropped: its
   connection ID is random by design, so QUIC-LB can't steer it. The
   connection then closes at the idle timeout instead of at once.
-- `limit_req` and per-IP limits count per worker, so the effective limit is
-  multiplied by the number of workers.
+- `max_connections_per_ip` counts TCP connections only. A QUIC connection's
+  address isn't validated when it is accepted (a spoofed Initial would
+  count against someone else's) and changes when the client migrates;
+  `max_connections` and `limit_req` bound QUIC clients instead.
 - Static files are read on the worker thread; fine for page-cached files,
   slow disks stall that worker.
 - Upstream pools and health state are per worker, so health checks run once

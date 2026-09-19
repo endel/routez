@@ -303,7 +303,8 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             };
 
             var addr_buf: [64]u8 = undefined;
-            const client = socket.formatSockaddr(session.entry.conn.peerAddress(), &addr_buf);
+            const peer = session.entry.conn.peerAddress();
+            const client = socket.formatSockaddr(peer, &addr_buf);
             const ex = Exchange.create(self.worker, s.downstream(), .{
                 .method = m,
                 .target = p,
@@ -314,6 +315,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .protocol = .http3,
                 .scheme = scheme,
                 .client_addr = client,
+                .client_ip = socket.ipKey(peer) orelse @splat(0),
                 .vhosts = &self.vhosts,
             }) catch {
                 s.destroy();

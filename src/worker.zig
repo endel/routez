@@ -1,6 +1,6 @@
 //! A worker thread: one libxev loop running every listener, client
-//! connection and upstream connection it owns. Workers share nothing but the
-//! config; each binds its listeners with SO_REUSEPORT.
+//! connection and upstream connection it owns. Workers share the config and
+//! a few process-wide tables; each binds its listeners with SO_REUSEPORT.
 const std = @import("std");
 const builtin = @import("builtin");
 const quic = @import("quic");
@@ -21,6 +21,7 @@ const h3_server = @import("h3/server.zig");
 const access_log = @import("access_log.zig");
 const logs = @import("logs.zig");
 const privileges = @import("privileges.zig");
+const client_limits = @import("client_limits.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -170,10 +171,6 @@ pub const Worker = struct {
 
     conns_head: ?*H1Conn = null,
     conn_count: u32 = 0,
-    per_ip: std.AutoHashMapUnmanaged([16]u8, u32) = .empty,
-    /// limit_req token buckets, keyed by location and client address.
-    rate_buckets: std.AutoHashMapUnmanaged(u64, RateBucket) = .empty,
-    rate_sweep_ms: i64 = 0,
     gzip_active: u32 = 0,
 
     stop_async: xev.Async,
@@ -206,6 +203,9 @@ pub const Worker = struct {
         access_format: access_log.Format = .main,
         /// Where access log lines go.
         access_fd: std.posix.fd_t = 2,
+        /// Per-client limits, shared with every other generation; null
+        /// until a config uses them.
+        clients: ?*client_limits.Table = null,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -467,7 +467,7 @@ pub const Worker = struct {
 
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
-        self.sweepRateBuckets();
+        if (self.shared.clients) |tbl| tbl.sweepStep(self.io, quic.sys.nanoTimestamp());
         self.publishQuicStats();
         for (self.quic_listeners.items) |q| switch (q) {
             .wt => |l| l.relay.checkPaused(),
@@ -522,7 +522,11 @@ pub const Worker = struct {
         // Client connections that outlived the drain: close their sockets
         // so a reload doesn't leak them. Their memory goes with the process.
         var c = self.conns_head;
-        while (c) |conn| : (c = conn.next) _ = std.c.close(conn.sock.fd());
+        while (c) |conn| : (c = conn.next) {
+            _ = std.c.close(conn.sock.fd());
+            if (conn.ip_key) |k| self.releaseIp(k);
+            conn.ip_key = null;
+        }
         _ = stats.active_quic.fetchSub(self.quic_active_pub, .monotonic);
         self.quic_active_pub = 0;
         self.timers.stop();
@@ -556,7 +560,7 @@ pub const Worker = struct {
         for (self.groups.items) |g| for (g.peers) |*p| {
             try views.append(self.alloc, .{ .stats = p.stats, .health_checked = g.cfg.health != null });
         };
-        try stats.prometheus(w, views.items);
+        try stats.prometheus(w, views.items, self.shared.clients);
     }
 
     pub fn addConn(self: *Worker, c: *H1Conn) void {
@@ -576,53 +580,20 @@ pub const Worker = struct {
         if (c.ip_key) |k| self.releaseIp(k);
     }
 
-    /// Count a connection against its client address; false when over the limit.
-    fn acquireIp(self: *Worker, key: [16]u8) bool {
-        const limit = self.cfg.limits.max_connections_per_ip;
-        const gop = self.per_ip.getOrPut(self.alloc, key) catch return true;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        if (gop.value_ptr.* >= limit) return false;
-        gop.value_ptr.* += 1;
-        return true;
+    /// Count a connection against its client address, process-wide.
+    fn acquireIp(self: *Worker, key: [16]u8) client_limits.Table.Admit {
+        const t = self.shared.clients orelse return .untracked;
+        return t.acquireConn(self.io, key, self.cfg.limits.max_connections_per_ip, quic.sys.nanoTimestamp());
     }
 
     fn releaseIp(self: *Worker, key: [16]u8) void {
-        const v = self.per_ip.getPtr(key) orelse return;
-        v.* -= 1;
-        if (v.* == 0) _ = self.per_ip.remove(key);
+        if (self.shared.clients) |t| t.releaseConn(self.io, key);
     }
 
-    const RateBucket = struct { milli_tokens: i64, last_ms: i64 };
-
-    /// Token bucket check for `limit_req`: `rate` tokens per second, holding
-    /// at most `burst + 1`. Counted per worker.
-    pub fn allowRequest(self: *Worker, loc: *const config.Location, lim: config.Location.LimitReq, client: []const u8) bool {
-        const now = self.timers.now_ms;
-        const key = std.hash.Wyhash.hash(@intFromPtr(loc), client);
-        const cap: i64 = (@as(i64, lim.burst) + 1) * 1000;
-        const gop = self.rate_buckets.getOrPut(self.alloc, key) catch return true;
-        if (!gop.found_existing) gop.value_ptr.* = .{ .milli_tokens = cap, .last_ms = now };
-        const b = gop.value_ptr;
-        // `rate` tokens per second is `rate` milli-tokens per millisecond.
-        b.milli_tokens = @min(cap, b.milli_tokens + (now - b.last_ms) * @as(i64, lim.rate));
-        b.last_ms = now;
-        if (b.milli_tokens < 1000) return false;
-        b.milli_tokens -= 1000;
-        return true;
-    }
-
-    /// Forget buckets idle long enough to have refilled.
-    fn sweepRateBuckets(self: *Worker) void {
-        const now = self.timers.now_ms;
-        if (now - self.rate_sweep_ms < 10_000) return;
-        self.rate_sweep_ms = now;
-        var stale: std.ArrayListUnmanaged(u64) = .empty;
-        defer stale.deinit(self.alloc);
-        var it = self.rate_buckets.iterator();
-        while (it.next()) |e| {
-            if (now - e.value_ptr.last_ms > 60_000) stale.append(self.alloc, e.key_ptr.*) catch break;
-        }
-        for (stale.items) |k| _ = self.rate_buckets.remove(k);
+    /// `limit_req` for one request, counted across all workers.
+    pub fn allowRequest(self: *Worker, srv: *const config.Server, loc: *const config.Location, lim: config.Location.LimitReq, client: [16]u8) bool {
+        const t = self.shared.clients orelse return true;
+        return t.allowRequest(self.io, client, client_limits.zoneId(srv, loc), lim.rate, lim.burst, quic.sys.nanoTimestamp());
     }
 
     /// Live QUIC connections on this worker.
@@ -787,14 +758,15 @@ pub const Listener = struct {
         stats.inc(&stats.accepted);
         var ip_key: ?[16]u8 = null;
         if (w.cfg.limits.max_connections_per_ip != 0) {
-            if (socket.peerIpKey(tcp.fd)) |k| {
-                if (!w.acquireIp(k)) {
+            if (socket.peerIpKey(tcp.fd)) |k| switch (w.acquireIp(k)) {
+                .counted => ip_key = k,
+                .untracked => {},
+                .refused => {
                     stats.inc(&stats.refused_per_ip);
                     _ = std.c.close(tcp.fd);
                     return;
-                }
-                ip_key = k;
-            }
+                },
+            };
         }
         const conn = H1Conn.create(w, self, tcp) catch |err| {
             log.warn("connection setup: {s}", .{@errorName(err)});

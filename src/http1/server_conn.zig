@@ -50,6 +50,7 @@ pub const Conn = struct {
 
     addr_buf: [64]u8 = undefined,
     addr_len: usize = 0,
+    client_ip: [16]u8 = @splat(0),
 
     next: ?*Conn = null,
     prev: ?*Conn = null,
@@ -78,7 +79,12 @@ pub const Conn = struct {
         const self = try worker.alloc.create(Conn);
         self.* = .{ .worker = worker, .listener = listener, .sock = undefined };
         self.sock.init(self, &worker.loop, &worker.timers, worker.alloc, tcp);
-        const a = socket.peerAddress(self.sock.fd(), &self.addr_buf);
+        var peer: std.posix.sockaddr.storage = undefined;
+        var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const a = if (std.c.getpeername(self.sock.fd(), @ptrCast(&peer), &peer_len) == 0) blk: {
+            self.client_ip = socket.ipKey(&peer) orelse self.client_ip;
+            break :blk socket.formatSockaddr(&peer, &self.addr_buf);
+        } else "-";
         self.addr_len = a.len;
         if (@intFromPtr(a.ptr) != @intFromPtr(&self.addr_buf)) @memcpy(self.addr_buf[0..a.len], a);
         if (listener.tls_config) |tc| {
@@ -327,6 +333,7 @@ pub const Conn = struct {
             .protocol = if (head.version == .http10) .http10 else .http11,
             .scheme = if (self.tls != null) "https" else "http",
             .client_addr = self.clientAddr(),
+            .client_ip = self.client_ip,
             .vhosts = &self.listener.vhosts,
         }) catch {
             self.rejectRequest(500);

@@ -93,6 +93,8 @@ pub const Request = struct {
     protocol: Protocol,
     scheme: []const u8,
     client_addr: []const u8,
+    /// The client's IP (IPv4 mapped), keying per-client limits.
+    client_ip: [16]u8,
 
     pub fn get(self: *const Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -119,6 +121,7 @@ pub const RequestInit = struct {
     protocol: Protocol,
     scheme: []const u8,
     client_addr: []const u8,
+    client_ip: [16]u8,
     vhosts: *const router.VirtualHosts,
 };
 
@@ -189,6 +192,7 @@ pub const Exchange = struct {
             .protocol = init.protocol,
             .scheme = init.scheme,
             .client_addr = try a.dupe(u8, init.client_addr),
+            .client_ip = init.client_ip,
         };
         return ex;
     }
@@ -213,7 +217,8 @@ pub const Exchange = struct {
         self.set_values = self.expandAll(loc.proxy_set_headers) catch return self.sendError(400);
         self.location = loc;
         if (loc.limit_req) |lim| {
-            if (!self.worker.allowRequest(loc, lim, self.req.client_addr)) {
+            if (!self.worker.allowRequest(self.server, loc, lim, self.req.client_ip)) {
+                stats.inc(&stats.requests_limited);
                 const headers = [_]Header{ .{ .name = "retry-after", .value = "1" }, .{ .name = "content-type", .value = "text/plain" } };
                 self.respondHead(&.{ .status = 429, .headers = &headers, .content_length = 0 });
                 return self.respondEnd();

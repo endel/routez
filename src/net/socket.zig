@@ -330,17 +330,22 @@ pub fn peerIpKey(fd: std.posix.socket_t) ?[16]u8 {
     var storage: std.posix.sockaddr.storage = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     if (std.c.getpeername(fd, @ptrCast(&storage), &len) != 0) return null;
-    const sa: *const std.posix.sockaddr = @ptrCast(&storage);
+    return ipKey(&storage);
+}
+
+/// An address's IP as 16 bytes, IPv4 (plain or mapped) in mapped form.
+pub fn ipKey(storage: *const std.posix.sockaddr.storage) ?[16]u8 {
+    const sa: *const std.posix.sockaddr = @ptrCast(storage);
     var key = [_]u8{0} ** 16;
     switch (sa.family) {
         std.posix.AF.INET => {
-            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(storage));
             key[10] = 0xff;
             key[11] = 0xff;
             @memcpy(key[12..16], std.mem.asBytes(&in.addr));
         },
         std.posix.AF.INET6 => {
-            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
             key = in6.addr;
         },
         else => return null,

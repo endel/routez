@@ -9,6 +9,7 @@ const logs = @import("logs.zig");
 const stats = @import("stats.zig");
 const access_log = @import("access_log.zig");
 const privileges = @import("privileges.zig");
+const client_limits = @import("client_limits.zig");
 const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
@@ -96,6 +97,7 @@ const Generation = struct {
         };
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
+        g.shared.clients = try clientTable(&g.cfg);
         g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
         if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
             g.access_file = logs.acquire(io, p) catch |err| {
@@ -153,6 +155,31 @@ const Generation = struct {
         std.heap.smp_allocator.destroy(self);
     }
 };
+
+/// Created for the first config that limits clients, then kept for the
+/// life of the process: every generation counts in it, so connections the
+/// old one accepted are released where they were counted and buckets
+/// carry over a reload.
+var client_table: ?*client_limits.Table = null;
+var client_table_size: u32 = 0;
+
+fn clientTable(cfg: *const config.Config) !?*client_limits.Table {
+    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg);
+    if (client_table) |t| {
+        if (wanted and cfg.limits.max_tracked_clients != client_table_size)
+            log.warn("limits.max_tracked_clients: a change takes effect at the next restart", .{});
+        return t;
+    }
+    if (!wanted) return null;
+    client_table = try client_limits.Table.create(std.heap.smp_allocator, cfg.limits.max_tracked_clients);
+    client_table_size = cfg.limits.max_tracked_clients;
+    return client_table;
+}
+
+fn limitsRequests(cfg: *const config.Config) bool {
+    for (cfg.servers) |srv| for (srv.locations) |loc| if (loc.limit_req != null) return true;
+    return false;
+}
 
 fn applyLogging(io: std.Io, cfg: *const config.Config) !void {
     logs.setErrorLog(io, cfg.error_log) catch |err| {
@@ -346,4 +373,5 @@ test {
     _ = @import("logs.zig");
     _ = @import("privileges.zig");
     _ = @import("stats.zig");
+    _ = @import("client_limits.zig");
 }

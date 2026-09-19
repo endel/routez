@@ -71,8 +71,15 @@ pub const Limits = struct {
     /// that ride out long outages; a vanished peer then holds its slot longer.
     quic_idle_timeout_ms: u32 = 30_000,
     max_connections: u32 = 10_000,
-    /// TCP connections one client address may hold per worker. 0 disables it.
+    /// TCP connections one client address may hold, across all workers.
+    /// 0 disables it.
     max_connections_per_ip: u32 = 0,
+    /// Entries in the table behind `max_connections_per_ip` and `limit_req`:
+    /// one per client address for its connection count, and one per client
+    /// address and zone for each request limit it is under. ~32 bytes each.
+    /// When full, new clients go unlimited (and a warning is logged). Sized
+    /// at start; a change takes effect at the next restart.
+    max_tracked_clients: u32 = 100_000,
 };
 
 pub const Listen = struct {
@@ -165,7 +172,7 @@ pub const Location = struct {
     add_headers: []const HeaderKV = &.{},
     /// Compress text-like responses with gzip for clients that accept it.
     gzip: bool = false,
-    /// Per-client request rate limit, counted per worker.
+    /// Per-client request rate limit, shared by all workers.
     limit_req: ?LimitReq = null,
 
     /// Serve connection and request counters as plain text.
@@ -178,6 +185,10 @@ pub const Location = struct {
         rate: u32,
         /// Extra requests allowed in a burst above the rate.
         burst: u32 = 0,
+        /// Locations naming the same zone share each client's bucket; they
+        /// must agree on `rate`, and each applies its own `burst`. Without
+        /// one, the location has a bucket of its own.
+        zone: ?[]const u8 = null,
     };
 
     pub const Return = struct {
@@ -362,10 +373,21 @@ pub fn validate(cfg: *const Config) error{InvalidConfig}!void {
                 if (r.status < 100 or r.status > 599) return fail("location '{s}': return status {d} is out of range", .{ loc.prefix, r.status });
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
             }
-            if (loc.limit_req) |l| if (l.rate == 0) return fail("location '{s}': limit_req.rate must be > 0", .{loc.prefix});
+            if (loc.limit_req) |l| try checkLimitReq(cfg, loc.prefix, l);
             if (loc.webtransport_pass) |p| try checkTarget(cfg, p);
         }
     }
+}
+
+fn checkLimitReq(cfg: *const Config, prefix: []const u8, l: Location.LimitReq) error{InvalidConfig}!void {
+    if (l.rate == 0) return fail("location '{s}': limit_req.rate must be > 0", .{prefix});
+    const zone = l.zone orelse return;
+    if (zone.len == 0) return fail("location '{s}': limit_req.zone is empty", .{prefix});
+    for (cfg.servers) |srv| for (srv.locations) |other| {
+        const o = other.limit_req orelse continue;
+        const oz = o.zone orelse continue;
+        if (std.mem.eql(u8, oz, zone) and o.rate != l.rate) return fail("limit_req zone '{s}': rates differ ({d} and {d})", .{ zone, o.rate, l.rate });
+    };
 }
 
 fn checkTryFiles(loc: Location) error{InvalidConfig}!void {
@@ -540,6 +562,28 @@ test "quic idle timeout" {
     try std.testing.expectEqual(@as(u32, 120_000), cfg.limits.quic_idle_timeout_ms);
     try std.testing.expectError(error.InvalidConfig, parse(a,
         \\.{ .limits = .{ .quic_idle_timeout_ms = 0 }, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test"));
+}
+
+test "limit_req zones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    _ = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/a", .root = "x", .limit_req = .{ .zone = "api", .rate = 5, .burst = 10 } },
+        \\    .{ .prefix = "/b", .root = "x", .limit_req = .{ .zone = "api", .rate = 5 } },
+        \\    .{ .prefix = "/c", .root = "x", .limit_req = .{ .rate = 1 } },
+        \\} }} }
+    , "test");
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/a", .root = "x", .limit_req = .{ .zone = "api", .rate = 5 } },
+        \\    .{ .prefix = "/b", .root = "x", .limit_req = .{ .zone = "api", .rate = 6 } },
+        \\} }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .zone = "", .rate = 5 } }} }} }
     , "test"));
 }
 

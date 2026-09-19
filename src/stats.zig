@@ -2,6 +2,7 @@
 //! stub_status and Prometheus renderings.
 const std = @import("std");
 const builtin = @import("builtin");
+const client_limits = @import("client_limits.zig");
 
 pub var accepted: std.atomic.Value(u64) = .init(0);
 pub var active_tcp: std.atomic.Value(u64) = .init(0);
@@ -11,6 +12,8 @@ pub var active_quic: std.atomic.Value(u64) = .init(0);
 pub var requests: std.atomic.Value(u64) = .init(0);
 pub var requests_h3: std.atomic.Value(u64) = .init(0);
 pub var refused_per_ip: std.atomic.Value(u64) = .init(0);
+/// Requests answered 429 by `limit_req`.
+pub var requests_limited: std.atomic.Value(u64) = .init(0);
 /// QUIC datagrams handed to the worker owning their connection.
 pub var quic_steered: std.atomic.Value(u64) = .init(0);
 /// Finished responses by protocol (HTTP/1.x, HTTP/3) and status class.
@@ -107,7 +110,7 @@ pub const UpstreamView = struct {
 };
 
 /// The Prometheus text exposition format, version 0.0.4.
-pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView) std.Io.Writer.Error!void {
+pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?*const client_limits.Table) std.Io.Writer.Error!void {
     const load = struct {
         fn f(v: *const std.atomic.Value(u64)) u64 {
             return v.load(.monotonic);
@@ -132,6 +135,14 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView) std.Io.Wri
     try w.print("routez_connections_active{{protocol=\"quic\"}} {d}\n", .{load(&active_quic)});
     try header(w, "routez_connections_refused_per_ip_total", "counter", "TCP connections refused by limits.max_connections_per_ip.");
     try w.print("routez_connections_refused_per_ip_total {d}\n", .{load(&refused_per_ip)});
+    try header(w, "routez_http_requests_limited_total", "counter", "Requests refused with 429 by limit_req.");
+    try w.print("routez_http_requests_limited_total {d}\n", .{load(&requests_limited)});
+    try header(w, "routez_limit_table_entries", "gauge", "Client entries held for max_connections_per_ip and limit_req.");
+    try w.print("routez_limit_table_entries {d}\n", .{if (clients) |t| t.entries() else 0});
+    try header(w, "routez_limit_table_capacity", "gauge", "Client entries the limit table can hold.");
+    try w.print("routez_limit_table_capacity {d}\n", .{if (clients) |t| t.capacity else 0});
+    try header(w, "routez_limit_table_untracked_total", "counter", "Clients let through unlimited because the limit table was full.");
+    try w.print("routez_limit_table_untracked_total {d}\n", .{if (clients) |t| t.untracked.load(.monotonic) else 0});
 
     const h3 = load(&requests_h3);
     try header(w, "routez_http_requests_total", "counter", "HTTP requests received.");
@@ -181,12 +192,12 @@ const Label = struct {
 };
 
 test "prometheus exposition" {
-    var buf: [8192]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var p: Peer = .{ .upstream = "b\"e", .server = "127.0.0.1:1" };
     p.healthy.store(0, .monotonic);
     response(true, 204);
-    try prometheus(&w, &.{ .{ .stats = &p, .health_checked = true }, .{ .stats = &p, .health_checked = false } });
+    try prometheus(&w, &.{ .{ .stats = &p, .health_checked = true }, .{ .stats = &p, .health_checked = false } }, null);
     const text = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "routez_upstream_healthy{upstream=\"b\\\"e\",server=\"127.0.0.1:1\"} 0\n") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "routez_upstream_healthy{"));

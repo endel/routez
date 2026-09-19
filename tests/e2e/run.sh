@@ -161,6 +161,51 @@ SUITE=limits check per-ip-limit "$(python3 "$HERE/conn_limit.py" 25)" 5
 for _ in $(seq 1 20); do $CURL_BIN -s http://127.0.0.1:18080/status | grep -q '^Active connections: ' && break; perl -e 'select(undef,undef,undef,0.05)'; done
 SUITE=limits check stub-status "$($CURL_BIN -s http://127.0.0.1:18080/status | grep -c '^Active connections: ')" 1
 
+# Limits hold across workers: four of them, each taking its share of the
+# connections (on Linux; macOS gives one worker a port's TCP), and HTTP/3.
+cat > "$WORK/shared.zon" <<EOF2
+.{ .access_log = false, .workers = 4, .limits = .{ .max_connections_per_ip = 8 }, .servers = .{.{
+    .listen = .{.{ .address = "127.0.0.1", .port = 18470, .tls = true, .quic = true }, .{ .address = "127.0.0.1", .port = 18471 }},
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{
+        .{ .prefix = "/", .@"return" = .{ .body = "ok" } },
+        .{ .prefix = "/burst", .@"return" = .{ .body = "ok" }, .limit_req = .{ .rate = 1, .burst = 9 } },
+        .{ .prefix = "/za", .@"return" = .{ .body = "ok" }, .limit_req = .{ .zone = "z", .rate = 1, .burst = 5 } },
+        .{ .prefix = "/zb", .@"return" = .{ .body = "ok" }, .limit_req = .{ .zone = "z", .rate = 1, .burst = 5 } },
+        .{ .prefix = "/metrics", .metrics = true },
+    },
+}} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/shared.zon" 2> "$WORK/shared.log" & SHARED=$!; PIDS+=($SHARED)
+wait_port 18471
+SCURL="$CURL_BIN -s --max-time 10 --cacert $CERTS/ca.crt"
+# 40 requests, each on a new connection, well inside a second: rate + burst
+# is 10 (11 if a second ticks by), where per-worker buckets would allow 40.
+codes=$(for i in $(seq 1 40); do echo "url = \"http://127.0.0.1:18471/burst\""; done | $SCURL -K - -Z --parallel-max 8 -H 'Connection: close' -o /dev/null -w '%{http_code}\n')
+ok=$(grep -c 200 <<< "$codes")
+SUITE=shared-limits check limit-req-across-workers "$([ "$ok" -ge 10 ] && [ "$ok" -le 11 ] && echo ok || echo "$ok allowed")" ok
+# One zone behind two locations, and both protocols when curl has HTTP/3:
+# 6 in all, then 429.
+status_of() { for u in "$@"; do $SCURL ${H3:-} -o /dev/null -w '%{http_code} ' "$u"; done; }
+if $CURL_BIN --version | grep -q HTTP3; then
+    zone="$(status_of http://127.0.0.1:18471/za http://127.0.0.1:18471/zb https://127.0.0.1:18470/za)"
+    zone+="$(H3=--http3-only status_of https://127.0.0.1:18470/zb https://127.0.0.1:18470/za https://127.0.0.1:18470/zb https://127.0.0.1:18470/za)"
+else
+    zone="$(status_of http://127.0.0.1:18471/za http://127.0.0.1:18471/zb http://127.0.0.1:18471/za http://127.0.0.1:18471/zb http://127.0.0.1:18471/za http://127.0.0.1:18471/zb http://127.0.0.1:18471/za)"
+fi
+SUITE=shared-limits check zone "$zone" "200 200 200 200 200 200 429 "
+SUITE=shared-limits check per-ip-across-workers "$(python3 "$HERE/conn_limit.py" 20 18471)" 12
+# A reload keeps the buckets (about a second has refilled one request, where
+# a fresh bucket would allow 6), and releases what the old workers counted.
+kill -HUP $SHARED
+for _ in $(seq 1 100); do [ "$(grep -c 'worker [0-3] stopped' "$WORK/shared.log")" -ge 4 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
+after=$(for i in $(seq 1 10); do echo 'url = "http://127.0.0.1:18471/za"'; done | $SCURL -K - -o /dev/null -w '%{http_code}\n' | grep -c 200)
+SUITE=shared-limits check bucket-survives-reload "$([ "$after" -le 4 ] && echo kept || echo "$after allowed")" kept
+SUITE=shared-limits check per-ip-after-reload "$(python3 "$HERE/conn_limit.py" 12 18471)" 4
+for _ in $(seq 1 20); do $SCURL -o /dev/null http://127.0.0.1:18471/ && break; perl -e 'select(undef,undef,undef,0.05)'; done
+SUITE=shared-limits check metrics "$($SCURL http://127.0.0.1:18471/metrics | python3 "$HERE/check_metrics.py" routez_http_requests_limited_total routez_limit_table_capacity)" "$((40 - ok + 1 + 10 - after)) 100032"
+kill $SHARED; wait $SHARED 2>/dev/null
+
 # QUIC connection migration across workers: four workers share UDP 18444;
 # a NAT relay moves the client to a new source port mid-connection, which
 # the kernel usually hashes to another worker. Steering by connection ID
