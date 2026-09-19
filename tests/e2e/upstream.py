@@ -1,4 +1,4 @@
-import http.server, sys, json, ssl, gzip, random
+import http.server, sys, json, ssl, gzip, random, time
 # Text that doesn't shrink much: gzipped, still past routez's 1 KiB minimum.
 NOISE = "".join(random.Random(1).choice("0123456789abcdef") for _ in range(8000)).encode()
 class H(http.server.BaseHTTPRequestHandler):
@@ -32,6 +32,18 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._reply(200, NOISE, "text/plain", headers=[("Cache-Control", "public, no-transform")])
         if self.path == "/noise":
             return self._reply(200, NOISE, "text/plain")
+        if self.path == "/sse":
+            # Server-sent events, a pause between each: the proxy must pass each on as it comes.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i in range(3):
+                if i: time.sleep(0.5)
+                ev = b"data: %d\n\n" % i
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(ev), ev))
+            self.wfile.write(b"0\r\n\r\n")
+            return
         if self.path == "/healthz":
             return self._reply(200, b"ok", "text/plain")
         reply = {"path": self.path, "headers": dict(self.headers), "port": self.server.server_port, "peer_port": self.client_address[1]}

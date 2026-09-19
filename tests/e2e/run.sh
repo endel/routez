@@ -167,6 +167,7 @@ check proxy-path "$($CURL "$B/api/hello?x=1" | json '["path"]')" "/hello?x=1"
 check proxy-xff "$($CURL "$B/api/h" | json '["headers"]["X-Forwarded-For"]')" "127.0.0.1"
 check round-robin "$(for i in 1 2 3 4; do $CURL "$B/api/p" | json '["port"]'; done | sort -u | wc -l | tr -d ' ')" 2
 check chunked-upstream "$($CURL "$B/api/chunked" | wc -c | tr -d ' ')" 5000
+check sse-streamed "$($CURL -N "$B/api/sse" | python3 "$HERE/sse_client.py")" streamed
 check post-sized "$($CURL -X POST --data-binary @"$WORK/www/big.bin" "$B/api/up" | json '["received"]')" 3000000
 check post-chunked "$($CURL -X POST -H 'Transfer-Encoding: chunked' --data-binary @"$WORK/www/big.bin" "$B/api/up" | json '["received"]')" 3000000
 [ "$SUITE" != h3 ] && check keepalive "$($CURL -v "$B/ping" "$B/ping" "$B/api/x" 2>&1 | grep -c 'Re-using\|Reusing')" 2
