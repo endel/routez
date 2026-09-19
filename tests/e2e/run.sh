@@ -30,6 +30,7 @@ gz "$WORK/pc/x.js" "$WORK/pc/x.js.gz"
 cp "$WORK/pc/x.js" "$WORK/pc/d/index.html"; gz "$WORK/pc/d/index.html" "$WORK/pc/d/index.html.gz"
 gz "$WORK/pc/x.js" "$WORK/pc/only.js.gz"
 cp "$WORK/gz/text.txt" "$WORK/pc/plain.txt"
+head -c 3000 /dev/urandom > "$WORK/pc/data.bin"; gz "$WORK/pc/data.bin" "$WORK/pc/data.bin.gz"
 mkdir "$WORK/pc/dir.js.gz"
 echo '<h1>pcspa</h1>' > "$WORK/pcspa/index.html"
 gz "$WORK/pc/x.js" "$WORK/pcspa/only.js.gz"
@@ -104,7 +105,12 @@ check pc-if-range "$($CURL -H 'Accept-Encoding: br' -H 'Range: bytes=0-9' -H "If
 check pc-compressed "$($CURL --compressed "$B/pc/x.js" | sha)" "$(sha < "$PC/x.js")"
 check pc-gunzip "$($CURL -H 'Accept-Encoding: gzip' "$B/pc/x.js" | gunzip | sha)" "$(sha < "$PC/x.js")"
 check pc-index "$(enc gzip /pc/d/)" "gzip|Accept-Encoding|$(sha < "$PC/d/index.html.gz")"
-check pc-only-compressed "$(enc gzip /pc/only.js | cut -d'|' -f1) $($CURL -o /dev/null -w '%{http_code}' "$B/pc/only.js")" "gzip 404"
+check pc-only-compressed "$(enc gzip /pc/only.js | cut -d'|' -f1) $($CURL -o /dev/null -w '%{http_code}' -D "$WORK/enc.h" "$B/pc/only.js") $(hdr vary)" "gzip 404 Accept-Encoding"
+check pc-404-no-variant "$($CURL -o /dev/null -w '%{http_code}' -D "$WORK/enc.h" "$B/pc/none.js") $(hdr vary)" "404 "
+# Vary wherever a variant exists, whatever the type; not where none does.
+check pc-vary-any-type "$(enc '' /pc/data.bin) $(enc gzip /pc/data.bin)" "|Accept-Encoding|$(sha < "$PC/data.bin") gzip|Accept-Encoding|$(sha < "$PC/data.bin.gz")"
+check pc-no-variant-no-vary "$(enc gzip /pcspa/index.html | cut -d'|' -f1,2)" "|"
+check pc-try-files-vary "$(enc '' /pcspa/only.js)" "|Accept-Encoding|$(sha < "$WORK/pcspa/index.html")"
 check pc-variant-not-file "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: gzip' "$B/pc/dir.js")" 404
 check pc-try-files "$(enc gzip /pcspa/only.js | cut -d'|' -f1) $($CURL "$B/pcspa/only.js")" "gzip <h1>pcspa</h1>"
 check pc-traversal "$($CURL -o /dev/null -w '%{http_code}' -H 'Accept-Encoding: gzip' --path-as-is "$B/pc/../../etc/passwd")" 400

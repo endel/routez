@@ -286,8 +286,10 @@ ETag and no `Content-Length`; a HEAD request gets the same headers.
 
 Every response that could be encoded differently for another client,
 compressed or not, carries `Vary: Accept-Encoding` (a static file's 304s
-too), so caches keep the variants apart. An original served in place of a
-precompressed variant gets it when its type is text-like, as for `gzip`.
+too), so caches keep the variants apart. In a `precompressed` location
+that is any response for a path with a variant beside it, taken or not and
+whatever the type, including the 404 for a path whose only file is a
+variant the client doesn't take.
 
 ### Client limits
 

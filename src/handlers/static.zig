@@ -67,6 +67,9 @@ pub const Transfer = struct {
     coding: ?Coding = null,
     /// The candidate served (or whose variant is), which gives the type.
     chosen: usize = 0,
+    /// A variant exists for a path looked at, so the answer depended on
+    /// Accept-Encoding.
+    varied: bool = false,
 
     // The body.
     offset: u64 = 0,
@@ -152,6 +155,7 @@ pub const Transfer = struct {
         t.file = null;
         t.coding = null;
         t.chosen = 0;
+        t.varied = false;
     }
 
     // ---- on an I/O thread, or cache-only on the loop ----
@@ -245,6 +249,7 @@ pub const Transfer = struct {
 
     /// Open the best variant of `path` the client takes, if one exists as
     /// a regular file. It sits beside `path`, so it's no further from root.
+    /// Also notes whether any variant exists, taken or not.
     fn openVariant(t: *Transfer, path: []const u8, i: usize, comptime cached: bool) error{WouldBlock}!bool {
         if (t.offered_len == 0) return false;
         const io = t.io;
@@ -264,12 +269,30 @@ pub const Transfer = struct {
                 file.close(io);
                 continue;
             }
+            t.varied = true;
             t.file = file;
             t.meta = meta;
             t.coding = c;
             t.chosen = i;
             return true;
         }
+        if (!t.varied) for (t.offered[0..t.offered_len]) |c| {
+            if (std.mem.indexOfScalar(Coding, t.accepted[0..t.accepted_len], c) != null) continue;
+            const vpath = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, c.suffix() }) catch continue;
+            const file = t.open(vpath, cached) catch |err| switch (err) {
+                error.WouldBlock => return error.WouldBlock,
+                else => continue,
+            };
+            defer file.close(io);
+            const meta = t.stat(file, cached) catch |err| switch (err) {
+                error.WouldBlock => return error.WouldBlock,
+                else => continue,
+            };
+            if (meta.kind == .file) {
+                t.varied = true;
+                break;
+            }
+        };
         return false;
     }
 
@@ -321,8 +344,9 @@ pub const Transfer = struct {
         switch (t.result) {
             .found => serve(ex, t),
             .status => |status| {
+                const varied = t.varied;
                 release(ex);
-                ex.sendError(status);
+                ex.sendErrorWith(status, if (varied) &.{vary} else &.{});
             },
             .redirect_dir => {
                 release(ex);
@@ -405,8 +429,7 @@ fn serve(ex: *Exchange, t: *Transfer) void {
     const lm_buf = a.create([29]u8) catch return fail(ex);
     const last_modified = common.formatHttpDate(mtime_s, lm_buf);
     // Whether another client could get another coding of this path.
-    const varies = t.coding != null or
-        ((loc.precompressed.len > 0 or loc.gzip) and gzip.compressible(content_type));
+    const varies = t.varied or (loc.gzip and gzip.compressible(content_type));
 
     if (notModified(ex, etag, mtime_s)) {
         release(ex);
@@ -426,8 +449,8 @@ fn serve(ex: *Exchange, t: *Transfer) void {
             .unsatisfiable => {
                 release(ex);
                 const cr = std.fmt.allocPrint(a, "bytes */{d}", .{st.size}) catch return ex.sendError(500);
-                const headers = [_]Header{.{ .name = "content-range", .value = cr }};
-                ex.respondHead(&.{ .status = 416, .headers = &headers, .content_length = 0 });
+                const headers = [_]Header{ .{ .name = "content-range", .value = cr }, vary };
+                ex.respondHead(&.{ .status = 416, .headers = headers[0..if (t.varied) 2 else 1], .content_length = 0 });
                 return ex.respondEnd();
             },
             .range => |r| {

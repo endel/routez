@@ -719,12 +719,23 @@ pub const Exchange = struct {
     /// A small HTML error page. If the response already started, the only
     /// honest signal left is an abort.
     pub fn sendError(self: *Exchange, status: u16) void {
+        self.sendErrorWith(status, &.{});
+    }
+
+    /// `sendError` with up to three more headers.
+    pub fn sendErrorWith(self: *Exchange, status: u16, extra: []const Header) void {
         if (self.done) return;
         if (self.head_sent) return self.respondAbort();
         var buf: [256]u8 = undefined;
         const reason = common.reason(status);
         const body = std.fmt.bufPrint(&buf, "<html><head><title>{d} {s}</title></head><body><h1>{d} {s}</h1></body></html>\n", .{ status, reason, status, reason }) catch unreachable;
-        self.sendFixed(status, "text/html; charset=utf-8", body);
+        var headers: [4]Header = undefined;
+        headers[0] = .{ .name = "content-type", .value = "text/html; charset=utf-8" };
+        const n = @min(extra.len, headers.len - 1);
+        @memcpy(headers[1..][0..n], extra[0..n]);
+        self.respondHead(&.{ .status = status, .headers = headers[0 .. n + 1], .content_length = body.len });
+        if (!self.req.isHead()) self.respondBody(body);
+        self.respondEnd();
     }
 
     /// Called by a handler once it holds nothing that refers to the exchange.
