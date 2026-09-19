@@ -11,6 +11,9 @@ OUT="${OUT:-$HERE/results/$(date -u +%Y%m%dT%H%M%SZ)}"
 IMAGE=routez-bench
 
 mkdir -p "$OUT"
+# The container can't read a worktree's .git, so name the versions here.
+rev() { git -C "$1" describe --always --dirty 2>/dev/null || echo unknown; }
+export ROUTEZ_REV="$(rev "$ROOT")" QUIC_ZIG_REV="$(rev "$QZ")"
 docker build -q -t "$IMAGE" --build-arg "HAPROXY_BRANCH=${HAPROXY_BRANCH:-3.2}" - < "$HERE/Dockerfile" >/dev/null
 # tw_reuse and the wide port range keep the handshake row from running out of ports.
 docker run --rm \
@@ -18,7 +21,7 @@ docker run --rm \
     --sysctl net.ipv4.tcp_tw_reuse=1 \
     --sysctl net.ipv4.ip_local_port_range="1024 65535" \
     --sysctl net.core.somaxconn=4096 \
-    -e WORKERS -e CONNS -e DURATION -e ROUNDS -e WORKLOADS \
+    -e WORKERS -e CONNS -e DURATION -e ROUNDS -e WORKLOADS -e ROUTEZ_REV -e QUIC_ZIG_REV \
     -v "$ROOT:/src/routez:ro" -v "$QZ:/src/quic-zig:ro" \
     -v zigcache:/cache -v "$OUT:/out" \
     "$IMAGE" /src/routez/bench/bench.sh

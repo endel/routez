@@ -120,8 +120,8 @@ done
 git_rev() { git -c safe.directory='*' -C "$1" describe --always --dirty 2>/dev/null || echo unknown; }
 cat > "$OUT/env.txt" <<EOF
 date: $(date -u +%Y-%m-%dT%H:%MZ)
-routez: $(git_rev "$SRC")
-quic-zig: $(git_rev "$SRC_QZ")
+routez: ${ROUTEZ_REV:-$(git_rev "$SRC")}
+quic-zig: ${QUIC_ZIG_REV:-$(git_rev "$SRC_QZ")}
 nginx: $(nginx -v 2>&1 | sed 's|.*/||')
 haproxy: $(haproxy -v | awk 'NR == 1 {sub(/-.*/, "", $3); print $3}')
 wrk: $(wrk -v 2>&1 | awk 'NR == 1 {print $2}')
