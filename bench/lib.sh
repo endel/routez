@@ -45,7 +45,7 @@ echo "building routez (ReleaseFast, -Dcpu=$ZIG_CPU)"
 
 build_tool() { # name: build bench/tools/<name>.zig next to the routez binary
     [ -x "$RUN/$1" ] && return 0
-    zig build-exe -OReleaseFast -mcpu="$ZIG_CPU" -femit-bin="$RUN/$1" "$HERE/tools/$1.zig" || exit 1
+    zig build-exe -OReleaseFast -lc -mcpu="$ZIG_CPU" -femit-bin="$RUN/$1" "$HERE/tools/$1.zig" || exit 1
 }
 
 start() { local name=$1 cpus=$2; shift 2; taskset -c "$cpus" "$@" > "$RUN/$name.log" 2>&1 & PIDS+=($!); }
