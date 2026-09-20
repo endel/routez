@@ -16,9 +16,16 @@ CERTS="$SRC_QZ/interop/certs"
 WWW="$RUN/www"
 export XDG_CACHE_HOME=/cache # so the HTTP/3 curl is fetched once, not per run
 
+# The four h3-conns rows hold the requests in flight at 64 and move them from
+# streams onto connections, which is the axis that separates per-request cost
+# from per-connection cost. Read a single-stream row with care: at one stream per
+# connection h2load's own QUIC client costs milliseconds per request, and every
+# server measures ~2 ms there, so those rows are partly the client's.
 # name           alpn path      streams conns servers label
 ROWS_ALL="
-h3-return        h3   /ping      1      -     all   Fixed response
+h3-conns4        h3   /ping      16     4     all   64 in flight over 4 connections
+h3-conns16       h3   /ping      4      16    all   64 in flight over 16 connections
+h3-conns64       h3   /ping      1      64    all   64 in flight over 64 connections
 h3-return-m10    h3   /ping      10     -     all   Fixed response, 10 streams per connection
 h3-static        h3   /10k.bin   10     -     nohap 10 KB static file
 h3-static-1m     h3   /1m.bin    10     32    nohap 1 MB static file

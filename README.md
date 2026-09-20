@@ -731,26 +731,56 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 | Row | routez | best other | |
 |---|---|---|---|
 | Full TLS handshakes, RSA 2048 | 0.7k/s | 3.2k/s | nginx |
+| gzip on the fly through the proxy | 3.9k/s | 15k/s | HAProxy |
+| gzip on the fly, 100 KB of text | 4.0k/s | 10k/s | nginx |
+| HTTP/3, 64 connections, 1 stream each | 35k/s | 129k/s | HAProxy |
 | HTTP/3, 1 MB static file | 0.8k/s | 2.8k/s | nginx |
 | HTTP/3, 10 KB static file | 77k/s | 232k/s | nginx |
-| HTTP/3, fixed response | 34k/s | 80k/s | nginx |
 | 10k files of 4 KB, one at random | 94k/s | 213k/s | nginx |
-| HTTP/3, reverse proxy | 91k/s | 200k/s | HAProxy |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
 | Full TLS handshakes, ECDSA P-256 | 4.8k/s | 8.2k/s | nginx |
-| gzip on the fly through the proxy | 4.0k/s | 15k/s | HAProxy |
 | Memory per parked keep-alive connection | 2.0 KB | 0.5 KB | nginx |
-| Memory per UDP flow | 2.3 KB | 0.1 KB | nginx stream |
-| gzip on the fly, 100 KB of text | 4.1k/s | 6.0k/s | nginx |
 | A new connection per request | 187k/s | 235k/s | nginx |
 | A reload every 2 s under load | 765 failed | 0 failed | HAProxy |
 
-HTTP/3 is the largest gap and the least CPU-bound: on the fixed-response row
-routez sits at 29% CPU with the client at 11%, so nothing is saturated. Its
-median request takes 2.00 ms against nginx's 0.33 ms over a 125 µs round trip,
-and its handshake 19 ms against 7 ms. Ten streams per connection recover most of
-the throughput, which points at per-connection serialization rather than
-per-request cost.
+Three of these have a known cause:
+
+- **The two gzip rows** are bounded by compressing on the event-loop thread. A
+  100 KB body takes about 700 µs in `std.compress.flate` at level 4, and each
+  worker does one at a time, so three workers give about 4k responses a second,
+  which is what the row reads. The codec is also slower than zlib at the same
+  level.
+- **The file-set row** is latency-bound, not CPU-bound: 256 connections divided
+  by its 2.58 ms p50 is the 94k it serves. A cache miss hands the read to four
+  I/O threads, and the handoff costs two futex round trips and an eventfd wakeup
+  per 4 KB file.
+- **The reload row** force-closes connections it believes are idle, and a
+  connection whose next request is still unread in the kernel looks idle. Closing
+  it then sends RST, which the client sees as a reset request.
+
+**HTTP/3 is about per-connection cost, not per-request cost.** Holding 64
+requests in flight and moving them from streams onto connections:
+
+| Requests in flight | nginx | routez |
+|---|---|---|
+| 4 connections × 16 streams | 80k | 278k |
+| 16 connections × 4 streams | 299k | 132k |
+| 64 connections × 1 stream | 84k | 35k |
+
+routez is the fastest of the three at four connections and the slowest at 64.
+Every received datagram runs a pass over all of that worker's connections, and
+QUIC sends go out one `sendmsg` per datagram with no GSO or `sendmmsg`, so cost
+grows with the number of connections rather than the amount of work. Its CPU per
+request is 22.8 ms per thousand at one stream per connection and 6.2 at ten,
+which is the same effect seen from the other side. A row with one stream per
+connection also carries h2load's own per-request QUIC cost, which is
+milliseconds and appears for every server, so read it as the connection-heavy
+end rather than as a rate.
+
+Rows where routez was thought to be behind and is not, once the comparison was
+fixed: memory per UDP flow reads 1.9 KB against nginx's 61.5 KB, after dropping
+the `proxy_responses 1` that had nginx retiring each session after one reply
+instead of holding the flows.
 
 ### WebSocket connections
 

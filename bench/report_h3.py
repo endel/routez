@@ -11,7 +11,7 @@ SERVERS = [("nginx", "nginx"), ("haproxy", "HAProxy"), ("routez", "routez")]
 LABEL = dict(SERVERS)
 # Filled from the rows h3.sh actually ran; h1 rows pair with the h3 row of the
 # same name so each server's cost of HTTP/3 comes from one client.
-PAIRS = [("h3-return", "h1-return"), ("h3-static", "h1-static"), ("h3-proxy", "h1-proxy")]
+PAIRS = [("h3-return-m10", "h1-return"), ("h3-static", "h1-static"), ("h3-proxy", "h1-proxy")]
 DETAIL = ["rps", "mbps", "p50_us", "p99_us", "max_us", "connect_us", "rtt_us",
           "cpu_ms_per_1k", "rss_kb"]
 
@@ -128,8 +128,9 @@ write_jsonl(out, runs)
 cells = {}
 for r in runs:
     cells.setdefault((r["workload"], r["server"]), []).append(r)
-order = [w for w in ["h3-return", "h3-return-m10", "h3-static", "h3-static-1m", "h3-proxy",
-                     "h1-return", "h1-static", "h1-proxy"] if any(k[0] == w for k in cells)]
+order = [w for w in ["h3-conns4", "h3-conns16", "h3-conns64", "h3-return-m10", "h3-static",
+                     "h3-static-1m", "h3-proxy", "h1-return", "h1-static", "h1-proxy"]
+         if any(k[0] == w for k in cells)]
 labels = {r["workload"]: r["workload"] for r in runs}
 
 notes, saturated = [], False
@@ -201,7 +202,11 @@ if notes:
 if saturated:
     md.append(f"‡ h2load (or the upstream, for a proxy row) was ≥{SATURATED}% busy: the rig may be the "
               "limit, not the server.")
-md += ["", "**HTTP/3 as a share of the same server's HTTP/1.1 rate** (higher is better): what QUIC costs "
+md += ["", "The three `h3-conns` rows hold 64 requests in flight and move them from streams onto "
+       "connections: they separate per-request cost from per-connection cost. A row with one stream "
+       "per connection also carries h2load's own per-request QUIC cost, which is milliseconds and "
+       "shows up for every server, so read it as the connection-heavy end rather than as a rate.", "",
+       "**HTTP/3 as a share of the same server's HTTP/1.1 rate** (higher is better): what QUIC costs "
        "each server, measured by one client.", "", *ratio, "",
        "All figures, per row. Latency and RTT are h2load's own, over a closed-loop load: on a row "
        "where the server answers slowly, the request latency is what caps the rate.", "", *detail, ""]
