@@ -675,6 +675,52 @@ benchmark machine.
 - The last row measures resumed handshakes: wrk reuses the session on each
   new connection. wrk is also at its limit there, so read it as an ordering.
 
+### WebSocket connections
+
+```sh
+bench/run.sh ws   # concurrent WebSocket tunnels, one worker per server
+```
+
+Each server runs as a single process with one worker and proxies WebSocket
+over HTTP/1.1 to a Node.js app built on `ws` (an echo server). The Node app
+with no proxy in front is the baseline. The client opens the connections,
+holds them idle, then sends a fixed total of echoes spread over all of them.
+Results land in `bench/results/ws-<timestamp>/`. Knobs: `LEVELS`
+(1000 10000 50000), `RATE` (10000 echoes/s in total), `HOLD` (5 s),
+`DURATION` (10 s), `ROUNDS` (3), `CLIENTS`, `SERVERS`.
+
+Same machine, 19 Sep 2026: routez 8baf71e with the shared read buffer, Node.js
+22.22 and `ws` 8.21; the server, the app and the client are pinned to
+separate cores. Median of 3 rounds.
+
+**Memory per open connection** (lower is better). This is the server's RSS
+growth over its idle baseline, divided by the number of connections. It
+barely moves between rounds.
+
+| Open connections | nginx | HAProxy | routez |
+|---|---|---|---|
+| 1,000 | 18.2 KB | 15.6 KB | 8.7 KB |
+| 10,000 | 17.9 KB | 5.1 KB | 8.3 KB |
+| 50,000 | 17.8 KB | 4.9 KB | 8.3 KB |
+
+**Echo latency, p99** (lower is better). 10,000 messages per second in
+total, spread over all open connections. "No proxy" is the client talking
+to the app directly.
+
+| Open connections | No proxy | nginx | HAProxy | routez |
+|---|---|---|---|---|
+| 1,000 | 6 ms | 7 ms | 6 ms | 7 ms |
+| 10,000 | 12 ms | 14 ms | 14 ms | 12 ms |
+| 50,000 | 9 ms | 126 ms | 126 ms | 68 ms |
+
+- The p99 is noisy from round to round, above all at 50k connections. The
+  p50 stayed under 1.3 ms everywhere.
+- On Linux, sockets share one read buffer per worker instead of holding
+  16 KiB each; without that, routez held 21 KB per connection here.
+- One Node process can't absorb much more. At 1 message per second per
+  connection it saturates near 25k connections, so the load is a fixed
+  total rather than a rate per connection.
+
 ## Limitations
 
 - ACME: HTTP-01 only, so no wildcard names (they need DNS-01) and port 80

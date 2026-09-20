@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+from rig import SATURATED, busy, cpu_list, load_env, ms, proc_stat, write_jsonl
+
 WORKLOADS = [
     ("return", "Fixed response (`return`)"),
     ("static", "10 KB static file"),
@@ -15,39 +17,14 @@ WORKLOADS = [
 ]
 SERVERS = [("nginx", "nginx"), ("haproxy", "HAProxy"), ("routez", "routez")]
 ERRORS = ("connect", "read", "write", "status", "timeout")
-# Busy % past which wrk or the upstream, not the server, may be the limit.
-SATURATED = 95
-
-
-def cpu_list(spec):
-    a, _, b = spec.partition("-")
-    return range(int(a), int(b or a) + 1)
-
-
-def proc_stat(path):
-    out = {}
-    for line in path.read_text().splitlines():
-        name, *v = line.split()
-        v = [int(x) for x in v[:8]]  # user..steal; guest is already in user
-        out[int(name[3:])] = (sum(v) - v[3] - v[4], sum(v))
-    return out
-
-
-def busy(s0, s1, cpus):
-    pct = [100 * (s1[c][0] - s0[c][0]) / max(1, s1[c][1] - s0[c][1]) for c in cpus]
-    return round(sum(pct) / len(pct))
 
 
 def rate(rps):
     return f"{rps / 1000:.0f}k" if rps >= 10_000 else f"{rps / 1000:.1f}k"
 
 
-def ms(us):
-    return f"{us / 1000:.2f} ms"
-
-
 out = Path(sys.argv[1])
-env = dict(line.split(": ", 1) for line in (out / "env.txt").read_text().splitlines())
+env = load_env(out)
 groups = {g: cpu_list(env[f"{g}_cpus"]) for g in ("server", "wrk", "upstream")}
 hs_groups = {**groups, "wrk": cpu_list(env["handshake_wrk_cpus"])}
 
@@ -67,9 +44,7 @@ for txt in sorted((out / "raw").glob("*.txt")):
         "errors": {k: j[k] for k in ERRORS if j[k]},
         "cpu": {g: busy(s0, s1, c) for g, c in (hs_groups if workload == "tls-handshake" else groups).items()},
     })
-with open(out / "results.jsonl", "w") as f:
-    for r in runs:
-        f.write(json.dumps(r) + "\n")
+write_jsonl(out, runs)
 
 cells = {}
 for r in runs:

@@ -1,4 +1,5 @@
-# nginx (nginx.org stable), HAProxy (LTS PPA), wrk and Zig, for bench/run.sh.
+# nginx (nginx.org stable), HAProxy (LTS PPA), wrk, Zig and Node.js with `ws`,
+# for bench/run.sh.
 FROM ubuntu:26.04
 ARG ZIG_VERSION=0.16.0
 ARG HAPROXY_BRANCH=3.2
@@ -7,6 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg xz-utils unzip software-properties-common \
         build-essential libssl-dev openssl python3 rsync git util-linux \
+        iproute2 procps nodejs npm \
     && . /etc/os-release \
     && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/nginx.gpg] https://nginx.org/packages/ubuntu $VERSION_CODENAME nginx" \
@@ -26,3 +28,6 @@ RUN curl -fsSL "https://github.com/wg/wrk/archive/refs/tags/$WRK_VERSION.tar.gz"
     && cp wrk /usr/local/bin/ && cd / && rm -rf "/tmp/wrk-$WRK_VERSION"
 RUN curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt \
     && ln -s "/opt/zig-$(uname -m)-linux-$ZIG_VERSION/zig" /usr/local/bin/zig
+ARG WS_VERSION=8
+RUN mkdir /opt/ws && cd /opt/ws && npm install --no-audit --no-fund "ws@$WS_VERSION"
+ENV NODE_PATH=/opt/ws/node_modules
