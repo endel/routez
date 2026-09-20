@@ -3,13 +3,16 @@
 # of workloads.txt, measured one server at a time with wrk. Runs inside
 # bench/run.sh's container; directly on a Linux host it needs root and what
 # bench/Dockerfile installs.
-# Knobs: WORKERS, CONNS, DURATION (seconds), ROUNDS, WORKLOADS (subset of rows), OUT.
+# Knobs: WORKERS, CONNS, DURATION (seconds), ROUNDS, WORKLOADS (subset of rows),
+# ACCESS_LOG (off/on — on for all three servers, to price the log), OUT.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORKERS=${WORKERS:-3}
 CONNS=${CONNS:-256}
 DURATION=${DURATION:-10}
 ROUNDS=${ROUNDS:-3}
+ACCESS_LOG=${ACCESS_LOG:-off}
+case $ACCESS_LOG in off|on) ;; *) echo "ACCESS_LOG is off or on"; exit 1 ;; esac
 
 . "$HERE/lib.sh"
 CERTS="$SRC_QZ/interop/certs"
@@ -115,7 +118,8 @@ PY
 }
 for w in "${WORKLOADS[@]}"; do
     case ${W_CHECK[$w]} in
-        file:*|head:*) bin "${W_CHECK[$w]#*:}" ;;
+        post:*) head -c "$((1024 * 1024))" /dev/zero | tr '\0' x > "$RUN/post.body" ;;
+        file:*) bin "${W_CHECK[$w]#*:}" ;;
         gz:*) text "${W_CHECK[$w]#*:}" ;;
         set) fileset ;;
         ims) bin "$(basename "${W_PATH[$w]}")" ;;
@@ -124,8 +128,14 @@ done
 
 # ---------------------------------------------------------------------- configs
 cat "$CERTS/server.crt" "$CERTS/server.key" > "$RUN/server.pem"
+if [ "$ACCESS_LOG" == on ]; then
+    NGINX_LOG=$RUN/access-nginx.log ROUTEZ_LOG=true HAPROXY_LOG='option httplog'
+else
+    NGINX_LOG=off ROUTEZ_LOG=false HAPROXY_LOG='no log'
+fi
 for f in nginx.conf haproxy.cfg routez.zon upstream.conf; do
-    sed "s|UPSTREAM_WORKERS|$UPSTREAM_WORKERS|g; s|WORKERS|$WORKERS|g; s|WWW|$WWW|g; s|CERTS|$CERTS|g; s|RUN|$RUN|g" \
+    sed "s|UPSTREAM_WORKERS|$UPSTREAM_WORKERS|g; s|WORKERS|$WORKERS|g; s|WWW|$WWW|g; s|CERTS|$CERTS|g; \
+         s|ACCESS_LOG|$NGINX_LOG|g; s|ROUTEZ_LOG|$ROUTEZ_LOG|g; s|HAPROXY_LOG|$HAPROXY_LOG|g; s|RUN|$RUN|g" \
         "$HERE/conf/$f" > "$RUN/$f"
 done
 # The 304 rows need the file's own Last-Modified, so both the gate and wrk send
@@ -203,6 +213,10 @@ check_cell() { # workload server
             [ "$CODE" == 404 ] || bad "$s $w: status $CODE, want 404" ;;
         pipe:*)
             python3 "$HERE/tools/pipecheck.py" "$url" "${W_CHECK[$w]#*:}" pong || bad "$s $w: pipelining" ;;
+        post:*)
+            fetch "$url" --data-binary "@$RUN/post.body" -H 'Content-Type: application/octet-stream'
+            [ "$CODE" == 200 ] || { bad "$s $w: status $CODE"; return; }
+            [ "$(cat "$RUN/body")" == pong ] || bad "$s $w: body '$(head -c 60 "$RUN/body")'" ;;
         gz:*)
             f=$WWW/${W_CHECK[$w]#*:}
             fetch "$url" -H 'Accept-Encoding: gzip'
@@ -232,6 +246,7 @@ workers: $WORKERS
 conns: $CONNS
 duration: $DURATION
 rounds: $ROUNDS
+access_log: $ACCESS_LOG
 pinning: $PINNING
 server_cpus: $SERVER_CPUS
 wrk_cpus: $WRK_CPUS

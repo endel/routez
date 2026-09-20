@@ -48,7 +48,8 @@ for txt in sorted((out / "raw").glob("*.txt")):
     if limiter >= SATURATED:
         flags.append(f"rig {limiter}% busy")
     r = row(env, "http", workload, server, rnd,
-            {"workers": int(env["workers"]), "conns": int(env["conns"])},
+            {"workers": int(env["workers"]), "conns": int(env["conns"]),
+             "log": env.get("access_log", "off")},
             # Ranked: wrk keeps the connections full, so these are the row's real result.
             {"rps": round(j["requests"] / secs),
              "cpu_ms_per_1k": cpu_ms_per_1k(s0, s1, server_cpus, j["requests"]),

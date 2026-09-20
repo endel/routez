@@ -1,7 +1,8 @@
 // routez under test: plain on :19081, TLS on :19444.
 .{
     .workers = WORKERS,
-    .access_log = false,
+    .access_log = ROUTEZ_LOG,
+    .access_log_path = "RUN/access-routez.log",
     .servers = .{.{
         .listen = .{
             .{ .address = "127.0.0.1", .port = 19081 },
@@ -12,9 +13,67 @@
             .{ .prefix = "/", .root = "WWW" },
             .{ .prefix = "/ping", .@"return" = .{ .body = "pong", .content_type = "text/plain" } },
             .{ .prefix = "/up/", .proxy_pass = "be" },
+            .{ .prefix = "/up1m/", .proxy_pass = "be1m" },
+            .{ .prefix = "/ups/", .proxy_pass = "betls" },
+            .{ .prefix = "/up8/", .proxy_pass = "be8" },
+            .{ .prefix = "/up8lc/", .proxy_pass = "be8lc" },
+            .{ .prefix = "/nk/", .proxy_pass = "benk" },
+            .{ .prefix = "/upz/", .proxy_pass = "bez", .gzip = true },
             // Compression rows only, so the other static rows stay uncompressed.
             .{ .prefix = "/z/", .root = "WWW", .gzip = true, .precompressed = .{.gzip} },
+            // What a feature costs when it is on but never fires.
+            .{
+                .prefix = "/lr/",
+                .limit_req = .{ .rate = 1_000_000, .burst = 1000 },
+                .@"return" = .{ .body = "pong", .content_type = "text/plain" },
+            },
+            .{
+                .prefix = "/acl/",
+                .access = .{ .{ .allow = "127.0.0.0/8" }, .{ .deny = "all" } },
+                .@"return" = .{ .body = "pong", .content_type = "text/plain" },
+            },
+            // A location needs a handler even when `last` sends the request
+            // elsewhere, so root is the one that must not be reached: if the
+            // rewrite stopped firing the gate would see its 404, not "pong".
+            .{
+                .prefix = "/rw/",
+                .rewrite = .{.{ .regex = "^/rw/(.*)$", .replacement = "/ping", .flag = .last }},
+                .root = "WWW",
+            },
         },
     }},
-    .upstreams = .{.{ .name = "be", .servers = .{"127.0.0.1:19090"}, .keepalive = 64 }},
+    .upstreams = .{
+        .{ .name = "be", .servers = .{"127.0.0.1:19090"}, .keepalive = 64 },
+        .{ .name = "be1m", .servers = .{"127.0.0.1:19099"}, .keepalive = 64 },
+        .{ .name = "bez", .servers = .{"127.0.0.1:19100"}, .keepalive = 64 },
+        .{ .name = "betls", .servers = .{"127.0.0.1:19098"}, .keepalive = 64, .tls = true },
+        // A fresh upstream connection per request, spread over eight addresses
+        // so the row measures the server and not the ephemeral port range.
+        .{
+            .name = "benk",
+            .servers = .{
+                "127.0.0.1:19101", "127.0.0.2:19101", "127.0.0.3:19101", "127.0.0.4:19101",
+                "127.0.0.5:19101", "127.0.0.6:19101", "127.0.0.7:19101", "127.0.0.8:19101",
+            },
+            .keepalive = 0,
+        },
+        .{
+            .name = "be8",
+            .servers = .{
+                "127.0.0.1:19090", "127.0.0.1:19091", "127.0.0.1:19092", "127.0.0.1:19093",
+                "127.0.0.1:19094", "127.0.0.1:19095", "127.0.0.1:19096", "127.0.0.1:19097",
+            },
+            .balance = .round_robin,
+            .keepalive = 64,
+        },
+        .{
+            .name = "be8lc",
+            .servers = .{
+                "127.0.0.1:19090", "127.0.0.1:19091", "127.0.0.1:19092", "127.0.0.1:19093",
+                "127.0.0.1:19094", "127.0.0.1:19095", "127.0.0.1:19096", "127.0.0.1:19097",
+            },
+            .balance = .least_conn,
+            .keepalive = 64,
+        },
+    },
 }

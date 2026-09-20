@@ -30,5 +30,15 @@ not-modified     http   /10k.bin        ims        nohap   ims           no     
 notfound         http   /nope.bin       -          nohap   404           no       -     404 for a missing file
 bigheaders       http   /ping           bigheaders all     pong          no       -     Fixed response, 1.5 KB of request headers
 pipeline         http   /ping           pipeline   all     pipe:16       no       -     Fixed response, 16 requests pipelined
+proxy-1m         http   /up1m/          -          all     file:1m.bin    yes     64    Reverse proxy, 1 MB response
+proxy-post       http   /up/            post1m     all     post:1m        yes     64    Reverse proxy, 1 MB upload
+proxy-nokeep     http   /nk/            -          all     pong           yes     -     Reverse proxy, a new upstream connection each time
+proxy-tls        http   /ups/           -          all     pong           yes     -     Reverse proxy over TLS to the upstream
+proxy-8rr        http   /up8/           -          all     pong           yes     -     Reverse proxy, 8 upstreams, round-robin
+proxy-8lc        http   /up8lc/         -          all     pong           yes     -     Reverse proxy, 8 upstreams, least-conn
+proxy-gzip       http   /upz/           gzip       all     gz:z/text.html yes     -     gzip on the fly through the proxy
+limitreq         http   /lr/            -          all     pong           no      -     Fixed response, a rate limit armed
+acl              http   /acl/           -          all     pong           no      -     Fixed response, an IP allow list
+rewrite          http   /rw/x           -          all     pong           no      -     Fixed response behind a rewrite
 gzip             http   /z/text.html    gzip       nohap   gz:z/text.html no      -     gzip on the fly, 100 KB of text
 precompressed    http   /z/pre.html     gzip       nohap   gz:z/pre.html  no      -     Precompressed `.gz`, 100 KB of text
