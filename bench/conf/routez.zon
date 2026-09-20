@@ -2,6 +2,8 @@
 .{
     .workers = WORKERS,
     .access_log = ROUTEZ_LOG,
+    // Above anything the connection sweep offers, so the cap is never the limit.
+    .limits = .{ .max_connections = 100_000 },
     .access_log_path = "RUN/access-routez.log",
     .servers = .{.{
         .listen = .{
