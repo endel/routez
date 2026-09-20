@@ -41,6 +41,13 @@ for txt in sorted((out / "raw").glob("*.txt")):
     expected = ERRORS if workloads[workload]["check"] not in EXPECTS_NON_2XX \
         else tuple(k for k in ERRORS if k != "status")
     errs = {k: j[k] for k in expected if j[k]}
+    # A compression row that served some responses uncompressed measured a
+    # cheaper job than the row claims.
+    for line in txt.read_text().splitlines():
+        if line.startswith('{"uncompressed"'):
+            n = json.loads(line)["uncompressed"]
+            if n:
+                flags.append(f"{n} of {j['requests']} responses came back uncompressed")
     if errs:
         flags.append("errors: " + ", ".join(f"{n} {k}" for k, n in errs.items()))
     # The load generator (or, on a proxy row, the upstream) may be the limit.
@@ -120,6 +127,11 @@ for w in order:
     vs = f"{100 * (med(ours, 'rps') / best - 1):+.0f}%" if ours and best else ""
     table.append(f"| {label} | " + " | ".join(cols) + f" | {vs} |")
 
+COMPRESSION_NOTE = (
+    "— the compression rows: nginx and routez both compress at level 4, but this HAProxy is built "
+    "with libslz and no zlib, a stateless fixed-Huffman encoder with no level, so its cell compares "
+    "a different encoder rather than a different setting.")
+
 md = [
     f"nginx {env['nginx']}, HAProxy {env['haproxy']}, routez {env['routez']} (quic-zig {env['quic-zig']}), "
     f"{env['workers']} workers each. `wrk -c{env['conns']}`, keep-alive, median of {env['rounds']} × "
@@ -128,6 +140,8 @@ md = [
     f"certificate. routez built with `-Dcpu={env['zig_cpu']}`. {env['date']}.",
     "", *table, "", "— HAProxy isn't a file server.",
 ]
+if any(k[0] in ("gzip", "precompressed", "proxy-gzip") for k in cells):
+    md.append(COMPRESSION_NOTE)
 if notes:
     md.append("† socket errors or non-2xx responses in at least one round: " + "; ".join(notes) + ".")
 if saturated:
