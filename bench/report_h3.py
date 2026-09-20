@@ -4,8 +4,8 @@ import re
 import sys
 from pathlib import Path
 
-from rig import (METRICS, SATURATED, busy, cpu_list, cpu_ms_per_1k, load_env, med,
-                 proc_stat, rate, read_jsonl, row, spread, write_jsonl)
+from rig import (METRICS, SATURATED, busy, cpu_list, cpu_ms_per_1k, load_env, med, proc_stat,
+                 rate, read_int, read_jsonl, row, spread, write_jsonl)
 
 SERVERS = [("nginx", "nginx"), ("haproxy", "HAProxy"), ("routez", "routez")]
 LABEL = dict(SERVERS)
@@ -117,7 +117,7 @@ for txt in sorted((out / "raw").glob("*.txt")):
             {"workers": int(env["workers"]), "conns": int(env["conns"])},
             {"rps": round(j["rps"]),
              "cpu_ms_per_1k": cpu_ms_per_1k(s0, s1, server_cpus, j.get("succeeded", 0)),
-             "rss_kb": int(rss.read_text()) if rss.exists() else None},
+             "rss_kb": read_int(rss)},
             {"mbps": j["mbps"], "cpu_pct": cpu["server"],
              **{k: j.get(k) for k in ("p50_us", "p99_us", "max_us", "connect_us", "rtt_us")}},
             flags)

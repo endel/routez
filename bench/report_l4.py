@@ -9,8 +9,8 @@ import re
 import sys
 from pathlib import Path
 
-from rig import (METRICS, SATURATED, busy, cpu_list, cpu_ms_per_1k, load_env, med,
-                 proc_stat, rate, row, write_jsonl)
+from rig import (METRICS, SATURATED, busy, cpu_list, cpu_ms_per_1k, load_env, med, proc_stat,
+                 rate, read_int, row, write_jsonl)
 
 SERVERS = [("direct", "No proxy"), ("nginx", "nginx stream"), ("haproxy", "HAProxy tcp"),
            ("routez", "routez")]
@@ -41,8 +41,9 @@ for txt in sorted((out / "raw").glob("*.txt")):
     base = txt.parent / f"{workload}.{server}.base"
     rss = txt.with_suffix(".rss")
     grew = None
-    if base.exists() and rss.exists():
-        grew = int(rss.read_text()) - int(base.read_text())
+    a, b2 = read_int(base), read_int(rss)
+    if a is not None and b2 is not None:
+        grew = b2 - a
     flags = []
     metrics, detail = {}, {"cpu_pct": cpu["server"]}
     if workload in UDP_ROWS:
@@ -76,7 +77,7 @@ for txt in sorted((out / "raw").glob("*.txt")):
     if server != "direct":
         metrics["cpu_ms_per_1k"] = cpu_ms_per_1k(s0, s1, server_cpus, done)
         if grew is not None and workload != "udp-flows":
-            detail["rss_kb"] = int(rss.read_text())
+            detail["rss_kb"] = read_int(rss)
     limiter = max(cpu["load"], cpu["backend"])
     if limiter >= SATURATED:
         flags.append(f"rig {limiter}% busy")

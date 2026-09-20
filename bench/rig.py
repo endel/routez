@@ -87,6 +87,14 @@ def load_workloads(here: Path):
     return out
 
 
+def read_int(path: Path):
+    """A sample file a racing process left empty reads as missing, not as zero."""
+    if not path.exists():
+        return None
+    text = path.read_text().strip()
+    return int(text) if text else None
+
+
 def load_env(out: Path):
     return dict(line.split(": ", 1) for line in (out / "env.txt").read_text().splitlines())
 

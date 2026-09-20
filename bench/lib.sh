@@ -32,7 +32,12 @@ fi
 RUN="$(mktemp -d)"
 chmod 755 "$RUN" # nginx's workers drop to an unprivileged user
 PIDS=()
-cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; rm -rf "$RUN"; }
+cleanup() {
+    local p
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null; done
+    rm -rf "$RUN"
+}
 trap cleanup EXIT
 
 # Zig 0.16 detects some arm64 cores as `generic` without AES (Apple silicon
@@ -66,20 +71,25 @@ wait_udp() { # a UDP listener has no handshake to wait on; look for the socket
     echo "udp port $1 never came up"; tail -n 20 "$RUN"/*.log; exit 1
 }
 
+# A sampled process can be gone between listing it and reading it — a reload
+# replaces workers under us — so every read falls back to 0 rather than to an
+# empty string, which would break the arithmetic.
 tree_rss() { # pid -> kB resident in it and its children (nginx is master+workers)
-    local t=0 p
+    local t=0 p v
     [ -n "${1:-}" ] || { echo 0; return; }
     for p in $1 $(pgrep -P "$1" 2>/dev/null); do
-        t=$((t + $(awk '/^VmRSS/ {print $2}' "/proc/$p/status" 2>/dev/null || echo 0)))
+        v=$(awk '/^VmRSS/ {print $2}' "/proc/$p/status" 2>/dev/null)
+        t=$((t + ${v:-0}))
     done
     echo "$t"
 }
 
 open_fds() { # pid -> descriptors it and its children hold
-    local t=0 p
+    local t=0 p v
     [ -n "${1:-}" ] || { echo 0; return; }
     for p in $1 $(pgrep -P "$1" 2>/dev/null); do
-        t=$((t + $(ls "/proc/$p/fd" 2>/dev/null | wc -l)))
+        v=$(ls "/proc/$p/fd" 2>/dev/null | wc -l)
+        t=$((t + ${v:-0}))
     done
     echo "$t"
 }

@@ -42,6 +42,7 @@ docker run --rm \
     -e WORKERS -e CONNS -e DURATION -e ROUNDS -e WORKLOADS -e ROUTEZ_REV -e QUIC_ZIG_REV \
     -e LEVELS -e RATE -e HOLD -e CLIENTS -e SERVERS \
     -e SWEEP -e SWEEP_VALUES -e STREAMS -e PPS -e FLOWS -e SOAK_MINUTES -e ROWS \
+    -e HANDSHAKES -e ACCESS_LOG -e PHASE -e SAMPLE \
     -v "$ROOT:/src/routez:ro" -v "$QZ:/src/quic-zig:ro" \
     -v zigcache:/cache -v "$OUT:/out" \
     "$IMAGE" "/src/routez/bench/$SCRIPT"

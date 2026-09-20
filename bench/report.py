@@ -4,8 +4,8 @@ import json
 import sys
 from pathlib import Path
 
-from rig import (METRICS, SATURATED, busy, cpu_list, cpu_ms_per_1k, load_env,
-                 load_workloads, med, proc_stat, rate, row, spread, write_jsonl)
+from rig import (METRICS, SATURATED, busy, cpu_list, cpu_ms_per_1k, load_env, load_workloads,
+                 med, proc_stat, rate, read_int, row, spread, write_jsonl)
 
 HERE = Path(__file__).parent
 SERVERS = [("nginx", "nginx"), ("haproxy", "HAProxy"), ("routez", "routez")]
@@ -53,7 +53,7 @@ for txt in sorted((out / "raw").glob("*.txt")):
             # Ranked: wrk keeps the connections full, so these are the row's real result.
             {"rps": round(j["requests"] / secs),
              "cpu_ms_per_1k": cpu_ms_per_1k(s0, s1, server_cpus, j["requests"]),
-             "rss_kb": int(rss.read_text()) if rss.exists() else None},
+             "rss_kb": read_int(rss)},
             # Not ranked: closed-loop latency tracks 1/throughput, and every
             # server pins its cores. The fixed-rate rows are where latency counts.
             # Bandwidth restates req/s whenever the body is a fixed size, which

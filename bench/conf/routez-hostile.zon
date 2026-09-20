@@ -1,0 +1,42 @@
+// routez for the hostile suite: two upstreams (for the failover row), an RSA
+// certificate beside the ECDSA one, and a rate limit keyed on the client.
+// Resumption is left on everywhere: the handshake rows use a client that never
+// offers a session, so every server does a full handshake. routez has no config
+// for turning tickets off, which is why the row is driven from the client.
+.{
+    .workers = WORKERS,
+    .access_log = false,
+    .limits = .{ .max_connections = 200_000 },
+    .servers = .{
+        .{
+            .listen = .{
+                .{ .address = "127.0.0.1", .port = 19081 },
+                .{ .address = "127.0.0.1", .port = 19444, .tls = true },
+            },
+            .tls = .{ .cert = "CERTS/server.crt", .key = "CERTS/server.key" },
+            .locations = .{
+                .{ .prefix = "/", .root = "WWW" },
+                .{ .prefix = "/ping", .@"return" = .{ .body = "pong", .content_type = "text/plain" } },
+                .{ .prefix = "/up/", .proxy_pass = "be" },
+                .{
+                    .prefix = "/lr/",
+                    .limit_req = .{ .rate = 100, .burst = 10 },
+                    .@"return" = .{ .body = "pong", .content_type = "text/plain" },
+                },
+            },
+        },
+        .{
+            .listen = .{.{ .address = "127.0.0.1", .port = 19485, .tls = true }},
+            .tls = .{ .cert = "RUN/rsa.crt", .key = "RUN/rsa.key" },
+            .locations = .{
+                .{ .prefix = "/ping", .@"return" = .{ .body = "pong", .content_type = "text/plain" } },
+            },
+        },
+    },
+    .upstreams = .{.{
+        .name = "be",
+        // :19102 is killed by the failover row; the shared backend stays up.
+        .servers = .{ "127.0.0.1:19090", "127.0.0.1:19102" },
+        .keepalive = 64,
+    }},
+}
