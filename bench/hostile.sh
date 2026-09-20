@@ -20,21 +20,22 @@ CERTS="$SRC_QZ/interop/certs"
 WWW="$RUN/www"
 build_tool holdconn
 
-# name             kind       label
+# name             kind       servers label
 ROWS_ALL="
-idle               hold       Parked keep-alive connections
-slowhead           hold       Request heads that never end
-storm              storm      A new connection per request
-handshake-ecdsa    handshake  Full TLS handshakes, ECDSA P-256
-handshake-rsa      handshake  Full TLS handshakes, RSA 2048
-reload             reload     A reload every 2 s under load
-failover           failover   An upstream killed mid-run
+idle               hold       all   Parked keep-alive connections
+slowhead           hold       all   Request heads that never end
+slowread           hold       nohap Clients reading a 1 MB body a trickle at a time
+storm              storm      all   A new connection per request
+handshake-ecdsa    handshake  all   Full TLS handshakes, ECDSA P-256
+handshake-rsa      handshake  all   Full TLS handshakes, RSA 2048
+reload             reload     all   A reload every 2 s under load
+failover           failover   all   An upstream killed mid-run
 "
-declare -A R_KIND R_LABEL
+declare -A R_KIND R_SERVERS R_LABEL
 ORDER=()
-while read -r name kind label; do
+while read -r name kind servers label; do
     [ -n "${name:-}" ] || continue
-    ORDER+=("$name") R_KIND[$name]=$kind R_LABEL[$name]=$label
+    ORDER+=("$name") R_KIND[$name]=$kind R_SERVERS[$name]=$servers R_LABEL[$name]=$label
 done <<< "$ROWS_ALL"
 read -ra ROWS <<< "${ROWS:-${ORDER[*]}}"
 for r in "${ROWS[@]}"; do
@@ -46,6 +47,10 @@ declare -A PLAIN=([nginx]=19080 [routez]=19081 [haproxy]=19082)
 declare -A TLS=([nginx]=19443 [routez]=19444 [haproxy]=19445)
 declare -A RSA=([nginx]=19484 [routez]=19485 [haproxy]=19486)
 declare -A SPID=()
+# HAProxy is not a file server, so a row that asks for a file would measure its
+# error page rather than the abuse.
+serves() { [ "${R_SERVERS[$1]}" == all ] || [ "$2" != haproxy ]; }
+active() { local s; for s in "${SERVERS[@]}"; do serves "$1" "$s" && echo "$s"; done; }
 
 NCPU=$(nproc)
 BACK_WORKERS=2
@@ -160,11 +165,14 @@ run_row() { # row server seconds prefix
         hold)
             # Hold the connections, sample the server's memory while they are
             # held, and measure what a well-behaved client still gets.
-            local mode=idle
+            local mode=idle req=/ping
             [ "$r" == slowhead ] && mode=partial
+            # A body the server has to hold while the client barely reads it.
+            [ "$r" == slowread ] && mode=slow req=/1m.bin
             tree_rss "${SPID[$s]}" > "$f.rss0"
             taskset -c "$LOAD_CPUS" "$RUN/holdconn" "127.0.0.1:${PLAIN[$s]}" \
-                --count "$HOLD_COUNT" --mode "$mode" --seconds $((secs + 6)) > "$f.hold" 2>&1 &
+                --count "$HOLD_COUNT" --mode "$mode" --request "$req" \
+                --seconds $((secs + 6)) > "$f.hold" 2>&1 &
             pid=$!
             sleep 5 # let them all be open before anything is measured
             tree_rss "${SPID[$s]}" > "$f.rss1"
@@ -213,16 +221,17 @@ run_row() { # row server seconds prefix
 }
 
 for r in "${ROWS[@]}"; do
+    mapfile -t act < <(active "$r")
     up_servers
-    for s in "${SERVERS[@]}"; do
+    for s in "${act[@]}"; do
         # The quiet baseline this row is read against.
         f="$OUT/raw/$r.$s.base"
         tree_rss "${SPID[$s]}" > "$f.rss"
         wrk_ping "$s" 3 "$f.txt"
     done
     for n in $(seq 1 "$ROUNDS"); do
-        for i in $(seq 0 $((${#SERVERS[@]} - 1))); do
-            s=${SERVERS[$(((i + n - 1) % ${#SERVERS[@]}))]}
+        for i in $(seq 0 $((${#act[@]} - 1))); do
+            s=${act[$(((i + n - 1) % ${#act[@]}))]}
             f="$OUT/raw/$r.$s.$n"
             sleep 1
             grep '^cpu[0-9]' /proc/stat > "$f.stat0"

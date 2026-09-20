@@ -17,6 +17,7 @@ LABEL = dict(SERVERS)
 ROWS = {
     "idle": ("Parked keep-alive connections", "hold"),
     "slowhead": ("Request heads that never end", "hold"),
+    "slowread": ("Clients reading a 1 MB body a trickle at a time", "hold"),
     "storm": ("A new connection per request", "storm"),
     "handshake-ecdsa": ("Full TLS handshakes, ECDSA P-256", "handshake"),
     "handshake-rsa": ("Full TLS handshakes, RSA 2048", "handshake"),
@@ -204,5 +205,6 @@ for w in order:
             f"| {ROWS[w][0]} | {slabel} | {rate(r0) if r0 is not None else '—'} | {fmt(rs, 'p99_us')} "
             f"| {fmt(rs, 'max_us')} | {fmt(rs, 'rss_kb')} | {fmt(rs, 'cpu_ms_per_1k')} "
             f"| {cpu['server']} / {cpu['load']} / {cpu['upstream']} |")
-md += ["", "All figures, per row.", "", *detail, ""]
+md += ["", "— HAProxy isn't a file server, so it sits out the row that asks for one.",
+       "", "All figures, per row.", "", *detail, ""]
 (out / "table.md").write_text("\n".join(md))
