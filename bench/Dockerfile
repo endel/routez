@@ -1,5 +1,5 @@
-# nginx (nginx.org stable), HAProxy (LTS PPA), wrk, Zig and Node.js with `ws`,
-# for bench/run.sh.
+# nginx (nginx.org stable), HAProxy (LTS PPA), wrk, h2load with HTTP/3, Zig and
+# Node.js with `ws`, for bench/run.sh.
 FROM ubuntu:26.04
 ARG ZIG_VERSION=0.16.0
 ARG HAPROXY_BRANCH=3.2
@@ -28,6 +28,32 @@ RUN curl -fsSL "https://github.com/wg/wrk/archive/refs/tags/$WRK_VERSION.tar.gz"
     && cp wrk /usr/local/bin/ && cd / && rm -rf "/tmp/wrk-$WRK_VERSION"
 RUN curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt \
     && ln -s "/opt/zig-$(uname -m)-linux-$ZIG_VERSION/zig" /usr/local/bin/zig
+# h2load is the HTTP/3 load generator: a client from neither project under test.
+# OpenSSL 3.5 in this image has the QUIC API, so ngtcp2 needs no forked TLS.
+ARG NGHTTP3_VERSION=v1.18.0
+ARG NGTCP2_VERSION=v1.25.0
+ARG NGHTTP2_VERSION=v1.70.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf automake libtool pkg-config cmake g++ libev-dev libc-ares-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux \
+    && git clone --depth 1 -b "$NGHTTP3_VERSION" --recursive https://github.com/ngtcp2/nghttp3 /tmp/nghttp3 \
+    && cd /tmp/nghttp3 && autoreconf -i && ./configure --prefix=/usr/local --enable-lib-only \
+    && make -j"$(nproc)" && make install \
+    && git clone --depth 1 -b "$NGTCP2_VERSION" --recursive https://github.com/ngtcp2/ngtcp2 /tmp/ngtcp2 \
+    && cd /tmp/ngtcp2 && autoreconf -i && ./configure --prefix=/usr/local --enable-lib-only --with-ossl \
+    && make -j"$(nproc)" && make install \
+    && git clone --depth 1 -b "$NGHTTP2_VERSION" --recursive https://github.com/nghttp2/nghttp2 /tmp/nghttp2 \
+    && cd /tmp/nghttp2 && autoreconf -i \
+    && ./configure --prefix=/usr/local --enable-app --enable-http3 --disable-python-bindings \
+        --without-jemalloc PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    && make -j"$(nproc)" -C third-party && make -j"$(nproc)" -C lib \
+    && make -j"$(nproc)" -C src h2load \
+    && ./libtool --mode=install install -c src/h2load /usr/local/bin/h2load \
+    && ldconfig \
+    && cd / && rm -rf /tmp/nghttp3 /tmp/ngtcp2 /tmp/nghttp2 \
+    && h2load --version \
+    && h2load --help 2>&1 | grep -qi 'h3'  # built without HTTP/3 it wouldn't mention it
 ARG WS_VERSION=8
 RUN mkdir /opt/ws && cd /opt/ws && npm install --no-audit --no-fund "ws@$WS_VERSION"
 ENV NODE_PATH=/opt/ws/node_modules

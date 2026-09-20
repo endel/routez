@@ -1,0 +1,10 @@
+// routez for the layer-4 suite: TCP :19281 and UDP :19291, forwarding without
+// terminating anything. No `servers`, so nothing is parsed as HTTP.
+.{
+    .workers = WORKERS,
+    .access_log = false,
+    .limits = .{ .max_connections = 100_000 },
+    .servers = .{},
+    .tcp_proxies = .{.{ .address = "127.0.0.1", .port = 19281, .proxy_pass = "127.0.0.1:19090" }},
+    .udp_proxies = .{.{ .address = "127.0.0.1", .port = 19291, .proxy_pass = "127.0.0.1:19201" }},
+}

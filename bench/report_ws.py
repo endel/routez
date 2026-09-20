@@ -9,7 +9,8 @@ import statistics
 import sys
 from pathlib import Path
 
-from rig import SATURATED, busy, cpu_list, load_env, ms, proc_stat, write_jsonl
+from rig import (METRICS, SATURATED, busy, cpu_list, load_env, med, ms,
+                 proc_stat, row, write_jsonl)
 
 SERVERS = [("direct", "No proxy"), ("nginx", "nginx"), ("haproxy", "HAProxy"), ("routez", "routez")]
 PROXIES = SERVERS[1:]
@@ -37,6 +38,7 @@ for js in sorted((out / "raw").glob("*.json")):
     in_flight = j["in_flight"]
     m = rss(js.with_suffix(".rss"))
     s0, s1 = proc_stat(js.with_suffix(".stat0")), proc_stat(js.with_suffix(".stat1"))
+    cpu = {g: busy(s0, s1, c) for g, c in groups.items()}
     problems = {k: v for k, v in {
         "failed to connect": j["failed"],
         "dropped": j["dropped"],
@@ -44,27 +46,27 @@ for js in sorted((out / "raw").glob("*.json")):
     }.items() if v}
     if m["held"][2] != n:
         problems[f"of {n} connections at the app"] = m["held"][2]
-    runs.append({
-        "date": env["date"], "routez": env["routez"], "quic_zig": env["quic-zig"],
-        "level": n, "server": server, "round": int(rnd),
-        "connect_per_s": round(j["connected"] / max(1, j["connect_ms"]) * 1000),
-        "server_kb_per_conn": (m["held"][0] - m["base"][0]) / n,
-        "app_kb_per_conn": (m["held"][1] - m["base"][1]) / n,
-        "p50_us": j["p50_us"], "p99_us": j["p99_us"], "p999_us": j["p999_us"],
-        "echoes_per_s": round(j["received"] / float(env["duration"])),
-        "problems": problems,
-        "cpu": {g: busy(s0, s1, c) for g, c in groups.items()},
-    })
+    flags = ["problems: " + ", ".join(f"{v} {k}" for k, v in problems.items())] if problems else []
+    if max(cpu["client"], cpu["app"]) >= SATURATED:
+        flags.append(f"rig {max(cpu['client'], cpu['app'])}% busy")
+    r = row(env, "ws", "tunnel", server, rnd, {"level": n, "workers": 1},
+            {"kb_per_conn": (m["held"][0] - m["base"][0]) / n if server != "direct" else None,
+             "connect_per_s": round(j["connected"] / max(1, j["connect_ms"]) * 1000),
+             "echoes_per_s": round(j["received"] / float(env["duration"])),
+             # The load is a fixed total echo rate, so latency and CPU do compare.
+             "p50_us": j["p50_us"], "p99_us": j["p99_us"], "p999_us": j["p999_us"],
+             "cpu_pct": cpu["server"] if server != "direct" else None},
+            flags=flags)
+    r["app_kb_per_conn"] = (m["held"][1] - m["base"][1]) / n
+    r["cpu"] = cpu
+    r["problems"] = problems
+    runs.append(r)
 write_jsonl(out, runs)
 
 cells = {}
 for r in runs:
-    cells.setdefault((r["level"], r["server"]), []).append(r)
-levels = sorted({r["level"] for r in runs})
-
-
-def med(rs, key):
-    return statistics.median(r[key] for r in rs)
+    cells.setdefault((r["params"]["level"], r["server"]), []).append(r)
+levels = sorted({r["params"]["level"] for r in runs})
 
 
 def med_cpu(rs, g):
@@ -87,10 +89,11 @@ for (n, s), rs in sorted(cells.items()):
 
 
 def table(head, servers, cell):
-    rows = [f"| Open connections | " + " | ".join(l for _, l in servers) + " |", "|---" * (len(servers) + 1) + "|"]
+    rows = ["| Open connections | " + " | ".join(l for _, l in servers) + " |",
+            "|---" * (len(servers) + 1) + "|"]
     for n in levels:
-        row = [f"{cell(cells[n, s])}{marks[n, s]}" if (n, s) in cells else "—" for s, _ in servers]
-        rows.append(f"| {n:,} | " + " | ".join(row) + " |")
+        r = [f"{cell(cells[n, s])}{marks[n, s]}" if (n, s) in cells else "—" for s, _ in servers]
+        rows.append(f"| {n:,} | " + " | ".join(r) + " |")
     return [head, "", *rows, ""]
 
 
@@ -102,14 +105,14 @@ md = [
     "",
     *table("**Memory per open connection** (lower is better): the server's RSS growth over its idle "
            "baseline, divided by the number of connections.", PROXIES,
-           lambda rs: f"{med(rs, 'server_kb_per_conn'):.1f} KB"),
+           lambda rs: METRICS["kb_per_conn"].fmt(med(rs, "kb_per_conn"))),
     *table(f"**Echo latency, p99** (lower is better): {int(env['rate']):,} messages per second in total, spread over "
            f"all open connections, for {env['duration']} s. The server's CPU use is in parentheses.", SERVERS,
            lambda rs: f"{ms(med(rs, 'p99_us'))} ({med_cpu(rs, 'server')}%)" if rs[0]["server"] != "direct"
            else ms(med(rs, "p99_us"))),
     *table(f"**Connections opened per second** (higher is better), with {in_flight} handshakes in flight per "
            "client process.", SERVERS,
-           lambda rs: f"{med(rs, 'connect_per_s') / 1000:.1f}k/s"),
+           lambda rs: METRICS["connect_per_s"].fmt(med(rs, "connect_per_s"))),
 ]
 if notes:
     md.append("† " + "; ".join(notes) + ".")
@@ -123,7 +126,9 @@ for n in levels:
         rs = cells.get((n, s))
         if not rs:
             continue
-        md.append(f"| {n:,} | {label} | {med(rs, 'server_kb_per_conn'):.1f} | {med(rs, 'app_kb_per_conn'):.1f} "
+        kb = med(rs, "kb_per_conn")
+        app_kb = statistics.median(r["app_kb_per_conn"] for r in rs)
+        md.append(f"| {n:,} | {label} | {'—' if kb is None else f'{kb:.1f}'} | {app_kb:.1f} "
                   f"| {med(rs, 'connect_per_s'):,.0f} | {med(rs, 'echoes_per_s'):,.0f} | {ms(med(rs, 'p50_us'))} "
                   f"| {ms(med(rs, 'p99_us'))} | {ms(med(rs, 'p999_us'))} "
                   f"| {med_cpu(rs, 'server')} / {med_cpu(rs, 'app')} / {med_cpu(rs, 'client')} |")

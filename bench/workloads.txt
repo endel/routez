@@ -1,0 +1,47 @@
+# Rows of the HTTP suite, read by bench.sh and report.py. Whitespace-separated;
+# `label` is the rest of the line. Order here is the order in the report.
+#
+#   servers   all | nohap (HAProxy is not a file server)
+#   check     what the sanity gate sends and expects, and so the request shape
+#             the workload's lua must match: pong | file:<f> | set | ims | 404 |
+#             gz:<f> | pipe:<depth> | post:<size>
+#   upstream  does the row use the shared upstream (it keeps its own cores) —
+#             when it doesn't, wrk takes those cores too
+#   lua       extra wrk script in lua/, concatenated after report.lua; - for none
+#   conns     wrk connections, or - for the default
+#   profile   which config the servers run for this row; `main` unless the row
+#             needs settings that would change every other row's result
+#
+# No HEAD row: wrk reads a HEAD response as a body that never arrives and
+# records nothing. It belongs with the fixed-rate rows, which use another client.
+#
+# name           scheme path            lua        servers check          upstream conns profile label
+return           http   /ping           -          all     pong           no       -     main    Fixed response (`return`)
+static           http   /10k.bin        -          nohap   file:10k.bin   no       -     main    10 KB static file
+proxy            http   /up/            -          all     pong           yes      -     main    Reverse proxy to a keep-alive upstream
+tls-return       https  /ping           -          all     pong           no       -     main    TLS: fixed response
+tls-static       https  /10k.bin        -          nohap   file:10k.bin   no       -     main    TLS: 10 KB static file
+tls-handshake    https  /ping           close      all     pong           no       -     main    TLS: new connection per request (resumed)
+static-1k        http   /1k.bin         -          nohap   file:1k.bin    no       -     main    1 KB static file
+static-100k      http   /100k.bin       -          nohap   file:100k.bin  no       -     main    100 KB static file
+static-1m        http   /1m.bin         -          nohap   file:1m.bin    no       64    main    1 MB static file
+static-100m      http   /100m.bin       -          nohap   file:100m.bin  no       8     main    100 MB static file
+tls-static-1m    https  /1m.bin         -          nohap   file:1m.bin    no       64    main    TLS: 1 MB static file
+fileset          http   /set/           fileset    nohap   set            no       -     main    10k files of 4 KB, one at random
+not-modified     http   /10k.bin        ims        nohap   ims            no       -     main    304 from `If-Modified-Since`
+notfound         http   /nope.bin       -          nohap   404            no       -     main    404 for a missing file
+bigheaders       http   /ping           bigheaders all     pong           no       -     main    Fixed response, 1.5 KB of request headers
+pipeline         http   /ping           pipeline   all     pipe:16        no       -     main    Fixed response, 16 requests pipelined
+proxy-1m         http   /up1m/          -          all     file:1m.bin    yes      64    main    Reverse proxy, 1 MB response
+proxy-post       http   /up/            post1m     all     post:1m        yes      64    main    Reverse proxy, 1 MB upload
+proxy-nokeep     http   /nk/            -          all     pong           yes      -     main    Reverse proxy, a new upstream connection each time
+proxy-tls        http   /ups/           -          all     pong           yes      -     main    Reverse proxy over TLS to the upstream
+proxy-8rr        http   /up8/           -          all     pong           yes      -     main    Reverse proxy, 8 upstreams, round-robin
+proxy-8lc        http   /up8lc/         -          all     pong           yes      -     main    Reverse proxy, 8 upstreams, least-conn
+proxy-gzip       http   /upz/           gzip       all     gz:z/text.html yes      -     main    gzip on the fly through the proxy
+limitreq         http   /lr/            -          all     pong           no       -     main    Fixed response, a rate limit armed
+acl              http   /acl/           -          all     pong           no       -     main    Fixed response, an IP allow list
+rewrite          http   /rw/x           -          all     pong           no       -     main    Fixed response behind a rewrite
+gzip             http   /z/text.html    gzip       nohap   gz:z/text.html no       -     main    gzip on the fly, 100 KB of text
+precompressed    http   /z/pre.html     gzip       nohap   gz:z/pre.html  no       -     main    Precompressed `.gz`, 100 KB of text
+routing          http   /r/deep/x42.z   -          all     pong           no       -     routing 200 prefixes and 20 regexes, hits the last
