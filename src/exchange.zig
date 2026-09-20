@@ -616,17 +616,14 @@ pub const Exchange = struct {
         if (resp.content_length) |n| if (n < gzip.min_length) return false;
         if (!gzip.clientAccepts(self.req.get("accept-encoding"))) return false;
         if (self.req.isHead()) return true;
-        if (self.worker.gzip_active >= gzip.max_active) return false;
-        self.gz = gzip.Encoder.create(self.worker.alloc) catch return false;
-        self.worker.gzip_active += 1;
+        self.gz = self.worker.gzip.acquire() orelse return false;
         return true;
     }
 
     fn releaseGzip(self: *Exchange) void {
         const e = self.gz orelse return;
-        e.destroy();
         self.gz = null;
-        self.worker.gzip_active -= 1;
+        self.worker.gzip.release(e);
     }
 
     pub fn respondBody(self: *Exchange, data: []const u8) void {

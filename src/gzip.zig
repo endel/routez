@@ -1,9 +1,12 @@
 //! Streaming gzip for responses.
 //!
-//! A compressor costs about 300 KB (std's deflate tables plus its 64 KiB
-//! window), so one is created only for a response that qualifies, and a
-//! worker runs at most `max_active` at once; past that responses go out
-//! uncompressed.
+//! A compressor costs about 300 KB: std's deflate tables are ~224 KB and its
+//! window is another 64 KiB. That is past the allocator's largest size class, so
+//! creating one per response meant an mmap, the page faults to first-touch it and
+//! a munmap every time. Each worker keeps a few on a freelist instead (`Pool`).
+//!
+//! One is still created only for a response that qualifies, and a worker runs at
+//! most `max_active` at once; past that responses go out uncompressed.
 const std = @import("std");
 const flate = std.compress.flate;
 const common = @import("http/common.zig");
@@ -13,12 +16,19 @@ const encoding = @import("encoding.zig");
 pub const max_active = 64;
 /// Bodies known to be smaller than this aren't worth the CPU.
 pub const min_length = 1024;
+/// Encoders a worker keeps between responses. Compressing is synchronous, so
+/// only the responses still streaming hold one and a handful covers the reuse;
+/// keeping `max_active` of them would park 19 MB per worker for a feature that
+/// may be idle.
+pub const max_idle = 4;
 
 pub const Encoder = struct {
     alloc: std.mem.Allocator,
     out: std.Io.Writer.Allocating,
     window: []u8,
     c: flate.Compress,
+    /// Next on a `Pool` freelist; meaningless while in use.
+    next: ?*Encoder = null,
 
     /// Heap-allocated: the compressor points at `out`.
     pub fn create(alloc: std.mem.Allocator) !*Encoder {
@@ -39,6 +49,12 @@ pub const Encoder = struct {
         self.alloc.destroy(self);
     }
 
+    /// Ready for another response, keeping the tables and the window.
+    fn reset(self: *Encoder) !void {
+        self.out.clearRetainingCapacity();
+        self.c = try flate.Compress.init(&self.out.writer, self.window, .gzip, .level_4);
+    }
+
     /// Compress `data`; compressed bytes accumulate in `output()`.
     pub fn write(self: *Encoder, data: []const u8) !void {
         try self.c.writer.writeAll(data);
@@ -55,6 +71,52 @@ pub const Encoder = struct {
 
     pub fn consume(self: *Encoder) void {
         self.out.clearRetainingCapacity();
+    }
+};
+
+/// One worker's encoders: those in use, and up to `max_idle` waiting.
+///
+/// Touched only on its worker's loop thread, so no locks.
+pub const Pool = struct {
+    alloc: std.mem.Allocator,
+    idle: ?*Encoder = null,
+    idle_count: u32 = 0,
+    /// Responses holding an encoder right now.
+    active: u32 = 0,
+
+    /// Null when `max_active` are already out, or the allocation failed: the
+    /// caller then sends the response uncompressed.
+    pub fn acquire(self: *Pool) ?*Encoder {
+        if (self.active >= max_active) return null;
+        const e = if (self.idle) |head| blk: {
+            self.idle = head.next;
+            self.idle_count -= 1;
+            head.next = null;
+            head.reset() catch {
+                head.destroy();
+                break :blk null;
+            };
+            break :blk head;
+        } else Encoder.create(self.alloc) catch null;
+        if (e != null) self.active += 1;
+        return e;
+    }
+
+    pub fn release(self: *Pool, e: *Encoder) void {
+        std.debug.assert(self.active > 0);
+        self.active -= 1;
+        if (self.idle_count >= max_idle) return e.destroy();
+        e.next = self.idle;
+        self.idle = e;
+        self.idle_count += 1;
+    }
+
+    pub fn deinit(self: *Pool) void {
+        while (self.idle) |e| {
+            self.idle = e.next;
+            e.destroy();
+        }
+        self.idle_count = 0;
     }
 };
 

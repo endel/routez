@@ -20,6 +20,7 @@ const UdpProxy = @import("udp_proxy.zig").UdpProxy;
 const Tunnel = @import("tcp_proxy.zig").Tunnel;
 const h3_server = @import("h3/server.zig");
 const access_log = @import("access_log.zig");
+const gzip = @import("gzip.zig");
 const logs = @import("logs.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
@@ -217,7 +218,7 @@ pub const Worker = struct {
     conn_count: u32 = 0,
     /// When the max_connections warning last went out, to throttle it.
     max_conn_logged_ms: i64 = std.math.minInt(i64) / 2,
-    gzip_active: u32 = 0,
+    gzip: gzip.Pool,
     /// For regex locations and rewrites; sized for this generation's largest.
     regex_scratch: regex.Scratch = .{},
 
@@ -331,6 +332,7 @@ pub const Worker = struct {
                 .valid_ms = cfg.open_file_cache.valid_ms,
                 .inactive_ms = cfg.open_file_cache.inactive_ms,
             }),
+            .gzip = .{ .alloc = alloc },
         };
         w.timers = try timers.Timers.init(&w.loop);
         w.timers.on_tick = onTick;
@@ -526,6 +528,7 @@ pub const Worker = struct {
         for (self.quic_listeners.items) |q| q.start();
         try self.loop.run(.until_done);
         self.files.deinit();
+        self.gzip.deinit();
         log.info("worker {d} stopped", .{self.id});
     }
 
