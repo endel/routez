@@ -50,7 +50,10 @@ METRICS = {
     "p50_us": Metric("p50", -1, ms),
     "p90_us": Metric("p90", -1, ms),
     "p99_us": Metric("p99", -1, ms),
+    "p95_us": Metric("p95", -1, ms),
     "p999_us": Metric("p99.9", -1, ms),
+    "connect_us": Metric("connect", -1, ms),
+    "rtt_us": Metric("smoothed RTT", -1, lambda v: f"{v:,.0f} µs"),
     "max_us": Metric("max", -1, ms),
     "overhead_us": Metric("added latency", -1, lambda v: f"{v:,.0f} µs"),
     # Cost. CPU per request still ranks servers when the load generator is the limit.

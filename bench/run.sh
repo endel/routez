@@ -36,7 +36,7 @@ docker run --rm \
     --ulimit nofile=1048576:1048576 \
     --sysctl net.ipv4.tcp_tw_reuse=1 \
     --sysctl net.ipv4.ip_local_port_range="1024 65535" \
-    --sysctl net.ipv4.ip_local_reserved_ports=19080-19294 \
+    --sysctl net.ipv4.ip_local_reserved_ports=19080-19599 \
     --sysctl net.core.somaxconn=4096 \
     --sysctl net.ipv4.tcp_max_syn_backlog=65535 \
     -e WORKERS -e CONNS -e DURATION -e ROUNDS -e WORKLOADS -e ROUTEZ_REV -e QUIC_ZIG_REV \

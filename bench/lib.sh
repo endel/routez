@@ -20,7 +20,7 @@ else
     if [ "$(id -u)" == 0 ]; then
         ulimit -n 1048576 2>/dev/null
         for kv in net.ipv4.tcp_tw_reuse=1 "net.ipv4.ip_local_port_range=1024 65535" \
-            net.ipv4.ip_local_reserved_ports=19080-19294 net.core.somaxconn=4096 \
+            net.ipv4.ip_local_reserved_ports=19080-19599 net.core.somaxconn=4096 \
             net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=16777216 \
             net.core.wmem_max=16777216; do # rmem/wmem only work on a bare host
             sysctl -qw "$kv" 2>/dev/null || echo "warning: could not set $kv"
