@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg xz-utils unzip software-properties-common \
         build-essential libssl-dev openssl python3 rsync git util-linux \
-        iproute2 procps nodejs npm \
+        iproute2 procps strace nodejs npm \
     && . /etc/os-release \
     && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/nginx.gpg] https://nginx.org/packages/ubuntu $VERSION_CODENAME nginx" \
