@@ -242,7 +242,7 @@ pub const Peer = struct {
 /// One HTTP/1.1 connection to a peer, pooled between requests.
 pub const UpConn = struct {
     peer: *Peer,
-    sock: socket.Socket(UpConn),
+    sock: socket.Socket(UpConn, true),
     tls: ?*tls.Client = null,
     user: ?*Proxy,
     state: enum { busy, idle, closing } = .busy,
@@ -324,7 +324,7 @@ pub const UpConn = struct {
 /// the status line alone.
 pub const Probe = struct {
     peer: *Peer,
-    sock: socket.Socket(Probe),
+    sock: socket.Socket(Probe, true),
     tls: ?*tls.Client = null,
     deadline: timers.Deadline = .{ .callback = onTimeout },
     in: std.ArrayListUnmanaged(u8) = .empty,

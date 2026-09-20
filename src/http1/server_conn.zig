@@ -28,7 +28,7 @@ const linger_ms = 5_000;
 pub const Conn = struct {
     worker: *Worker,
     listener: *Listener,
-    sock: socket.Socket(Conn),
+    sock: socket.Socket(Conn, false),
     tls: ?*tls_transport.Transport = null,
 
     /// Plaintext received and not yet consumed.
@@ -778,6 +778,9 @@ pub const Conn = struct {
 
     fn dsStartTunnel(ptr: *anyopaque) void {
         const self = cast(ptr);
+        // The request is over; a tunnel only ever holds one frame at a time.
+        self.in.clearAndFree(self.worker.alloc);
+        self.out.clearAndFree(self.worker.alloc);
         self.phase = .tunnel;
         self.keep_alive = false;
         self.body_paused = false;

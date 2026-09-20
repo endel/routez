@@ -46,7 +46,9 @@ pub const FileOut = struct {
     release: *const fn (*anyopaque) void,
 };
 
-pub fn Socket(comptime Owner: type) type {
+/// `connects` gives the socket a connect completion; sockets that only ever
+/// come from accept save its space on every connection.
+pub fn Socket(comptime Owner: type, comptime connects: bool) type {
     return struct {
         const Self = @This();
 
@@ -58,7 +60,7 @@ pub fn Socket(comptime Owner: type) type {
 
         read_c: xev.Completion = .{},
         write_c: xev.Completion = .{},
-        connect_c: xev.Completion = .{},
+        connect_c: if (connects) xev.Completion else void = if (connects) .{} else {},
         closed_cb: timers.Deferred = .{ .callback = onDeferredClose },
 
         reading: bool = false,
@@ -114,6 +116,7 @@ pub fn Socket(comptime Owner: type) type {
         /// Open a socket and start connecting. Completion arrives in
         /// `onSocketConnect`. Writes queued meanwhile are sent once connected.
         pub fn connect(self: *Self, owner: *Owner, loop: *xev.Loop, t: *timers.Timers, alloc: std.mem.Allocator, addr: std.Io.net.IpAddress) !void {
+            if (!connects) @compileError("this socket never connects");
             const tcp = try xev.TCP.init(addr);
             self.init(owner, loop, t, alloc, tcp);
             self.connecting = true;
