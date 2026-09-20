@@ -87,9 +87,16 @@ def main(argv):
         mo, mt = median(ours), median(theirs)
         if mo == 0 and mt == 0:
             continue
-        ratio = (mo / mt if spec.better > 0 else mt / mo) if mt and mo else float("inf")
         overlap = min(max(ours), max(theirs)) >= max(min(ours), min(theirs))
-        cls = "TIE" if overlap else ("WIN" if ratio > 1 else "LOSS")
+        if spec.signed or mo <= 0 or mt <= 0:
+            # Compared by direction: a ratio between figures that can be
+            # negative, or that straddle zero, means nothing.
+            ratio = None
+            ahead = spec.better * (mo - mt)
+            cls = "TIE" if overlap or ahead == 0 else ("WIN" if ahead > 0 else "LOSS")
+        else:
+            ratio = mo / mt if spec.better > 0 else mt / mo
+            cls = "TIE" if overlap else ("WIN" if ratio > 1 else "LOSS")
         notes = sorted(set(flagged[(suite, workload, params, OURS)]
                            + flagged[(suite, workload, params, best)]))
         lines.append({
@@ -99,7 +106,8 @@ def main(argv):
         })
 
     rank = {"LOSS": 0, "TIE": 1, "WIN": 2}
-    lines.sort(key=lambda l: (rank[l["cls"]], l["ratio"]))
+    # A row with no ratio sorts at the neutral point of its class.
+    lines.sort(key=lambda l: (rank[l["cls"]], l["ratio"] if l["ratio"] is not None else 1.0))
     counts = {c: sum(1 for l in lines if l["cls"] == c) for c in ("LOSS", "TIE", "WIN")}
 
     md = ["# Scorecard", "",
@@ -107,15 +115,17 @@ def main(argv):
           f"{counts['LOSS']} losses, {counts['TIE']} ties, {counts['WIN']} wins.", "",
           "Runs read:", ""]
     md += [f"- {s}" for s in sorted(sources)]
-    md += ["", "`ratio` is how many times better routez is, so below 1 is a loss. A TIE is a metric "
-           "whose min–max ranges across rounds overlap: the difference is inside the noise.", "",
+    md += ["", "`ratio` is how many times better routez is, so below 1 is a loss; a figure that can be "
+           "negative is compared by direction instead. A TIE is a metric whose min–max ranges "
+           "across rounds overlap: the difference is inside the noise.", "",
            "| | Suite | Row | Params | Metric | routez | best other | | ratio |",
            "|---|---|---|---|---|---|---|---|---|"]
     for l in lines:
         mark = "†" if l["notes"] else ""
+        ratio = f"{l['ratio']:.2f}×" if l["ratio"] is not None else "by direction"
         md.append(f"| {l['cls']} | {l['suite']} | {l['workload']} | {l['params']} "
                   f"| {METRICS[l['metric']].label} | {l['ours']} | {l['theirs']} | {l['rival']} "
-                  f"| {l['ratio']:.2f}×{mark} |")
+                  f"| {ratio}{mark} |")
     notes = sorted({n for l in lines for n in l["notes"]})
     if notes:
         md += ["", "† a round of this row carried: " + "; ".join(notes)
@@ -125,8 +135,9 @@ def main(argv):
     print(f"{counts['LOSS']} losses, {counts['TIE']} ties, {counts['WIN']} wins -> {out}")
     for l in lines[:15]:
         if l["cls"] != "WIN":
+            ratio = f"{l['ratio']:.2f}x" if l["ratio"] is not None else "(by direction)"
             print(f"  {l['cls']:4} {l['suite']}/{l['workload']} {METRICS[l['metric']].label}: "
-                  f"{l['ours']} vs {l['theirs']} ({l['rival']}) {l['ratio']:.2f}x")
+                  f"{l['ours']} vs {l['theirs']} ({l['rival']}) {ratio}")
 
 
 if __name__ == "__main__":

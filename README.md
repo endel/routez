@@ -671,34 +671,86 @@ validation against routez.
 ## Performance
 
 ```sh
-bench/run.sh    # routez, nginx and HAProxy in a Linux container (needs Docker)
+bench/run.sh                   # HTTP rows with wrk
+bench/run.sh h3                # HTTP/3 with h2load
+bench/run.sh l4                # the layer-4 TCP and UDP proxies
+bench/run.sh hostile           # storms, stalled clients, full handshakes, reload
+bench/run.sh soak              # a long mixed run, watching memory
+bench/run.sh ws                # concurrent WebSocket tunnels
+bench/sweep.sh WORKERS 1 2 4   # one suite over the values of one knob
+bench/scorecard.py             # where routez is behind, worst first
 ```
 
-It builds routez, starts all three beside a shared upstream, and runs wrk
-against one server at a time. The table and every run land in
-`bench/results/<timestamp>/`. Knobs: `WORKERS` (3), `CONNS` (256),
-`DURATION` (10 s), `ROUNDS` (3), `WORKLOADS` (a subset of rows).
+Each suite builds routez, starts all three servers beside a shared upstream and
+measures one at a time, rotating the order between rounds. Nothing is measured
+until a gate has checked that every server answers the row correctly, byte for
+byte, and negotiates the same TLS parameters: a row that compares different work
+is worse than no row. Results land in `bench/results/[<suite>-]<timestamp>/`.
 
-Docker Desktop on an Apple M-series Mac (10 cores), 19 Sep 2026: routez
-58ed54b, nginx 1.30.5 and HAProxy 3.2.23 on OpenSSL 3.5, 3 workers each, with
-the server, wrk and upstream on separate cores. Median of 3 × 10 s runs,
-keep-alive, in requests per second. Relative numbers only; a VM is not a
-benchmark machine.
+`bench/scorecard.py` reads the newest run of each suite and ranks routez against
+the better of nginx and HAProxy on every figure, worst first, so a pass ends in a
+list of things to fix rather than a table routez wins. A figure whose spread
+across rounds overlaps the rival's counts as a tie, not a difference; several of
+them move enough between rounds that a few percent means nothing.
+
+The HTTP rows live in `bench/workloads.txt`, one per line, and `WORKLOADS=` picks
+a subset. Knobs: `WORKERS` (3), `CONNS` (256), `DURATION` (10 s), `ROUNDS` (3),
+`ACCESS_LOG` (off). A row needing settings that would change every other row's
+result names a `profile` and gets its own server processes.
+
+Docker Desktop on an Apple M-series Mac (10 cores), 20 Sep 2026: routez 53d2011,
+nginx 1.30.5 and HAProxy 3.2.23 on OpenSSL 3.5, 3 workers each, with the server,
+wrk and upstream on separate cores. Median of 3 × 10 s runs, keep-alive, in
+requests per second. Relative numbers only; a VM is not a benchmark machine.
 
 | Workload | nginx | HAProxy | routez |
 |---|---|---|---|
-| Fixed response (`return`) | 579k | 400k | 684k |
-| 10 KB static file | 236k | — | 334k |
-| Reverse proxy to a keep-alive upstream | 207k | 167k | 239k |
-| TLS: fixed response | 347k | 255k | 507k |
-| TLS: 10 KB static file | 125k | — | 189k |
-| TLS: new connection per request | 11k | 8.3k | 14k |
+| Fixed response (`return`) | 529k | 320k | 627k |
+| 10 KB static file | 312k | — | 308k |
+| Reverse proxy to a keep-alive upstream | 208k | 155k | 262k |
+| TLS: fixed response | 324k | 227k | 582k |
+| TLS: 10 KB static file | 152k | — | 208k |
+| TLS: new connection per request | 13k | 11k | 17k |
 
 - HAProxy isn't a file server.
 - TLS is 1.3 with AES-128-GCM and X25519 everywhere, routez's own choice;
   nginx and HAProxy are pinned to it.
-- The last row measures resumed handshakes: wrk reuses the session on each
-  new connection. wrk is also at its limit there, so read it as an ordering.
+- nginx gets `open_file_cache`, which it has off by default. Without it it
+  reopened every file on every request and served 217k on the 10 KB row, which
+  is not a comparison worth winning.
+- The last row measures resumed handshakes: wrk reuses the session on each new
+  connection, and wrk is at its own limit there, so read it as an ordering.
+  Full handshakes are a hostile-suite row, driven by a client that offers no
+  session.
+
+### Where routez is behind
+
+From a full pass of every suite, worst first. Each is a place to look, not a
+verdict: the figure is routez against whichever of nginx and HAProxy does best.
+
+| Row | routez | best other | |
+|---|---|---|---|
+| Full TLS handshakes, RSA 2048 | 0.7k/s | 3.2k/s | nginx |
+| HTTP/3, 1 MB static file | 0.8k/s | 2.8k/s | nginx |
+| HTTP/3, 10 KB static file | 77k/s | 232k/s | nginx |
+| HTTP/3, fixed response | 34k/s | 80k/s | nginx |
+| 10k files of 4 KB, one at random | 94k/s | 213k/s | nginx |
+| HTTP/3, reverse proxy | 91k/s | 200k/s | HAProxy |
+| Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
+| Full TLS handshakes, ECDSA P-256 | 4.8k/s | 8.2k/s | nginx |
+| gzip on the fly through the proxy | 4.0k/s | 15k/s | HAProxy |
+| Memory per parked keep-alive connection | 2.0 KB | 0.5 KB | nginx |
+| Memory per UDP flow | 2.3 KB | 0.1 KB | nginx stream |
+| gzip on the fly, 100 KB of text | 4.1k/s | 6.0k/s | nginx |
+| A new connection per request | 187k/s | 235k/s | nginx |
+| A reload every 2 s under load | 765 failed | 0 failed | HAProxy |
+
+HTTP/3 is the largest gap and the least CPU-bound: on the fixed-response row
+routez sits at 29% CPU with the client at 11%, so nothing is saturated. Its
+median request takes 2.00 ms against nginx's 0.33 ms over a 125 µs round trip,
+and its handshake 19 ms against 7 ms. Ten streams per connection recover most of
+the throughput, which points at per-connection serialization rather than
+per-request cost.
 
 ### WebSocket connections
 

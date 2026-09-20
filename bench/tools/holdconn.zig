@@ -100,11 +100,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     const pfds = try alloc.alloc(linux.pollfd, o.count);
     var head: [512]u8 = undefined;
-    const full = try std.fmt.bufPrint(&head,
-        "GET {s} HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n", .{o.request});
+    const full = try std.fmt.bufPrint(&head, "GET {s} HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n", .{o.request});
     // A head with no blank line: the server must keep waiting for the rest.
-    const partial = try std.fmt.bufPrint(head[full.len..],
-        "GET {s} HTTP/1.1\r\nHost: bench\r\n", .{o.request});
+    const partial = try std.fmt.bufPrint(head[full.len..], "GET {s} HTTP/1.1\r\nHost: bench\r\n", .{o.request});
 
     var opened: usize = 0;
     var failed: usize = 0;
@@ -174,9 +172,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf,
-        "{{\"opened\":{d},\"failed\":{d},\"closed_by_server\":{d},\"connect_us\":{d},\"mode\":\"{s}\"}}\n",
-        .{ opened, failed, closed, connect_us, @tagName(o.mode) });
+    const line = try std.fmt.bufPrint(&buf, "{{\"opened\":{d},\"failed\":{d},\"closed_by_server\":{d},\"connect_us\":{d},\"mode\":\"{s}\"}}\n", .{ opened, failed, closed, connect_us, @tagName(o.mode) });
     _ = write(1, line.ptr, line.len);
     return 0;
 }

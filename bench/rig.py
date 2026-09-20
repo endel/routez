@@ -35,6 +35,10 @@ class Metric(NamedTuple):
     label: str
     better: int  # +1 higher is better, -1 lower is better
     fmt: Callable[[float], str]
+    # A figure that can be negative, so a ratio between two of them says
+    # nothing: a trend of -352 KB/min is not "52 times better" than +6.7.
+    # Those are compared by direction instead.
+    signed: bool = False
 
 
 METRICS = {
@@ -61,8 +65,8 @@ METRICS = {
     "cpu_pct": Metric("CPU %", -1, lambda v: f"{v:.0f}%"),
     "rss_kb": Metric("RSS", -1, lambda v: f"{v / 1024:.1f} MB"),
     "kb_per_conn": Metric("KB/conn", -1, lambda v: _n(v, " KB")),
-    "rss_slope_kb_min": Metric("RSS growth", -1, lambda v: _n(v, " KB/min")),
-    "fd_drift": Metric("fd drift", -1, lambda v: _n(v, "", 0)),
+    "rss_slope_kb_min": Metric("RSS growth", -1, lambda v: _n(v, " KB/min"), signed=True),
+    "fd_drift": Metric("fd drift", -1, lambda v: _n(v, "", 0), signed=True),
     # Robustness. Degradation is the victim metric's loss against its own baseline.
     "rps_kept_pct": Metric("throughput kept", +1, lambda v: f"{v:.0f}%"),
     "errors": Metric("errors", -1, lambda v: _n(v, "", 0)),

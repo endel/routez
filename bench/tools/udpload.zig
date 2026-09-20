@@ -207,8 +207,8 @@ fn runClient(target: SockAddr, cfg: Client) !void {
             "\"send_us\":{d},\"elapsed_us\":{d}," ++
             "\"p50_us\":{d},\"p99_us\":{d},\"p999_us\":{d},\"size\":{d}}}\n",
         .{
-            cfg.flows,           cfg.pps,             sent,                  received,
-            send_us,             elapsed_us,          hist.percentile(50),   hist.percentile(99),
+            cfg.flows,             cfg.pps,    sent,                received,
+            send_us,               elapsed_us, hist.percentile(50), hist.percentile(99),
             hist.percentile(99.9), size,
         },
     );
