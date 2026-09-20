@@ -23,6 +23,13 @@ const xev = quic.event_loop.Xev;
 const timers = @import("../timers.zig");
 
 pub const read_buffer_size = 16 * 1024;
+/// With epoll every socket on a thread reads into one buffer, so an idle
+/// connection doesn't hold 16 KiB: epoll reads only just before running that
+/// read's callback. Other backends can read ahead and queue the callback
+/// (kqueue does), so there each socket keeps its own. Either way,
+/// `onSocketData` bytes are gone once the call returns.
+const shared_read_buf = xev.backend == .epoll;
+threadlocal var thread_read_buf: [read_buffer_size]u8 = undefined;
 /// SIGPIPE is ignored process-wide; MSG_NOSIGNAL covers Linux regardless.
 const send_flags: c_int = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
 /// Owners stop producing output above this.
@@ -76,7 +83,7 @@ pub fn Socket(comptime Owner: type) type {
 
         state: State = .open,
         fd_closed: bool = false,
-        read_buf: [read_buffer_size]u8 = undefined,
+        own_read_buf: if (shared_read_buf) void else [read_buffer_size]u8 = undefined,
 
         pub const State = enum {
             open,
@@ -135,7 +142,11 @@ pub fn Socket(comptime Owner: type) type {
             if (self.reading or self.connecting or self.read_paused) return;
             if (self.state == .closing or self.state == .closed) return;
             self.reading = true;
-            self.tcp.read(self.loop, &self.read_c, .{ .slice = &self.read_buf }, Self, self, onRead);
+            self.tcp.read(self.loop, &self.read_c, .{ .slice = self.readBuf() }, Self, self, onRead);
+        }
+
+        fn readBuf(self: *Self) *[read_buffer_size]u8 {
+            return if (shared_read_buf) &thread_read_buf else &self.own_read_buf;
         }
 
         pub fn pauseRead(self: *Self) void {
@@ -161,7 +172,7 @@ pub fn Socket(comptime Owner: type) type {
                 return .disarm;
             };
             switch (self.state) {
-                .open, .flushing => Owner.onSocketData(self.owner, self.read_buf[0..n]),
+                .open, .flushing => Owner.onSocketData(self.owner, self.readBuf()[0..n]),
                 .lingering => {},
                 .closing, .closed => {},
             }

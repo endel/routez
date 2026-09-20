@@ -1,0 +1,12 @@
+// routez under test for ws.sh: one worker, WebSocket tunnels on :19181.
+.{
+    .workers = 1,
+    .access_log = false,
+    // Tunnels idle through the hold phase.
+    .limits = .{ .max_connections = 300000, .io_timeout_ms = 3_600_000 },
+    .servers = .{.{
+        .listen = .{.{ .address = "127.0.0.1", .port = 19181 }},
+        .locations = .{.{ .prefix = "/ws", .proxy_pass = "app" }},
+    }},
+    .upstreams = .{.{ .name = "app", .servers = .{ "127.0.0.1:19191", "127.0.0.1:19192", "127.0.0.1:19193", "127.0.0.1:19194" } }},
+}
