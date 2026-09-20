@@ -68,7 +68,7 @@ METRICS = {
 }
 
 
-WORKLOAD_FIELDS = ("name", "scheme", "path", "lua", "servers", "check", "upstream", "conns")
+WORKLOAD_FIELDS = ("name", "scheme", "path", "lua", "servers", "check", "upstream", "conns", "profile")
 
 
 def load_workloads(here: Path):

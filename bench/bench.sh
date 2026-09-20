@@ -19,13 +19,14 @@ CERTS="$SRC_QZ/interop/certs"
 WWW="$RUN/www"
 
 # ---------------------------------------------------------------- the registry
-declare -A W_SCHEME W_PATH W_LUA W_SERVERS W_CHECK W_UP W_CONNS W_LABEL
+declare -A W_SCHEME W_PATH W_LUA W_SERVERS W_CHECK W_UP W_CONNS W_PROFILE W_LABEL
 ORDER=()
-while read -r name scheme path lua servers check up conns label; do
+while read -r name scheme path lua servers check up conns profile label; do
     case ${name:-} in ""|\#*) continue ;; esac
     ORDER+=("$name")
     W_SCHEME[$name]=$scheme W_PATH[$name]=$path W_LUA[$name]=$lua W_SERVERS[$name]=$servers
-    W_CHECK[$name]=$check W_UP[$name]=$up W_CONNS[$name]=$conns W_LABEL[$name]=$label
+    W_CHECK[$name]=$check W_UP[$name]=$up W_CONNS[$name]=$conns W_PROFILE[$name]=$profile
+    W_LABEL[$name]=$label
 done < "$HERE/workloads.txt"
 
 read -ra WORKLOADS <<< "${WORKLOADS:-${ORDER[*]}}"
@@ -133,11 +134,37 @@ if [ "$ACCESS_LOG" == on ]; then
 else
     NGINX_LOG=off ROUTEZ_LOG=false HAPROXY_LOG='no log'
 fi
-for f in nginx.conf haproxy.cfg routez.zon upstream.conf; do
+fill() { # template -> rendered config
     sed "s|UPSTREAM_WORKERS|$UPSTREAM_WORKERS|g; s|WORKERS|$WORKERS|g; s|WWW|$WWW|g; s|CERTS|$CERTS|g; \
          s|ACCESS_LOG|$NGINX_LOG|g; s|ROUTEZ_LOG|$ROUTEZ_LOG|g; s|HAPROXY_LOG|$HAPROXY_LOG|g; s|RUN|$RUN|g" \
-        "$HERE/conf/$f" > "$RUN/$f"
+        "$1"
+}
+fill "$HERE/conf/upstream.conf" > "$RUN/upstream.conf"
+
+# A row whose settings would change every other row's result gets its own
+# config, and its own server processes: the routing row's regex locations are
+# tried for most paths, so in the main config every row would pay for them.
+render_profile() { # profile
+    local d=$RUN/$1 f
+    mkdir -p "$d"
+    for f in nginx.conf haproxy.cfg routez.zon; do fill "$HERE/conf/$f" > "$d/$f"; done
+    if [ "$1" == routing ]; then
+        python3 "$HERE/tools/genrouting.py" nginx > "$d/gen.nginx"
+        python3 "$HERE/tools/genrouting.py" haproxy > "$d/gen.haproxy"
+        python3 "$HERE/tools/genrouting.py" routez > "$d/gen.routez"
+        sed -i -e "/# ROUTING/r $d/gen.nginx" -e "/# ROUTING/d" "$d/nginx.conf"
+        sed -i -e "/# ROUTING/r $d/gen.haproxy" -e "/# ROUTING/d" "$d/haproxy.cfg"
+        sed -i -e "\|// ROUTING|r $d/gen.routez" -e "\|// ROUTING|d" "$d/routez.zon"
+    else
+        sed -i -e "/# ROUTING/d" "$d/nginx.conf" -e "/# ROUTING/d" "$d/haproxy.cfg"
+        sed -i -e "\|// ROUTING|d" "$d/routez.zon"
+    fi
+}
+PROFILES=()
+for w in "${WORKLOADS[@]}"; do
+    case " ${PROFILES[*]:-} " in *" ${W_PROFILE[$w]} "*) ;; *) PROFILES+=("${W_PROFILE[$w]}") ;; esac
 done
+for prof in "${PROFILES[@]}"; do render_profile "$prof"; done
 # The 304 rows need the file's own Last-Modified, so both the gate and wrk send
 # a date the servers agree is not older than the file.
 IMS_DATE=
@@ -154,10 +181,11 @@ done
 start upstream "$UP_CPUS" nginx -c "$RUN/upstream.conf"
 wait_port 19090
 
-up_servers() {
-    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx.conf"; SPID[nginx]=$!
-    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/haproxy.cfg"; SPID[haproxy]=$!
-    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez.zon"; SPID[routez]=$!
+up_servers() { # profile
+    local d=$RUN/$1
+    start nginx "$SERVER_CPUS" nginx -c "$d/nginx.conf"; SPID[nginx]=$!
+    start haproxy "$SERVER_CPUS" haproxy -f "$d/haproxy.cfg"; SPID[haproxy]=$!
+    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$d/routez.zon"; SPID[routez]=$!
     local p
     for p in "${PLAIN[@]}" "${TLS[@]}"; do wait_port "$p"; done
     # nginx's master listens before its worker exists; the RSS baseline needs both.
@@ -175,7 +203,6 @@ down_servers() {
 # Every cell must answer correctly and every TLS port must negotiate the same
 # parameters, or the numbers compare different things. The check also fixes the
 # request shape each row's lua has to match.
-up_servers
 fail=0 CODE= DL=
 bad() { echo "sanity: $*"; fail=1; }
 # Sets CODE and DL (bytes of body): with -I curl writes the headers into the
@@ -226,8 +253,8 @@ check_cell() { # workload server
         *) bad "$w: unknown check '${W_CHECK[$w]}'" ;;
     esac
 }
-for s in "${SERVERS[@]}"; do
-    for w in "${WORKLOADS[@]}"; do serves "$w" "$s" && check_cell "$w" "$s"; done
+check_tls() { # server: same parameters everywhere, or the rows compare different work
+    local s=$1 tls
     tls=$(echo | openssl s_client -brief -connect "127.0.0.1:${TLS[$s]}" 2>&1 |
         awk -F': ' '/^Protocol version/ {p=$2} /^Ciphersuite/ {c=$2} /Temp Key|Negotiated TLS1.3 group/ {split($2, k, ","); g=k[1]} END {print p, c, g}')
     [ "$tls" == "TLSv1.3 TLS_AES_128_GCM_SHA256 X25519" ] || bad "$s negotiates '$tls'"
@@ -235,8 +262,21 @@ for s in "${SERVERS[@]}"; do
         openssl s_client -connect "127.0.0.1:${TLS[$s]}" -sess_out "$RUN/sess" -ign_eof >/dev/null 2>&1
     echo | openssl s_client -connect "127.0.0.1:${TLS[$s]}" -sess_in "$RUN/sess" 2>/dev/null | grep -q '^Reused' ||
         bad "$s doesn't resume TLS sessions"
+}
+for prof in "${PROFILES[@]}"; do
+    up_servers "$prof"
+    https=no
+    for w in "${WORKLOADS[@]}"; do
+        [ "${W_PROFILE[$w]}" == "$prof" ] && [ "${W_SCHEME[$w]}" == https ] && https=yes
+    done
+    for s in "${SERVERS[@]}"; do
+        for w in "${WORKLOADS[@]}"; do
+            [ "${W_PROFILE[$w]}" == "$prof" ] && serves "$w" "$s" && check_cell "$w" "$s"
+        done
+        [ "$https" == yes ] && check_tls "$s"
+    done
+    down_servers
 done
-down_servers
 [ "$fail" == 0 ] || { tail -n 20 "$RUN"/*.log; exit 1; }
 
 { env_header; cat <<EOF
@@ -273,8 +313,8 @@ for w in "${WORKLOADS[@]}"; do
     mapfile -t act < <(active "$w")
     # Restart the servers per row, so its memory is its own and no earlier row's
     # open-file cache or connection pool is still warm.
-    up_servers
-    for s in "${act[@]}"; do echo "$(tree_rss "${SPID[$s]}")" > "$OUT/raw/$w.$s.base"; done
+    up_servers "${W_PROFILE[$w]}"
+    for s in "${act[@]}"; do tree_rss "${SPID[$s]}" > "$OUT/raw/$w.$s.base"; done
     for s in "${act[@]}"; do run_wrk "$w" "$s" 2 /dev/null; done
     for r in $(seq 1 "$ROUNDS"); do
         # Rotate who goes first so drift doesn't favour one server.
