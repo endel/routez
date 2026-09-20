@@ -1,0 +1,34 @@
+# Rows of the HTTP suite, read by bench.sh and report.py. Whitespace-separated;
+# `label` is the rest of the line. Order here is the order in the report.
+#
+#   servers   all | nohap (HAProxy is not a file server)
+#   check     what the sanity gate sends and expects, and so the request shape
+#             the workload's lua must match: pong | file:<f> | set | ims | 404 |
+#             head:<f> | gz:<f>
+#   upstream  does the row use the shared upstream (it keeps its own cores) —
+#             when it doesn't, wrk takes those cores too
+#   lua       extra wrk script in lua/, concatenated after report.lua; - for none
+#   conns     wrk connections, or - for the default
+#
+# No HEAD row: wrk reads a HEAD response as a body that never arrives and
+# records nothing. It belongs with the fixed-rate rows, which use another client.
+#
+# name           scheme path            lua        servers check         upstream conns label
+return           http   /ping           -          all     pong          no       -     Fixed response (`return`)
+static           http   /10k.bin        -          nohap   file:10k.bin  no       -     10 KB static file
+proxy            http   /up/            -          all     pong          yes      -     Reverse proxy to a keep-alive upstream
+tls-return       https  /ping           -          all     pong          no       -     TLS: fixed response
+tls-static       https  /10k.bin        -          nohap   file:10k.bin  no       -     TLS: 10 KB static file
+tls-handshake    https  /ping           close      all     pong          no       -     TLS: new connection per request (resumed)
+static-1k        http   /1k.bin         -          nohap   file:1k.bin   no       -     1 KB static file
+static-100k      http   /100k.bin       -          nohap   file:100k.bin no       -     100 KB static file
+static-1m        http   /1m.bin         -          nohap   file:1m.bin   no       64    1 MB static file
+static-100m      http   /100m.bin       -          nohap   file:100m.bin no       8     100 MB static file
+tls-static-1m    https  /1m.bin         -          nohap   file:1m.bin   no       64    TLS: 1 MB static file
+fileset          http   /set/           fileset    nohap   set           no       -     10k files of 4 KB, one at random
+not-modified     http   /10k.bin        ims        nohap   ims           no       -     304 from `If-Modified-Since`
+notfound         http   /nope.bin       -          nohap   404           no       -     404 for a missing file
+bigheaders       http   /ping           bigheaders all     pong          no       -     Fixed response, 1.5 KB of request headers
+pipeline         http   /ping           pipeline   all     pipe:16       no       -     Fixed response, 16 requests pipelined
+gzip             http   /z/text.html    gzip       nohap   gz:z/text.html no      -     gzip on the fly, 100 KB of text
+precompressed    http   /z/pre.html     gzip       nohap   gz:z/pre.html  no      -     Precompressed `.gz`, 100 KB of text

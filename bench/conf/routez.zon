@@ -12,6 +12,8 @@
             .{ .prefix = "/", .root = "WWW" },
             .{ .prefix = "/ping", .@"return" = .{ .body = "pong", .content_type = "text/plain" } },
             .{ .prefix = "/up/", .proxy_pass = "be" },
+            // Compression rows only, so the other static rows stay uncompressed.
+            .{ .prefix = "/z/", .root = "WWW", .gzip = true, .precompressed = .{.gzip} },
         },
     }},
     .upstreams = .{.{ .name = "be", .servers = .{"127.0.0.1:19090"}, .keepalive = 64 }},
