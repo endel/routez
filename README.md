@@ -28,7 +28,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   tunnels, X-Forwarded-* headers.
 - Load balancing: round robin, least connections, IP hash; passive failure
   tracking and active HTTP health checks.
-- Layer-4 UDP proxy for QUIC traffic, with QUIC-LB connection-ID routing.
+- Layer-4 TCP proxy for protocols routez doesn't terminate, and a layer-4
+  UDP proxy for QUIC traffic, with QUIC-LB connection-ID routing.
 - Worker threads with SO_REUSEPORT. Graceful shutdown on SIGINT/SIGTERM:
   keep-alive connections close once idle, after the client has been sent
   every byte of its last response (queued output and `sendfile` ranges
@@ -109,6 +110,11 @@ A ZON file; see `src/config.zig` for every field and default.
         .servers = .{ "10.0.0.1:8080", "10.0.0.2:8080" },
         .balance = .least_conn,
         .health = .{ .path = "/healthz", .interval_ms = 5000 },
+    }},
+    .tcp_proxies = .{.{
+        .address = "0.0.0.0",
+        .port = 5432,
+        .proxy_pass = "db",
     }},
     .udp_proxies = .{.{
         .port = 4433,
@@ -194,6 +200,17 @@ A ZON file; see `src/config.zig` for every field and default.
 - TLS keys may be EC P-256, Ed25519 or RSA (2048 to 4096 bits). TLS 1.2 is
   not supported. A key that doesn't belong to the first certificate of its
   `cert` file fails the load.
+
+- `tcp_proxies` forwards a whole TCP connection to an upstream, parsing
+  nothing and terminating no TLS: for a database, an SSH or a game server
+  behind the same balancing, passive failure tracking and health checks as
+  the HTTP proxy. The peer is chosen when the client connects (`ip_hash`
+  sees the client address), and the tunnel closes after
+  `idle_timeout_ms` (10 minutes) with no traffic either way, or as soon as
+  either side closes and the other has drained. Tunnels count against
+  `limits.max_connections` like any connection, and a reload hands the
+  listening socket over as it does for HTTP. A port serving `servers` can't
+  also be a `tcp_proxy`.
 
 ### Locations
 
@@ -354,6 +371,14 @@ variant the client doesn't take.
   rather than being refused: refusing would let anyone with enough
   addresses lock out every new client, and those addresses already let
   them sidestep per-address limits.
+- `limits.max_connections` (10 000) counts **per worker**, so a four-worker
+  server holds up to 40 000 TCP connections; connections over the cap are
+  closed right after accept, counted by
+  `routez_connections_refused_max_connections_total`, and logged once per
+  worker. Long-lived connections (WebSocket tunnels, SSE) make it the limit
+  that bites first: raise it for them. It is lowered at startup to fit
+  `RLIMIT_NOFILE`, which every worker's clients and their upstream
+  connections share, with a warning saying so.
 
 ### Access control
 

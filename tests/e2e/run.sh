@@ -345,6 +345,61 @@ for _ in $(seq 1 20); do $SCURL -o /dev/null http://127.0.0.1:18471/ && break; p
 SUITE=shared-limits check metrics "$($SCURL http://127.0.0.1:18471/metrics | python3 "$HERE/check_metrics.py" routez_http_requests_limited_total routez_limit_table_capacity)" "$((40 - ok + 1 + 10 - after)) 100032"
 kill $SHARED; wait $SHARED 2>/dev/null
 
+# max_connections counts per worker: one worker holding 8, so 12 of 20 are
+# closed at accept and counted.
+cat > "$WORK/maxconn.zon" <<EOF2
+.{ .access_log = false, .workers = 1, .limits = .{ .max_connections = 8 }, .servers = .{.{
+    .listen = .{.{ .address = "127.0.0.1", .port = 18472 }},
+    .locations = .{ .{ .prefix = "/", .@"return" = .{ .body = "ok" } }, .{ .prefix = "/metrics", .metrics = true } },
+}} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/maxconn.zon" 2> "$WORK/maxconn.log" & MAXC=$!; PIDS+=($MAXC)
+wait_port 18472
+SUITE=limits check max-connections "$(python3 "$HERE/conn_limit.py" 20 18472)" 12
+# The metrics request needs a slot of its own, once the refused ones close.
+for _ in $(seq 1 20); do $CURL_BIN -s -o /dev/null http://127.0.0.1:18472/ && break; perl -e 'select(undef,undef,undef,0.05)'; done
+SUITE=limits check max-connections-metric "$($CURL_BIN -s http://127.0.0.1:18472/metrics | python3 "$HERE/check_metrics.py" routez_connections_refused_max_connections_total)" 12
+SUITE=limits check max-connections-logged "$(grep -c 'at limits.max_connections' "$WORK/maxconn.log")" 1
+kill $MAXC; wait $MAXC 2>/dev/null
+
+# Layer-4 TCP forwarding: no parsing, so an HTTP server behind it answers
+# as itself, big bodies and all. The upstream here is the main server.
+cat > "$WORK/l4.zon" <<EOF2
+.{ .access_log = false, .workers = 1,
+   .tcp_proxies = .{.{ .address = "127.0.0.1", .port = 18473, .proxy_pass = "l4be" }},
+   .upstreams = .{.{ .name = "l4be", .servers = .{"127.0.0.1:18080"} }},
+   .servers = .{.{ .listen = .{.{ .address = "127.0.0.1", .port = 18474 }},
+                   .locations = .{.{ .prefix = "/metrics", .metrics = true }} }} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/l4.zon" 2> "$WORK/l4.log" & L4=$!; PIDS+=($L4)
+wait_port 18473
+L4URL=http://127.0.0.1:18473
+# The main server answers "pong2" here: the reload section changed it.
+SUITE=tcp-proxy check tcp-proxy-forwards "$($CURL_BIN -s "$L4URL/ping")" "pong2"
+SUITE=tcp-proxy check tcp-proxy-streams "$($CURL_BIN -s "$L4URL/big.bin" | sha)" "$(sha < "$WORK/www/big.bin")"
+# Keep-alive: a second request on the same tunnel, and an upload back up it.
+SUITE=tcp-proxy check tcp-proxy-keepalive "$($CURL_BIN -s "$L4URL/ping" "$L4URL/ping" | tr -d '\n')" "pong2pong2"
+SUITE=tcp-proxy check tcp-proxy-upload "$($CURL_BIN -s --data-binary @"$WORK/www/big.bin" -o /dev/null -w '%{http_code}' "$L4URL/api/")" 200
+# A WebSocket rides the tunnel too: nothing in the path parses HTTP.
+SUITE=tcp-proxy check tcp-proxy-websocket "$(node "$HERE/ws_client.mjs" ws://127.0.0.1:18473/ws/echo)" "ws-ok"
+# Every tunnel was accounted for: none is still open once the clients left.
+active_l4() { $CURL_BIN -s http://127.0.0.1:18474/metrics | python3 "$HERE/check_metrics.py" 'routez_connections_active{protocol="tcp"}'; }
+for _ in $(seq 1 20); do [ "$(active_l4)" == 1 ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+# Only the metrics request itself is left, so every tunnel was released.
+SUITE=tcp-proxy check tcp-proxy-released "$(active_l4)" 1
+kill $L4; wait $L4 2>/dev/null
+
+# An upstream that refuses: the tunnel closes instead of hanging.
+cat > "$WORK/l4dead.zon" <<EOF2
+.{ .access_log = false, .workers = 1,
+   .tcp_proxies = .{.{ .address = "127.0.0.1", .port = 18475, .proxy_pass = "dead" }},
+   .upstreams = .{.{ .name = "dead", .servers = .{"127.0.0.1:19099"} }} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/l4dead.zon" 2> "$WORK/l4dead.log" & L4D=$!; PIDS+=($L4D)
+wait_port 18475
+SUITE=tcp-proxy check tcp-proxy-upstream-down "$($CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18475/ping)" 000
+kill $L4D; wait $L4D 2>/dev/null
+
 # QUIC connection migration across workers: four workers share UDP 18444;
 # a NAT relay moves the client to a new source port mid-connection, which
 # the kernel usually hashes to another worker. Steering by connection ID

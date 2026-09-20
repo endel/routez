@@ -20,10 +20,9 @@ Nothing queued; the list below is next, in order, as needs arrive.
    with a long DoS history (Rapid Reset, CONTINUATION floods, HPACK bombs),
    so only when one of those needs arrives.
 5. **ACME DNS-01** for wildcard certificates, and OCSP stapling (M).
-6. **Layer-4 TCP proxy** beside the UDP one (S).
-7. **quic-zig idle timeout covering PTO backoff.** A patch exists, parked:
+6. **quic-zig idle timeout covering PTO backoff.** A patch exists, parked:
    under realistic loss nothing fails, only outages of 12 s or more do, and
    it would let dead peers hold a slot for up to 180 s.
-8. **Brotli and zstd on the fly** (L). Needs an encoder: Zig's standard
+7. **Brotli and zstd on the fly** (L). Needs an encoder: Zig's standard
    library has neither, a minimal one would compress worse than gzip, and C
    libraries are out. Precompress at build time instead.
