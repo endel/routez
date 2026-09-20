@@ -300,15 +300,18 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             return (self.active.items.len - self.active_off) + self.pending.items.len + file_len;
         }
 
-        /// Bytes the kernel holds for us that we have not read yet.
+        /// Whether the kernel holds bytes for us that we have not read yet.
         ///
         /// A connection whose next request is still in the receive queue looks
         /// idle to everything that only inspects our own buffers. Closing it
         /// then sends RST and the client loses that request.
-        pub fn unread(self: *const Self) usize {
-            var n: c_int = 0;
-            if (std.c.ioctl(self.tcp.fd, std.c.T.FIONREAD, &n) != 0) return 0;
-            return if (n > 0) @intCast(n) else 0;
+        ///
+        /// A peek rather than FIONREAD, whose value std does not carry for
+        /// every target this builds on, and one byte answers the question.
+        pub fn hasUnread(self: *const Self) bool {
+            var byte: [1]u8 = undefined;
+            const flags = std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT;
+            return std.c.recv(self.tcp.fd, &byte, 1, flags) > 0;
         }
 
         fn kickWrite(self: *Self) void {

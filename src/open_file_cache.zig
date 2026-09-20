@@ -437,9 +437,10 @@ test "a working set larger than the cache stays correct, and the table stays com
     var c = Cache.init(testing.allocator, .{ .max = max, .valid_ms = 1000, .inactive_ms = 60_000 });
     defer c.deinit();
 
-    var names: [64][8]u8 = undefined;
+    // Sized to the name exactly: a spare byte would travel into the path.
+    var names: [64]["f00.txt".len]u8 = undefined;
     for (&names, 0..) |*n, i| {
-        _ = try std.fmt.bufPrint(n, "f{d:0>2}.txt", .{i});
+        std.debug.assert((try std.fmt.bufPrint(n, "f{d:0>2}.txt", .{i})).len == n.len);
         try d.write(n, "x");
     }
 

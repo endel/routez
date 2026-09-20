@@ -584,7 +584,7 @@ pub const Conn = struct {
         // with `Connection: close`, since keep_alive is off from here on; the
         // drain timeout is the backstop if the client sent a partial head and
         // stopped.
-        if (self.sock.unread() > 0) return;
+        if (self.sock.hasUnread()) return;
         if (self.tls) |t| {
             t.close();
             self.flushTls();
