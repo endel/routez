@@ -34,7 +34,7 @@ for w in "${WORKLOADS[@]}"; do
     [ -n "${W_SCHEME[$w]:-}" ] || { echo "unknown workload '$w'; have: ${ORDER[*]}"; exit 1; }
 done
 
-SERVERS=(nginx haproxy routez)
+read -ra SERVERS <<< "${SERVERS:-nginx haproxy routez}"
 declare -A PLAIN=([nginx]=19080 [routez]=19081 [haproxy]=19082)
 declare -A TLS=([nginx]=19443 [routez]=19444 [haproxy]=19445)
 declare -A SPID=()

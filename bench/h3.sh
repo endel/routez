@@ -47,7 +47,7 @@ for r in "${ROWS[@]}"; do
     [ -n "${R_ALPN[$r]:-}" ] || { echo "unknown row '$r'; have: ${ORDER[*]}"; exit 1; }
 done
 
-SERVERS=(nginx haproxy routez)
+read -ra SERVERS <<< "${SERVERS:-nginx haproxy routez}"
 declare -A QUIC=([nginx]=19543 [routez]=19544 [haproxy]=19545)
 declare -A TLS=([nginx]=19443 [routez]=19444 [haproxy]=19445)
 declare -A SPID=()

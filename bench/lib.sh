@@ -64,7 +64,10 @@ start() {
     local name=$1 cpus=$2 pre=()
     shift 2
     if [ "$PROFILE" == strace ] && [ "$name" == "$PROFILE_SERVER" ]; then
-        pre=(strace -c -f -o "$OUT/$name.strace")
+        # Only the syscall families the rows are about. Tracing everything on a
+        # threaded server pushes every syscall through ptrace and the run stops
+        # making progress at all, rather than merely slowing down.
+        pre=(strace -c -f -e "trace=${PROFILE_TRACE:-%net,%desc}" -o "$OUT/$name.strace")
     fi
     taskset -c "$cpus" "${pre[@]}" "$@" > "$RUN/$name.log" 2>&1 &
     local pid=$!

@@ -41,7 +41,7 @@ for r in "${ROWS[@]}"; do
 done
 
 # `direct` is the baseline: the same traffic with no proxy in the path.
-SERVERS=(direct nginx haproxy routez)
+read -ra SERVERS <<< "${SERVERS:-direct nginx haproxy routez}"
 declare -A TCP=([direct]=19090 [nginx]=19280 [routez]=19281 [haproxy]=19282)
 declare -A UDP=([direct]=19201 [nginx]=19290 [routez]=19291)
 declare -A SPID=()
