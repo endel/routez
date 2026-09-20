@@ -184,6 +184,9 @@ pub const cached = if (builtin.os.tag == .linux) linux_cached else struct {
     pub fn enabled() bool {
         return false;
     }
+    pub fn readEnabled() bool {
+        return false;
+    }
     pub fn open(_: [:0]const u8) linux_cached.OpenError!std.Io.File {
         return error.WouldBlock;
     }
@@ -198,9 +201,17 @@ pub const cached = if (builtin.os.tag == .linux) linux_cached else struct {
 const linux_cached = struct {
     const linux = std.os.linux;
     var unsupported = std.atomic.Value(bool).init(false);
+    /// Separate from `unsupported`: openat2's RESOLVE_CACHED and preadv2's
+    /// RWF_NOWAIT are different capabilities, and overlayfs has the first
+    /// without the second.
+    var read_unsupported = std.atomic.Value(bool).init(false);
 
     pub fn enabled() bool {
         return !unsupported.load(.monotonic);
+    }
+
+    pub fn readEnabled() bool {
+        return !read_unsupported.load(.monotonic);
     }
 
     pub const OpenError = error{ WouldBlock, FileNotFound, NotDir, NameTooLong };
@@ -246,7 +257,13 @@ const linux_cached = struct {
         const rc = linux.preadv2(file.handle, &iov, 1, @intCast(offset), linux.RWF.NOWAIT);
         return switch (linux.errno(rc)) {
             .SUCCESS => rc,
-            .OPNOTSUPP => error.Unsupported,
+            // Remembered for the process: a filesystem that refuses one
+            // cache-only read refuses them all, and asking again costs a
+            // failing syscall on every request.
+            .OPNOTSUPP => {
+                read_unsupported.store(true, .monotonic);
+                return error.Unsupported;
+            },
             else => error.WouldBlock,
         };
     }

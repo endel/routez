@@ -327,13 +327,15 @@ pub const Transfer = struct {
         const e = t.entry.?;
         const want: usize = @intCast(@min(t.end - t.offset, chunk_size));
         const buf = t.buf.?[0..want];
-        if (e.nowait and file_io.cached.enabled()) {
+        if (file_io.cached.readEnabled()) {
             if (file_io.cached.read(e.file, buf, t.offset)) |n| {
                 t.filled = n;
                 return true;
             } else |err| switch (err) {
                 error.WouldBlock => return false,
-                error.Unsupported => e.nowait = false,
+                // file_io remembers this for the process; fall through to
+                // residency for this request.
+                error.Unsupported => {},
             }
         }
         if (!e.resident(t.offset, want)) return false;
