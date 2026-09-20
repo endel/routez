@@ -88,17 +88,22 @@ pub const Pool = struct {
     /// caller then sends the response uncompressed.
     pub fn acquire(self: *Pool) ?*Encoder {
         if (self.active >= max_active) return null;
-        const e = if (self.idle) |head| blk: {
-            self.idle = head.next;
-            self.idle_count -= 1;
-            head.next = null;
-            head.reset() catch {
-                head.destroy();
-                break :blk null;
-            };
-            break :blk head;
-        } else Encoder.create(self.alloc) catch null;
-        if (e != null) self.active += 1;
+        const e = self.takeIdle() orelse Encoder.create(self.alloc) catch return null;
+        self.active += 1;
+        return e;
+    }
+
+    /// An idle encoder, reset and ready. Null when there is none, or resetting
+    /// one failed, in which case the caller makes a fresh one.
+    fn takeIdle(self: *Pool) ?*Encoder {
+        const e = self.idle orelse return null;
+        self.idle = e.next;
+        self.idle_count -= 1;
+        e.next = null;
+        e.reset() catch {
+            e.destroy();
+            return null;
+        };
         return e;
     }
 
@@ -217,4 +222,38 @@ test "round trip" {
     const got = try d.reader.allocRemaining(alloc, .unlimited);
     defer alloc.free(got);
     try std.testing.expectEqualStrings(input.items, got);
+}
+
+test "the pool reuses encoders, keeps at most max_idle, and stops at max_active" {
+    const alloc = std.testing.allocator;
+    var pool: Pool = .{ .alloc = alloc };
+    defer pool.deinit();
+
+    // A released encoder comes back rather than being allocated again.
+    const first = pool.acquire().?;
+    pool.release(first);
+    try std.testing.expectEqual(first, pool.acquire().?);
+    try std.testing.expectEqual(@as(u32, 1), pool.active);
+
+    // Past max_idle the extras are freed instead of parked.
+    var held: [max_idle + 2]*Encoder = undefined;
+    held[0] = first;
+    for (held[1..]) |*e| e.* = pool.acquire().?;
+    for (held) |e| pool.release(e);
+    try std.testing.expectEqual(@as(u32, 0), pool.active);
+    try std.testing.expectEqual(@as(u32, max_idle), pool.idle_count);
+
+    // max_active is a hard ceiling; past it a response goes out uncompressed.
+    var out: [max_active]*Encoder = undefined;
+    for (&out) |*e| e.* = pool.acquire().?;
+    try std.testing.expect(pool.acquire() == null);
+    for (out) |e| pool.release(e);
+    try std.testing.expectEqual(@as(u32, 0), pool.active);
+
+    // A reused encoder still produces a valid stream.
+    const e = pool.acquire().?;
+    defer pool.release(e);
+    try e.write("hello hello hello");
+    try e.finish();
+    try std.testing.expect(e.output().len > 0);
 }
