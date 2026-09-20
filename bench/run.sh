@@ -5,6 +5,7 @@
 #   bench/run.sh h3       HTTP/3 with h2load (h3.sh)
 #   bench/run.sh l4       layer-4 TCP and UDP proxying (l4.sh)
 #   bench/run.sh hostile  connection storms, slow clients, limits, reload (hostile.sh)
+#   bench/run.sh rate     latency at a rate every server is held to (rate.sh)
 #   bench/run.sh soak     a long mixed run, watching memory and descriptors (soak.sh)
 # Results land in bench/results/[<suite>-]<timestamp>/. Knobs: see each script;
 # also OUT, QUIC_ZIG, HAPROXY_BRANCH.
@@ -15,8 +16,8 @@ QZ="$(cd "${QUIC_ZIG:-$ROOT/../quic-zig}" && pwd)"
 SUITE=${1:-http}
 case $SUITE in
     http) SCRIPT=bench.sh PREFIX= ;;
-    ws|h3|l4|hostile|soak) SCRIPT=$SUITE.sh PREFIX=$SUITE- ;;
-    *) echo "unknown suite '$SUITE'; one of: http ws h3 l4 hostile soak"; exit 1 ;;
+    ws|h3|l4|hostile|soak|rate) SCRIPT=$SUITE.sh PREFIX=$SUITE- ;;
+    *) echo "unknown suite '$SUITE'; one of: http rate ws h3 l4 hostile soak"; exit 1 ;;
 esac
 [ -f "$HERE/$SCRIPT" ] || { echo "$SCRIPT doesn't exist yet"; exit 1; }
 OUT="${OUT:-$HERE/results/$PREFIX$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -47,7 +48,7 @@ docker run --rm \
     -e LEVELS -e RATE -e HOLD -e CLIENTS -e SERVERS \
     -e SWEEP -e SWEEP_VALUES -e STREAMS -e PPS -e FLOWS -e SOAK_MINUTES -e ROWS \
     -e HANDSHAKES -e ACCESS_LOG -e PHASE -e SAMPLE \
-    -e PROFILE -e PROFILE_SERVER -e PROFILE_HZ \
+    -e PROFILE -e PROFILE_SERVER -e PROFILE_HZ -e PROFILE_TRACE -e FRACTION \
     -v "$ROOT:/src/routez:ro" -v "$QZ:/src/quic-zig:ro" \
     -v zigcache:/cache -v "$OUT:/out" \
     "$IMAGE" "/src/routez/bench/$SCRIPT"

@@ -672,6 +672,7 @@ validation against routez.
 
 ```sh
 bench/run.sh                   # HTTP rows with wrk
+bench/run.sh rate              # latency at a rate every server is held to
 bench/run.sh h3                # HTTP/3 with h2load
 bench/run.sh l4                # the layer-4 TCP and UDP proxies
 bench/run.sh hostile           # storms, stalled clients, full handshakes, reload
@@ -679,6 +680,8 @@ bench/run.sh soak              # a long mixed run, watching memory
 bench/run.sh ws                # concurrent WebSocket tunnels
 bench/sweep.sh WORKERS 1 2 4   # one suite over the values of one knob
 bench/scorecard.py             # where routez is behind, worst first
+bench/profile.sh http fileset routez   # what one losing row spends itself on
+bench/history.py compare <run>         # what moved since the last revision
 ```
 
 Each suite builds routez, starts all three servers beside a shared upstream and
@@ -722,6 +725,11 @@ requests per second. Relative numbers only; a VM is not a benchmark machine.
   connection, and wrk is at its own limit there, so read it as an ordering.
   Full handshakes are a hostile-suite row, driven by a client that offers no
   session.
+- These rows are closed-loop, so their latency is the reciprocal of throughput
+  and says nothing about latency at a given load. That is what `run.sh rate`
+  is for: it holds every server to the same offered rate. At 208k requests a
+  second on a fixed response, p99 is 3.6 ms for routez, 3.2 ms for HAProxy and
+  21.2 ms for nginx; on a 10 KB file at 172k it is 2.8 ms against nginx's 6.8.
 
 ### Where routez is behind
 
