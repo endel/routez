@@ -738,33 +738,40 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 
 | Row | routez | best other | |
 |---|---|---|---|
-| Full TLS handshakes, RSA 2048 | 0.7k/s | 3.2k/s | nginx |
-| gzip on the fly through the proxy | 3.9k/s | 15k/s | HAProxy |
-| gzip on the fly, 100 KB of text | 4.0k/s | 10k/s | nginx |
+| gzip on the fly through the proxy | 4.2k/s | 15k/s | HAProxy |
+| gzip on the fly, 100 KB of text | 4.4k/s | 10k/s | nginx |
+| Full TLS handshakes, RSA 2048 | 1.0k/s | 3.4k/s | nginx |
 | HTTP/3, 64 connections, 1 stream each | 35k/s | 129k/s | HAProxy |
 | HTTP/3, 1 MB static file | 0.8k/s | 2.8k/s | nginx |
 | HTTP/3, 10 KB static file | 77k/s | 232k/s | nginx |
-| 10k files of 4 KB, one at random | 94k/s | 213k/s | nginx |
+| 10k files of 4 KB, one at random | 103k/s | 209k/s | nginx |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
-| Full TLS handshakes, ECDSA P-256 | 4.8k/s | 8.2k/s | nginx |
+| Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
+| 100 KB static file | 156k/s | 185k/s | nginx |
 | Memory per parked keep-alive connection | 2.0 KB | 0.5 KB | nginx |
 | A new connection per request | 187k/s | 235k/s | nginx |
-| A reload every 2 s under load | 765 failed | 0 failed | HAProxy |
+| A reload every 2 s under load | 174 failed | 0 failed | HAProxy |
 
-Three of these have a known cause:
+What is known about the top of that list:
 
-- **The two gzip rows** are bounded by compressing on the event-loop thread. A
-  100 KB body takes about 700 µs in `std.compress.flate` at level 4, and each
-  worker does one at a time, so three workers give about 4k responses a second,
-  which is what the row reads. The codec is also slower than zlib at the same
-  level.
-- **The file-set row** is latency-bound, not CPU-bound: 256 connections divided
-  by its 2.58 ms p50 is the 94k it serves. A cache miss hands the read to four
-  I/O threads, and the handoff costs two futex round trips and an eventfd wakeup
-  per 4 KB file.
-- **The reload row** force-closes connections it believes are idle, and a
-  connection whose next request is still unread in the kernel looks idle. Closing
-  it then sends RST, which the client sees as a reset request.
+- **The two gzip rows** are the codec. Compressing runs on the loop thread, so a
+  worker does one response at a time, and `std.compress.flate` manages 146 MB/s
+  at level 4 where zlib does 342. Moving compression off the loop would fix the
+  tail, not the rate; matching the rate means a faster deflate.
+- **Handshakes** are the asymmetric crypto. quic-zig signs with its own
+  Montgomery exponentiation now, which took RSA from 0.7k to 1.0k a second, and
+  the remainder is a 1024-bit modexp against OpenSSL's assembly, plus about
+  1.2 ms per signature still spent in `std.crypto.ff` preparing moduli that do
+  not change.
+- **The file-set row** is no longer CPU-bound: at 85% of its cores with the
+  client at 15%, it is waiting. Every cache miss hands a 4 KB read to four I/O
+  threads, and the handoff costs two futex round trips and an eventfd wakeup.
+  Reading small files inline, as nginx does unless `aio` is on, is the change
+  that would close it.
+- **The reload row** is down to the race itself: a request that arrives after the
+  idle check and before the close. Reaching zero means HAProxy's model, never
+  force-closing an established connection, which wants a bound on how many
+  generations may coexist.
 
 **HTTP/3 is about per-connection cost, not per-request cost.** Holding 64
 requests in flight and moving them from streams onto connections:
