@@ -689,9 +689,8 @@ Results land in `bench/results/ws-<timestamp>/`. Knobs: `LEVELS`
 (1000 10000 50000), `RATE` (10000 echoes/s in total), `HOLD` (5 s),
 `DURATION` (10 s), `ROUNDS` (3), `CLIENTS`, `SERVERS`.
 
-Same machine, 19 Sep 2026: routez 8baf71e with the shared read buffer, Node.js
-22.22 and `ws` 8.21; the server, the app and the client are pinned to
-separate cores. Median of 3 rounds.
+Same machine, 20 Sep 2026: Node.js 22.22 and `ws` 8.21; the server, the app
+and the client are pinned to separate cores. One round per level.
 
 **Memory per open connection** (lower is better). This is the server's RSS
 growth over its idle baseline, divided by the number of connections. It
@@ -699,9 +698,9 @@ barely moves between rounds.
 
 | Open connections | nginx | HAProxy | routez |
 |---|---|---|---|
-| 1,000 | 18.2 KB | 15.6 KB | 8.7 KB |
-| 10,000 | 17.9 KB | 5.1 KB | 8.3 KB |
-| 50,000 | 17.8 KB | 4.9 KB | 8.3 KB |
+| 1,000 | 16.8 KB | 11.3 KB | 6.4 KB |
+| 10,000 | 18.0 KB | 5.3 KB | 5.3 KB |
+| 50,000 | 17.8 KB | 4.8 KB | 5.3 KB |
 
 **Echo latency, p99** (lower is better). 10,000 messages per second in
 total, spread over all open connections. "No proxy" is the client talking
@@ -709,14 +708,16 @@ to the app directly.
 
 | Open connections | No proxy | nginx | HAProxy | routez |
 |---|---|---|---|---|
-| 1,000 | 6 ms | 7 ms | 6 ms | 7 ms |
-| 10,000 | 12 ms | 14 ms | 14 ms | 12 ms |
-| 50,000 | 9 ms | 126 ms | 126 ms | 68 ms |
+| 1,000 | 5 ms | 5 ms | 7 ms | 5 ms |
+| 10,000 | 10 ms | 17 ms | 26 ms | 12 ms |
+| 50,000 | 89 ms | 53 ms | 75 ms | 68 ms |
 
 - The p99 is noisy from round to round, above all at 50k connections. The
-  p50 stayed under 1.3 ms everywhere.
+  p50 stayed under 1.6 ms everywhere.
 - On Linux, sockets share one read buffer per worker instead of holding
   16 KiB each; without that, routez held 21 KB per connection here.
+- The 1,000-connection row includes each server's fixed startup cost, which
+  is why it is higher for everyone.
 - One Node process can't absorb much more. At 1 message per second per
   connection it saturates near 25k connections, so the load is a fixed
   total rather than a rate per connection.

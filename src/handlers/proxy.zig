@@ -500,6 +500,10 @@ pub const Proxy = struct {
         ex.pauseRequestBody(false);
         if (self.in.items.len > head_len) ex.respondBody(self.in.items[head_len..]);
         self.in.clearAndFree(self.alloc());
+        // Nothing is replayable once the upgrade is through.
+        self.replay.clearAndFree(self.alloc());
+        self.unsent.clearAndFree(self.alloc());
+        self.replay_ok = false;
     }
 
     pub fn onUpstreamEof(self: *Proxy) void {
