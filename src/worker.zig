@@ -730,7 +730,9 @@ pub const Listener = struct {
         // Every worker binds the same port; the kernel spreads connections.
         _ = std.c.setsockopt(tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(c_int));
         try tcp.bind(addr);
-        try tcp.listen(1024);
+        // The kernel clamps this to net.core.somaxconn, which is where
+        // operators tune the accept queue.
+        try tcp.listen(std.math.maxInt(u16));
         return tcp;
     }
 
