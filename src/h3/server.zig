@@ -106,7 +106,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 },
                 .loop = &w.loop,
                 .reuse_port = true,
-                .max_connections = w.cfg.limits.max_connections,
+                .max_connections = w.shared.max_connections,
                 .recv_buffer_size = 4 * 1024 * 1024,
                 // Our id in every connection ID, so a sibling worker that gets
                 // our packets after a client's address changes can pass them on.

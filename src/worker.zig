@@ -143,6 +143,20 @@ pub fn dupFd(fd: std.posix.fd_t) !std.posix.fd_t {
     return d;
 }
 
+/// Connections one worker may hold: `max`, lowered so every worker's clients
+/// and their upstream connections stay within the descriptor limit.
+pub fn capConnections(max: u32, workers: u16, nofile: u64) u32 {
+    const budget = nofile / 2 / @max(workers, 1);
+    return @intCast(@min(max, budget));
+}
+
+pub fn effectiveMaxConnections(max: u32, workers: u16) u32 {
+    const lim = std.posix.getrlimit(.NOFILE) catch return max;
+    const capped = capConnections(max, workers, lim.cur);
+    if (capped < max) log.warn("limits.max_connections lowered to {d} per worker: RLIMIT_NOFILE is {d} across {d} worker(s)", .{ capped, lim.cur, workers });
+    return capped;
+}
+
 /// Log a failed bind, explaining the one a dropped root can't do.
 pub fn bindFailed(what: []const u8, address: []const u8, port: u16, err: anyerror) void {
     if (privileges.dropped and port < 1024 and err == error.AccessDenied) {
@@ -177,6 +191,8 @@ pub const Worker = struct {
 
     conns_head: ?*H1Conn = null,
     conn_count: u32 = 0,
+    /// The max_connections warning is logged once per worker.
+    max_conn_logged: bool = false,
     gzip_active: u32 = 0,
     /// For regex locations and rewrites; sized for this generation's largest.
     regex_scratch: regex.Scratch = .{},
@@ -237,6 +253,8 @@ pub const Worker = struct {
         file_pool: ?*file_io.Pool = null,
         /// `open_file_cache.max` within the descriptor budget.
         open_file_cache_max: u32 = 0,
+        /// `limits.max_connections` within the descriptor budget, per worker.
+        max_connections: u32 = 0,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -827,7 +845,13 @@ pub const Listener = struct {
 
     fn serve(self: *Listener, tcp: xev.TCP) void {
         const w = self.worker;
-        if (w.conn_count >= w.cfg.limits.max_connections) {
+        if (w.conn_count >= w.shared.max_connections) {
+            stats.inc(&stats.refused_max_connections);
+            // Once per worker: the counter carries the rest.
+            if (!w.max_conn_logged) {
+                w.max_conn_logged = true;
+                log.warn("worker {d} at limits.max_connections ({d} per worker): refusing connections", .{ w.id, w.shared.max_connections });
+            }
             _ = std.c.close(tcp.fd);
             return;
         }
@@ -869,3 +893,13 @@ pub const Listener = struct {
         self.start();
     }
 };
+
+// ---- tests ----
+
+test capConnections {
+    // Two descriptors per proxied connection, shared by every worker.
+    try std.testing.expectEqual(@as(u32, 10_000), capConnections(10_000, 4, 1 << 20));
+    try std.testing.expectEqual(@as(u32, 8_192), capConnections(10_000, 4, 65_536));
+    try std.testing.expectEqual(@as(u32, 512), capConnections(100_000, 1, 1024));
+    try std.testing.expectEqual(@as(u32, 0), capConnections(10_000, 1, 0));
+}

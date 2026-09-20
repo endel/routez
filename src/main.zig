@@ -110,6 +110,7 @@ const Generation = struct {
             g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
             g.shared.open_file_cache_max = open_file_cache.effectiveMax(g.cfg.open_file_cache.max, g.cfg.workers);
         }
+        g.shared.max_connections = worker_mod.effectiveMaxConnections(g.cfg.limits.max_connections, g.cfg.workers);
         g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
         if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
             g.access_file = logs.acquire(io, p) catch |err| {

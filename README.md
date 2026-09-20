@@ -354,6 +354,14 @@ variant the client doesn't take.
   rather than being refused: refusing would let anyone with enough
   addresses lock out every new client, and those addresses already let
   them sidestep per-address limits.
+- `limits.max_connections` (10 000) counts **per worker**, so a four-worker
+  server holds up to 40 000 TCP connections; connections over the cap are
+  closed right after accept, counted by
+  `routez_connections_refused_max_connections_total`, and logged once per
+  worker. Long-lived connections (WebSocket tunnels, SSE) make it the limit
+  that bites first: raise it for them. It is lowered at startup to fit
+  `RLIMIT_NOFILE`, which every worker's clients and their upstream
+  connections share, with a warning saying so.
 
 ### Access control
 
