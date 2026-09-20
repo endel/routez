@@ -35,6 +35,8 @@ pub const Config = struct {
     upstreams: []const Upstream = &.{},
     /// Layer-4 UDP forwarding, for QUIC traffic we don't terminate.
     udp_proxies: []const UdpProxy = &.{},
+    /// Layer-4 TCP forwarding, for protocols we don't terminate.
+    tcp_proxies: []const TcpProxy = &.{},
     limits: Limits = .{},
     /// Write one line per completed request.
     access_log: bool = true,
@@ -447,6 +449,15 @@ pub const Upstream = struct {
 /// Forward UDP datagrams (typically QUIC) to an upstream group without
 /// decrypting them. Each client address gets its own upstream socket, so
 /// replies need no parsing.
+pub const TcpProxy = struct {
+    address: []const u8 = "0.0.0.0",
+    port: u16,
+    /// Upstream name or literal `host:port`.
+    proxy_pass: []const u8,
+    /// Close a tunnel after this long with no traffic either way.
+    idle_timeout_ms: u32 = 600_000,
+};
+
 pub const UdpProxy = struct {
     address: []const u8 = "0.0.0.0",
     port: u16,
@@ -511,7 +522,17 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
     if (cfg.file_io_threads == 0 or cfg.file_io_threads > 256) return fail("file_io_threads must be 1 to 256", .{});
     // 0 would disable the idle timeout: dead peers would never be dropped.
     if (cfg.limits.quic_idle_timeout_ms == 0) return fail("limits.quic_idle_timeout_ms must be at least 1", .{});
-    if (cfg.servers.len == 0 and cfg.udp_proxies.len == 0) return fail("nothing to serve: no servers or udp_proxies", .{});
+    if (cfg.servers.len == 0 and cfg.udp_proxies.len == 0 and cfg.tcp_proxies.len == 0) return fail("nothing to serve: no servers, tcp_proxies or udp_proxies", .{});
+    for (cfg.tcp_proxies) |t| {
+        if (t.port == 0) return fail("tcp_proxy needs a port", .{});
+        if (t.proxy_pass.len == 0) return fail("tcp_proxy :{d}: proxy_pass is empty", .{t.port});
+        if (t.idle_timeout_ms == 0) return fail("tcp_proxy :{d}: idle_timeout_ms must be > 0", .{t.port});
+        for (cfg.servers) |srv| for (srv.listen) |l| {
+            if (l.port == t.port and std.mem.eql(u8, l.address, t.address)) {
+                return fail("tcp_proxy :{d}: a server already listens on {s}:{d}", .{ t.port, t.address, t.port });
+            }
+        };
+    }
     if (cfg.group != null and cfg.user == null) return fail("group needs user", .{});
     if (cfg.user) |u| if (u.len == 0) return fail("user is empty", .{});
     if (cfg.access_log_path) |p| if (p.len == 0) return fail("access_log_path is empty", .{});
@@ -861,6 +882,28 @@ test "quic idle timeout" {
     try std.testing.expectEqual(@as(u32, 120_000), cfg.limits.quic_idle_timeout_ms);
     try std.testing.expectError(error.InvalidConfig, parse(a,
         \\.{ .limits = .{ .quic_idle_timeout_ms = 0 }, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test"));
+}
+
+test "tcp proxies" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // A tcp_proxy alone is enough to serve, and it defaults to a long idle.
+    const cfg = try parse(a,
+        \\.{ .tcp_proxies = .{.{ .port = 5432, .proxy_pass = "db" }}, .upstreams = .{.{ .name = "db", .servers = .{"10.0.0.1:5432"} }} }
+    , "test");
+    try std.testing.expectEqual(@as(u16, 5432), cfg.tcp_proxies[0].port);
+    try std.testing.expectEqual(@as(u32, 600_000), cfg.tcp_proxies[0].idle_timeout_ms);
+    // A port an HTTP server already listens on would never accept here.
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .tcp_proxies = .{.{ .port = 1, .proxy_pass = "db" }}, .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .tcp_proxies = .{.{ .port = 5432, .proxy_pass = "" }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .tcp_proxies = .{.{ .port = 5432, .proxy_pass = "db", .idle_timeout_ms = 0 }} }
     , "test"));
 }
 

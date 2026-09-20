@@ -442,6 +442,7 @@ test {
     _ = @import("handlers/proxy.zig");
     _ = @import("worker.zig");
     _ = @import("udp_proxy.zig");
+    _ = @import("tcp_proxy.zig");
     _ = @import("h3/server.zig");
     _ = @import("gzip.zig");
     _ = @import("encoding.zig");

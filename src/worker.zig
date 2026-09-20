@@ -17,6 +17,7 @@ const stats = @import("stats.zig");
 const steering = @import("steering.zig");
 const socket = @import("net/socket.zig");
 const UdpProxy = @import("udp_proxy.zig").UdpProxy;
+const Tunnel = @import("tcp_proxy.zig").Tunnel;
 const h3_server = @import("h3/server.zig");
 const access_log = @import("access_log.zig");
 const logs = @import("logs.zig");
@@ -185,6 +186,8 @@ pub const Worker = struct {
 
     listeners: std.ArrayListUnmanaged(*Listener) = .empty,
     udp_proxies: std.ArrayListUnmanaged(*UdpProxy) = .empty,
+    /// Open layer-4 TCP tunnels, so a stop can close them.
+    tunnels_head: ?*Tunnel = null,
     quic_listeners: std.ArrayListUnmanaged(QuicListener) = .empty,
     groups: std.ArrayListUnmanaged(*upstream.Group) = .empty,
     group_names: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -315,6 +318,7 @@ pub const Worker = struct {
         errdefer w.closeSockets();
         try w.setupUpstreams();
         try w.setupListeners(prev);
+        try w.setupTcpProxies(prev);
         try w.setupQuicListeners(prev);
         for (cfg.udp_proxies) |*u| try w.udp_proxies.append(alloc, try UdpProxy.create(w, u, try prev.udp(u.address, u.port)));
         return w;
@@ -358,6 +362,7 @@ pub const Worker = struct {
             }
         }
         for (self.cfg.udp_proxies) |u| try self.addImplicitGroup(u.proxy_pass, false);
+        for (self.cfg.tcp_proxies) |t| try self.addImplicitGroup(t.proxy_pass, false);
     }
 
     fn addImplicitGroup(self: *Worker, target: []const u8, h3: bool) !void {
@@ -398,6 +403,16 @@ pub const Worker = struct {
                 try lst.addServer(srv);
                 try self.listeners.append(self.alloc, lst);
             }
+        }
+    }
+
+    fn setupTcpProxies(self: *Worker, prev: Predecessor) !void {
+        for (self.cfg.tcp_proxies) |*t| {
+            const group = self.findGroup(t.proxy_pass) orelse return error.UnknownUpstream;
+            const l: config.Listen = .{ .address = t.address, .port = t.port };
+            const lst = try Listener.create(self, l, null, prev.tcp(t.address, t.port));
+            lst.l4 = .{ .cfg = t, .group = group };
+            try self.listeners.append(self.alloc, lst);
         }
     }
 
@@ -536,6 +551,11 @@ pub const Worker = struct {
         // Stop taking new clients here, so they reach a newer generation.
         for (self.listeners.items) |l| l.stopAccepting();
         for (self.udp_proxies.items) |u| u.stop();
+        var t = self.tunnels_head;
+        while (t) |tun| {
+            t = tun.next;
+            tun.stop();
+        }
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
@@ -660,6 +680,22 @@ pub const Worker = struct {
         stats.inc(&stats.active_tcp);
     }
 
+    pub fn addTunnel(self: *Worker, t: *Tunnel) void {
+        t.prev = null;
+        t.next = self.tunnels_head;
+        if (self.tunnels_head) |h| h.prev = t;
+        self.tunnels_head = t;
+        self.conn_count += 1;
+        stats.inc(&stats.active_tcp);
+    }
+
+    pub fn removeTunnel(self: *Worker, t: *Tunnel) void {
+        if (t.prev) |p| p.next = t.next else self.tunnels_head = t.next;
+        if (t.next) |n| n.prev = t.prev;
+        self.conn_count -= 1;
+        stats.dec(&stats.active_tcp);
+    }
+
     pub fn removeConn(self: *Worker, c: *H1Conn) void {
         if (c.prev) |p| p.next = c.next else self.conns_head = c.next;
         if (c.next) |n| n.prev = c.prev;
@@ -710,6 +746,9 @@ pub const Listener = struct {
     accept_c: xev.Completion = .{},
     servers: std.ArrayListUnmanaged(*const config.Server) = .empty,
     vhosts: router.VirtualHosts = .{ .servers = &.{} },
+    /// Set on a `tcp_proxies` listener: accepted sockets become layer-4
+    /// tunnels instead of HTTP connections.
+    l4: ?struct { cfg: *const config.TcpProxy, group: *upstream.Group } = null,
     tls_config: ?*const tls.ServerConfig,
     /// Connections open with a PROXY protocol header.
     proxy_protocol: bool,
@@ -878,6 +917,12 @@ pub const Listener = struct {
                     return;
                 },
             };
+        }
+        if (self.l4) |l4| {
+            Tunnel.create(w, l4.cfg, l4.group, tcp) catch {
+                if (ip_key) |k| w.releaseIp(k);
+            };
+            return;
         }
         const conn = H1Conn.create(w, self, tcp) catch |err| {
             log.warn("connection setup: {s}", .{@errorName(err)});
