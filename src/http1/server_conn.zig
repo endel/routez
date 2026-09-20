@@ -579,6 +579,12 @@ pub const Conn = struct {
     pub fn closeIfIdle(self: *Conn, fresh_too: bool) void {
         self.keep_alive = false;
         if (self.phase != .head or self.in.items.len > 0 or (self.requests == 0 and !fresh_too)) return;
+        // A request already in the receive queue makes an idle-looking
+        // connection busy. It is read on the next turn of the loop and answered
+        // with `Connection: close`, since keep_alive is off from here on; the
+        // drain timeout is the backstop if the client sent a partial head and
+        // stopped.
+        if (self.sock.unread() > 0) return;
         if (self.tls) |t| {
             t.close();
             self.flushTls();

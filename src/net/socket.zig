@@ -300,6 +300,17 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             return (self.active.items.len - self.active_off) + self.pending.items.len + file_len;
         }
 
+        /// Bytes the kernel holds for us that we have not read yet.
+        ///
+        /// A connection whose next request is still in the receive queue looks
+        /// idle to everything that only inspects our own buffers. Closing it
+        /// then sends RST and the client loses that request.
+        pub fn unread(self: *const Self) usize {
+            var n: c_int = 0;
+            if (std.c.ioctl(self.tcp.fd, std.c.T.FIONREAD, &n) != 0) return 0;
+            return if (n > 0) @intCast(n) else 0;
+        }
+
         fn kickWrite(self: *Self) void {
             if (self.writing or self.connecting or self.corked) return;
             if (self.state == .closing or self.state == .closed or self.state == .lingering) return;
