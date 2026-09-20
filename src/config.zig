@@ -446,9 +446,8 @@ pub const Upstream = struct {
     };
 };
 
-/// Forward UDP datagrams (typically QUIC) to an upstream group without
-/// decrypting them. Each client address gets its own upstream socket, so
-/// replies need no parsing.
+/// Forward whole TCP connections to an upstream group, parsing nothing and
+/// terminating no TLS.
 pub const TcpProxy = struct {
     address: []const u8 = "0.0.0.0",
     port: u16,
@@ -458,6 +457,9 @@ pub const TcpProxy = struct {
     idle_timeout_ms: u32 = 600_000,
 };
 
+/// Forward UDP datagrams (typically QUIC) to an upstream group without
+/// decrypting them. Each client address gets its own upstream socket, so
+/// replies need no parsing.
 pub const UdpProxy = struct {
     address: []const u8 = "0.0.0.0",
     port: u16,
@@ -525,7 +527,7 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
     if (cfg.servers.len == 0 and cfg.udp_proxies.len == 0 and cfg.tcp_proxies.len == 0) return fail("nothing to serve: no servers, tcp_proxies or udp_proxies", .{});
     for (cfg.tcp_proxies) |t| {
         if (t.port == 0) return fail("tcp_proxy needs a port", .{});
-        if (t.proxy_pass.len == 0) return fail("tcp_proxy :{d}: proxy_pass is empty", .{t.port});
+        try checkTarget(cfg, t.proxy_pass);
         if (t.idle_timeout_ms == 0) return fail("tcp_proxy :{d}: idle_timeout_ms must be > 0", .{t.port});
         for (cfg.servers) |srv| for (srv.listen) |l| {
             if (l.port == t.port and std.mem.eql(u8, l.address, t.address)) {

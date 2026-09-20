@@ -140,7 +140,7 @@ pub fn Relay(comptime Listener: type) type {
                 }
                 self.by_up.deinit(a);
                 _ = self.relay.sessions.remove(.{ .conn = self.down_conn, .id = self.down_sid });
-                self.peer.active -= 1;
+                self.peer.detach();
                 self.up.retire();
                 self.arena_state.deinit();
                 a.destroy(self);
@@ -415,7 +415,6 @@ pub fn Relay(comptime Listener: type) type {
             var client_buf: [64]u8 = undefined;
             const client_addr = socket.formatIpKey(clientIp(w, session, headers), &client_buf);
             const peer = group.pick(client_addr, &.{}) orelse return refuse(session, session_id);
-            stats.inc(&peer.stats.requests);
 
             self.open(w, session, session_id, path, headers, group, peer) catch |err| {
                 log.warn("relay to {s}: {s}", .{ peer.label, @errorName(err) });
@@ -552,7 +551,7 @@ pub fn Relay(comptime Listener: type) type {
             });
             r.up = up;
             try self.sessions.put(a, .{ .conn = r.down_conn, .id = session_id }, r);
-            peer.active += 1;
+            peer.attach();
             up.client.start();
         }
 

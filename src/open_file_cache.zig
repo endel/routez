@@ -252,21 +252,6 @@ pub const Cache = struct {
     }
 };
 
-/// Entries each worker may keep: `max`, lowered so all workers' cached
-/// descriptors stay within a quarter of the descriptor limit.
-pub fn capMax(max: u32, workers: u16, nofile: u64) u32 {
-    const budget = nofile / 4 / @max(workers, 1);
-    return @intCast(@min(max, budget));
-}
-
-pub fn effectiveMax(max: u32, workers: u16) u32 {
-    if (max == 0) return 0;
-    const lim = std.posix.getrlimit(.NOFILE) catch return max;
-    const capped = capMax(max, workers, lim.cur);
-    if (capped < max) log.info("max lowered to {d} entries per worker: RLIMIT_NOFILE is {d} across {d} worker(s)", .{ capped, lim.cur, workers });
-    return capped;
-}
-
 // ---- tests ----
 
 const testing = std.testing;
@@ -420,12 +405,4 @@ test "disabled cache: entries live as long as their references" {
     const fd = e.file.handle;
     e.release();
     try testing.expect(!fdOpen(fd));
-}
-
-test "descriptor budget" {
-    try testing.expectEqual(1000, capMax(1000, 1, 1_048_576));
-    try testing.expectEqual(64, capMax(1000, 1, 256));
-    try testing.expectEqual(16, capMax(1000, 4, 256));
-    try testing.expectEqual(0, capMax(1000, 4, 8));
-    try testing.expectEqual(1000, capMax(1000, 2, std.math.maxInt(u64)));
 }

@@ -138,24 +138,44 @@ pub const Predecessor = struct {
     }
 };
 
+/// A client connection the worker owns: an HTTP connection or a layer-4
+/// tunnel. Both are counted against `max_connections`, drained at a stop and
+/// released from the per-IP table, so what the accept path tracks lives here
+/// once instead of once per kind.
+pub const Client = struct {
+    next: ?*Client = null,
+    prev: ?*Client = null,
+    /// Set when counted against a per-IP limit.
+    ip_key: ?[16]u8 = null,
+    kind: enum { http, tunnel },
+
+    /// Close if nothing is in flight; `force` closes mid-request ones too.
+    /// A tunnel has no request boundary to wait for, so it just goes.
+    pub fn closeIfIdle(self: *Client, force: bool) void {
+        switch (self.kind) {
+            .http => H1Conn.fromClient(self).closeIfIdle(force),
+            .tunnel => Tunnel.fromClient(self).abort(),
+        }
+    }
+
+    /// Outlived the drain: close the sockets so a reload doesn't leak them.
+    /// The memory goes with the process.
+    pub fn abandon(self: *Client) void {
+        switch (self.kind) {
+            .http => {
+                const conn = H1Conn.fromClient(self);
+                conn.abandonFlushes();
+                _ = std.c.close(conn.sock.fd());
+            },
+            .tunnel => Tunnel.fromClient(self).abandon(),
+        }
+    }
+};
+
 pub fn dupFd(fd: std.posix.fd_t) !std.posix.fd_t {
     const d = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
     if (d < 0) return error.DupFailed;
     return d;
-}
-
-/// Connections one worker may hold: `max`, lowered so every worker's clients
-/// and their upstream connections stay within the descriptor limit.
-pub fn capConnections(max: u32, workers: u16, nofile: u64) u32 {
-    const budget = nofile / 2 / @max(workers, 1);
-    return @intCast(@min(max, budget));
-}
-
-pub fn effectiveMaxConnections(max: u32, workers: u16) u32 {
-    const lim = std.posix.getrlimit(.NOFILE) catch return max;
-    const capped = capConnections(max, workers, lim.cur);
-    if (capped < max) log.warn("limits.max_connections lowered to {d} per worker: RLIMIT_NOFILE is {d} across {d} worker(s)", .{ capped, lim.cur, workers });
-    return capped;
 }
 
 /// Log a failed bind, explaining the one a dropped root can't do.
@@ -168,6 +188,9 @@ pub fn bindFailed(what: []const u8, address: []const u8, port: u16, err: anyerro
 }
 
 const log = std.log.scoped(.worker);
+
+/// How often a worker may say it is refusing connections at the cap.
+const max_conn_log_interval_ms = 60_000;
 
 /// How long a stopping worker waits for in-flight requests.
 const drain_timeout_ms = 10_000;
@@ -186,16 +209,14 @@ pub const Worker = struct {
 
     listeners: std.ArrayListUnmanaged(*Listener) = .empty,
     udp_proxies: std.ArrayListUnmanaged(*UdpProxy) = .empty,
-    /// Open layer-4 TCP tunnels, so a stop can close them.
-    tunnels_head: ?*Tunnel = null,
     quic_listeners: std.ArrayListUnmanaged(QuicListener) = .empty,
     groups: std.ArrayListUnmanaged(*upstream.Group) = .empty,
     group_names: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    conns_head: ?*H1Conn = null,
+    conns_head: ?*Client = null,
     conn_count: u32 = 0,
-    /// The max_connections warning is logged once per worker.
-    max_conn_logged: bool = false,
+    /// When the max_connections warning last went out, to throttle it.
+    max_conn_logged_ms: i64 = std.math.minInt(i64) / 2,
     gzip_active: u32 = 0,
     /// For regex locations and rewrites; sized for this generation's largest.
     regex_scratch: regex.Scratch = .{},
@@ -399,7 +420,7 @@ pub const Worker = struct {
                     continue;
                 }
                 const tc: ?*const tls.ServerConfig = if (l.tls) self.shared.tlsFor(l.address, l.port) orelse return error.InvalidConfig else null;
-                const lst = try Listener.create(self, l, tc, prev.tcp(l.address, l.port));
+                const lst = try Listener.create(self, l, tc, null, prev.tcp(l.address, l.port));
                 try lst.addServer(srv);
                 try self.listeners.append(self.alloc, lst);
             }
@@ -408,11 +429,14 @@ pub const Worker = struct {
 
     fn setupTcpProxies(self: *Worker, prev: Predecessor) !void {
         for (self.cfg.tcp_proxies) |*t| {
+            if (self.findListener(t.address, t.port) != null) {
+                log.err("tcp_proxy {s}:{d}: already listening there", .{ t.address, t.port });
+                return error.InvalidConfig;
+            }
             const group = self.findGroup(t.proxy_pass) orelse return error.UnknownUpstream;
             const l: config.Listen = .{ .address = t.address, .port = t.port };
-            const lst = try Listener.create(self, l, null, prev.tcp(t.address, t.port));
-            lst.l4 = .{ .cfg = t, .group = group };
-            try self.listeners.append(self.alloc, lst);
+            const l4: Listener.L4 = .{ .cfg = t, .group = group };
+            try self.listeners.append(self.alloc, try Listener.create(self, l, null, l4, prev.tcp(t.address, t.port)));
         }
     }
 
@@ -551,11 +575,6 @@ pub const Worker = struct {
         // Stop taking new clients here, so they reach a newer generation.
         for (self.listeners.items) |l| l.stopAccepting();
         for (self.udp_proxies.items) |u| u.stop();
-        var t = self.tunnels_head;
-        while (t) |tun| {
-            t = tun.next;
-            tun.stop();
-        }
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
@@ -626,12 +645,9 @@ pub const Worker = struct {
             for (self.quic_listeners.items) |q| q.deinit();
             self.quic_listeners.clearRetainingCapacity();
         }
-        // Client connections that outlived the drain: close their sockets
-        // so a reload doesn't leak them. Their memory goes with the process.
         var c = self.conns_head;
         while (c) |conn| : (c = conn.next) {
-            conn.abandonFlushes();
-            _ = std.c.close(conn.sock.fd());
+            conn.abandon();
             if (conn.ip_key) |k| self.releaseIp(k);
             conn.ip_key = null;
         }
@@ -671,7 +687,7 @@ pub const Worker = struct {
         try stats.prometheus(w, views.items, self.shared.clients);
     }
 
-    pub fn addConn(self: *Worker, c: *H1Conn) void {
+    pub fn addClient(self: *Worker, c: *Client) void {
         c.prev = null;
         c.next = self.conns_head;
         if (self.conns_head) |h| h.prev = c;
@@ -680,23 +696,7 @@ pub const Worker = struct {
         stats.inc(&stats.active_tcp);
     }
 
-    pub fn addTunnel(self: *Worker, t: *Tunnel) void {
-        t.prev = null;
-        t.next = self.tunnels_head;
-        if (self.tunnels_head) |h| h.prev = t;
-        self.tunnels_head = t;
-        self.conn_count += 1;
-        stats.inc(&stats.active_tcp);
-    }
-
-    pub fn removeTunnel(self: *Worker, t: *Tunnel) void {
-        if (t.prev) |p| p.next = t.next else self.tunnels_head = t.next;
-        if (t.next) |n| n.prev = t.prev;
-        self.conn_count -= 1;
-        stats.dec(&stats.active_tcp);
-    }
-
-    pub fn removeConn(self: *Worker, c: *H1Conn) void {
+    pub fn removeClient(self: *Worker, c: *Client) void {
         if (c.prev) |p| p.next = c.next else self.conns_head = c.next;
         if (c.next) |n| n.prev = c.prev;
         self.conn_count -= 1;
@@ -739,6 +739,8 @@ pub const Worker = struct {
 };
 
 pub const Listener = struct {
+    pub const L4 = struct { cfg: *const config.TcpProxy, group: *upstream.Group };
+
     worker: *Worker,
     address: []const u8,
     port: u16,
@@ -748,7 +750,7 @@ pub const Listener = struct {
     vhosts: router.VirtualHosts = .{ .servers = &.{} },
     /// Set on a `tcp_proxies` listener: accepted sockets become layer-4
     /// tunnels instead of HTTP connections.
-    l4: ?struct { cfg: *const config.TcpProxy, group: *upstream.Group } = null,
+    l4: ?L4,
     tls_config: ?*const tls.ServerConfig,
     /// Connections open with a PROXY protocol header.
     proxy_protocol: bool,
@@ -763,7 +765,7 @@ pub const Listener = struct {
     /// With `inherit` (the same listener in the worker being replaced),
     /// share its socket: closing a listening socket resets the connections
     /// queued on it, and a SYN racing the close is refused.
-    fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig, inherit: ?*const Listener) !*Listener {
+    fn create(w: *Worker, l: config.Listen, tc: ?*const tls.ServerConfig, l4: ?L4, inherit: ?*const Listener) !*Listener {
         const tcp = if (inherit) |old| xev.TCP.initFd(try dupFd(old.tcp.fd)) else openListener(l) catch |err| {
             bindFailed("listen", l.address, l.port, err);
             return err;
@@ -771,11 +773,11 @@ pub const Listener = struct {
         errdefer _ = std.c.close(tcp.fd);
 
         const self = try w.alloc.create(Listener);
-        self.* = .{ .worker = w, .address = l.address, .port = l.port, .tcp = tcp, .tls_config = tc, .proxy_protocol = l.proxy_protocol };
+        self.* = .{ .worker = w, .address = l.address, .port = l.port, .tcp = tcp, .tls_config = tc, .l4 = l4, .proxy_protocol = l.proxy_protocol };
         if (l.quic) {
             self.alt_svc = std.fmt.bufPrint(&self.alt_svc_buf, "h3=\":{d}\"; ma=86400", .{l.port}) catch null;
         }
-        if (w.id == 0) log.info("listening on {s}:{d}{s}", .{ l.address, l.port, if (tc != null) " (tls)" else "" });
+        if (w.id == 0) log.info("listening on {s}:{d}{s}", .{ l.address, l.port, if (l4 != null) " (tcp proxy)" else if (tc != null) " (tls)" else "" });
         return self;
     }
 
@@ -886,9 +888,9 @@ pub const Listener = struct {
         const w = self.worker;
         if (w.conn_count >= w.shared.max_connections) {
             stats.inc(&stats.refused_max_connections);
-            // Once per worker: the counter carries the rest.
-            if (!w.max_conn_logged) {
-                w.max_conn_logged = true;
+            // At most once a minute per worker: the counter carries volume.
+            if (w.timers.now_ms - w.max_conn_logged_ms >= max_conn_log_interval_ms) {
+                w.max_conn_logged_ms = w.timers.now_ms;
                 log.warn("worker {d} at limits.max_connections ({d} per worker): refusing connections", .{ w.id, w.shared.max_connections });
             }
             _ = std.c.close(tcp.fd);
@@ -919,9 +921,13 @@ pub const Listener = struct {
             };
         }
         if (self.l4) |l4| {
-            Tunnel.create(w, l4.cfg, l4.group, tcp) catch {
+            const tunnel = Tunnel.create(w, l4.cfg, l4.group, tcp) catch |err| {
+                if (err != error.NoPeer) log.warn("tunnel setup: {s}", .{@errorName(err)});
                 if (ip_key) |k| w.releaseIp(k);
+                _ = std.c.close(tcp.fd);
+                return;
             };
+            tunnel.link.ip_key = ip_key;
             return;
         }
         const conn = H1Conn.create(w, self, tcp) catch |err| {
@@ -930,7 +936,7 @@ pub const Listener = struct {
             _ = std.c.close(tcp.fd);
             return;
         };
-        conn.ip_key = ip_key;
+        conn.client.ip_key = ip_key;
     }
 
     fn onRetryAccept(d: *timers.Deadline) void {
@@ -938,13 +944,3 @@ pub const Listener = struct {
         self.start();
     }
 };
-
-// ---- tests ----
-
-test capConnections {
-    // Two descriptors per proxied connection, shared by every worker.
-    try std.testing.expectEqual(@as(u32, 10_000), capConnections(10_000, 4, 1 << 20));
-    try std.testing.expectEqual(@as(u32, 8_192), capConnections(10_000, 4, 65_536));
-    try std.testing.expectEqual(@as(u32, 512), capConnections(100_000, 1, 1024));
-    try std.testing.expectEqual(@as(u32, 0), capConnections(10_000, 1, 0));
-}
