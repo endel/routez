@@ -32,7 +32,11 @@ docker build -q -t "$IMAGE" --build-arg "HAPROXY_BRANCH=${HAPROXY_BRANCH:-3.2}" 
 # run holds hundreds of thousands of descriptors. net.core.rmem_max isn't
 # namespaced, so the container can't raise it: the UDP rows size their own
 # socket buffers and record what the kernel allowed.
+# perf needs to read the kernel's counters, which the default profile forbids.
+PRIV=()
+[ "${PROFILE:-}" == perf ] && PRIV=(--privileged)
 docker run --rm \
+    ${PRIV[@]+"${PRIV[@]}"} \
     --ulimit nofile=1048576:1048576 \
     --sysctl net.ipv4.tcp_tw_reuse=1 \
     --sysctl net.ipv4.ip_local_port_range="1024 65535" \
@@ -43,6 +47,7 @@ docker run --rm \
     -e LEVELS -e RATE -e HOLD -e CLIENTS -e SERVERS \
     -e SWEEP -e SWEEP_VALUES -e STREAMS -e PPS -e FLOWS -e SOAK_MINUTES -e ROWS \
     -e HANDSHAKES -e ACCESS_LOG -e PHASE -e SAMPLE \
+    -e PROFILE -e PROFILE_SERVER -e PROFILE_HZ \
     -v "$ROOT:/src/routez:ro" -v "$QZ:/src/quic-zig:ro" \
     -v zigcache:/cache -v "$OUT:/out" \
     "$IMAGE" "/src/routez/bench/$SCRIPT"

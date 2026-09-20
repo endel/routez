@@ -112,6 +112,7 @@ up_servers() {
 }
 down_servers() {
     local s
+    profile_report
     for s in "${SERVERS[@]}"; do kill "${SPID[$s]}" 2>/dev/null; done
     for s in "${SERVERS[@]}"; do wait "${SPID[$s]}" 2>/dev/null; done
     SPID=()

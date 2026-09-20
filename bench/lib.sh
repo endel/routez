@@ -29,11 +29,18 @@ else
         echo "warning: not root, leaving sysctls and ulimits alone"
     fi
 fi
+# bench/profile.sh sets PROFILE to sample or trace one server; every other run
+# leaves these empty and `start` behaves as before.
+PROFILE=${PROFILE:-}
+PROFILE_SERVER=${PROFILE_SERVER:-}
+PERF_PID=
+
 RUN="$(mktemp -d)"
 chmod 755 "$RUN" # nginx's workers drop to an unprivileged user
 PIDS=()
 cleanup() {
     local p
+    [ -n "$PERF_PID" ] && { kill -INT "$PERF_PID" 2>/dev/null; wait "$PERF_PID" 2>/dev/null; }
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
     for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null; done
     rm -rf "$RUN"
@@ -53,7 +60,41 @@ build_tool() { # name: build bench/tools/<name>.zig next to the routez binary
     zig build-exe -OReleaseFast -lc -mcpu="$ZIG_CPU" -femit-bin="$RUN/$1" "$HERE/tools/$1.zig" || exit 1
 }
 
-start() { local name=$1 cpus=$2; shift 2; taskset -c "$cpus" "$@" > "$RUN/$name.log" 2>&1 & PIDS+=($!); }
+start() {
+    local name=$1 cpus=$2 pre=()
+    shift 2
+    if [ "$PROFILE" == strace ] && [ "$name" == "$PROFILE_SERVER" ]; then
+        pre=(strace -c -f -o "$OUT/$name.strace")
+    fi
+    taskset -c "$cpus" "${pre[@]}" "$@" > "$RUN/$name.log" 2>&1 &
+    local pid=$!
+    PIDS+=("$pid")
+    if [ "$PROFILE" == perf ] && [ "$name" == "$PROFILE_SERVER" ]; then
+        # Sample the whole tree: nginx's work is in its children, not its master.
+        perf record -F "${PROFILE_HZ:-999}" -g --inherit --pid "$pid" \
+            -o "$OUT/$name.perf" > "$RUN/perf.log" 2>&1 &
+        PERF_PID=$!
+    fi
+}
+
+# Ends the sample and turns it into text. Called before the servers go away, so
+# perf can still resolve their symbols.
+profile_report() {
+    [ -n "$PERF_PID" ] || return 0
+    kill -INT "$PERF_PID" 2>/dev/null
+    wait "$PERF_PID" 2>/dev/null
+    PERF_PID=
+    local f=$OUT/$PROFILE_SERVER
+    perf report -i "$f.perf" --stdio --no-children -g none --percent-limit 0.5 \
+        > "$f.hot" 2>/dev/null || true
+    # Collapsed stacks, the input a flamegraph wants.
+    perf script -i "$f.perf" 2>/dev/null |
+        awk '/^[a-zA-Z]/ { if (n) print s, n; s = ""; n = 0; next }
+             /^\t/ { gsub(/^\t| .*$/, ""); s = (s == "" ? $0 : $0 ";" s); n = 1 }
+             END { if (n) print s, n }' |
+        sort | uniq -c | awk '{ c = $1; $1 = ""; sub(/ [0-9]+$/, ""); print substr($0, 2), c }' \
+        > "$f.folded" 2>/dev/null || true
+}
 
 wait_port() {
     for _ in $(seq 1 100); do

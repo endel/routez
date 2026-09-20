@@ -1,5 +1,6 @@
-# nginx (nginx.org stable), HAProxy (LTS PPA), wrk, h2load with HTTP/3, Zig and
-# Node.js with `ws`, for bench/run.sh.
+# nginx (nginx.org stable), HAProxy (LTS PPA), wrk and oha, h2load with HTTP/3,
+# Zig, Node.js with `ws`, and strace/perf/eu-stack for bench/profile.sh, all for
+# bench/run.sh.
 FROM ubuntu:26.04
 ARG ZIG_VERSION=0.16.0
 ARG HAPROXY_BRANCH=3.2
@@ -8,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg xz-utils unzip software-properties-common \
         build-essential libssl-dev openssl python3 rsync git util-linux \
-        iproute2 procps strace nodejs npm \
+        iproute2 procps strace linux-perf elfutils nodejs npm \
     && . /etc/os-release \
     && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/nginx.gpg] https://nginx.org/packages/ubuntu $VERSION_CODENAME nginx" \
@@ -54,6 +55,15 @@ RUN set -eux \
     && cd / && rm -rf /tmp/nghttp3 /tmp/ngtcp2 /tmp/nghttp2 \
     && h2load --version \
     && h2load --help 2>&1 | grep -qi 'h3'  # built without HTTP/3 it wouldn't mention it
+# oha holds a fixed request rate, which wrk cannot: its closed loop reports the
+# latency the server allows rather than the latency at a given load.
+ARG OHA_VERSION=v1.16.0
+RUN case "$(uname -m)" in aarch64|arm64) A=arm64 ;; x86_64) A=amd64 ;; *) echo "no oha build for $(uname -m)"; exit 1 ;; esac \
+    && curl -fsSL -o /usr/local/bin/oha \
+        "https://github.com/hatoo/oha/releases/download/$OHA_VERSION/oha-linux-$A" \
+    && chmod +x /usr/local/bin/oha \
+    && oha --version
+
 ARG WS_VERSION=8
 RUN mkdir /opt/ws && cd /opt/ws && npm install --no-audit --no-fund "ws@$WS_VERSION"
 ENV NODE_PATH=/opt/ws/node_modules

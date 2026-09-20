@@ -90,6 +90,7 @@ up_proxies() {
 }
 down_proxies() {
     local s
+    profile_report
     for s in nginx haproxy routez; do kill "${SPID[$s]}" 2>/dev/null; done
     for s in nginx haproxy routez; do wait "${SPID[$s]}" 2>/dev/null; done
     PIDS=("${PIDS[0]}" "${PIDS[1]}")

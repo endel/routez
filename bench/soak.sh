@@ -120,6 +120,7 @@ for s in "${SERVERS[@]}"; do
         phase=$((phase + 1))
     done
     echo "$s: $(wc -l < "$samples") samples over $MINUTES min"
+    profile_report
     kill "${SPID[$s]}" 2>/dev/null
     wait "${SPID[$s]}" 2>/dev/null
     PIDS=("${PIDS[0]}")
