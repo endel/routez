@@ -183,7 +183,6 @@ pub const UdpProxy = struct {
             const text = socket.formatSockaddr(from, &text_buf);
             break :blk self.group.pick(text, &.{}) orelse return;
         };
-        stats.inc(&peer.stats.requests);
         const flow = Flow.create(self, key, from, peer) catch |err| {
             log.warn("new flow to {s}: {s}", .{ peer.label, @errorName(err) });
             return;
@@ -278,7 +277,7 @@ const Flow = struct {
             .fd = fd,
             .file = xev.File.initFd(fd),
         };
-        peer.active += 1;
+        peer.attach();
         self.polling = true;
         self.file.poll(&w.loop, &self.poll_c, .read, Flow, self, onReadable);
         w.timers.set(&self.idle, proxy.cfg.idle_timeout_ms);
@@ -345,7 +344,7 @@ const Flow = struct {
         self.closing = true;
         self.proxy.removeFlow(self);
         self.proxy.worker.timers.clear(&self.idle);
-        self.peer.active -= 1;
+        self.peer.detach();
         // Inside our own poll callback, disarming there is enough.
         if (self.polling and !self.in_callback) {
             self.cancelling = true;

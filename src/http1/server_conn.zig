@@ -70,10 +70,8 @@ pub const Conn = struct {
     flush_head: ?*Exchange = null,
     flush_tail: ?*Exchange = null,
 
-    next: ?*Conn = null,
-    prev: ?*Conn = null,
-    /// Set when counted against a per-IP limit.
-    ip_key: ?[16]u8 = null,
+    /// The worker's connection bookkeeping: list links and the per-IP count.
+    client: worker_mod.Client = .{ .kind = .http },
 
     const Phase = enum {
         /// Waiting for (the rest of) a request head.
@@ -93,6 +91,10 @@ pub const Conn = struct {
         started: bool = false,
     };
 
+    pub fn fromClient(c: *worker_mod.Client) *Conn {
+        return @alignCast(@fieldParentPtr("client", c));
+    }
+
     pub fn create(worker: *Worker, listener: *Listener, tcp: anytype) !*Conn {
         const self = try worker.alloc.create(Conn);
         self.* = .{ .worker = worker, .listener = listener, .sock = undefined, .proxy_pending = listener.proxy_protocol };
@@ -111,7 +113,7 @@ pub const Conn = struct {
                 return err;
             };
         }
-        worker.addConn(self);
+        worker.addClient(&self.client);
         worker.timers.set(&self.deadline, worker.cfg.limits.header_timeout_ms);
         self.sock.startReading();
         return self;
@@ -174,7 +176,7 @@ pub const Conn = struct {
             self.addr_len = socket.formatIpKey(src.ip, &self.addr_buf).len;
         }
         switch (self.worker.admitIp(self.client_ip)) {
-            .counted => self.ip_key = self.client_ip,
+            .counted => self.client.ip_key = self.client_ip,
             .untracked => {},
             .refused => {
                 stats.inc(&stats.refused_per_ip);
@@ -278,7 +280,7 @@ pub const Conn = struct {
         if (self.tls) |t| t.destroy();
         self.in.deinit(w.alloc);
         self.out.deinit(w.alloc);
-        w.removeConn(self);
+        w.removeClient(&self.client);
         w.alloc.destroy(self);
     }
 

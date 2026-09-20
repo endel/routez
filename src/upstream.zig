@@ -149,11 +149,21 @@ pub const Peer = struct {
         self.fails = 0;
     }
 
-    /// Take a pooled connection or open a new one, bound to `user`.
-    pub fn acquire(self: *Peer, user: *Proxy) !*UpConn {
+    /// One more client on this server: a pooled HTTP connection, a layer-4
+    /// tunnel or a relayed session. `detach` when it ends.
+    pub fn attach(self: *Peer) void {
         stats.inc(&self.stats.requests);
         self.active += 1;
-        errdefer self.active -= 1;
+    }
+
+    pub fn detach(self: *Peer) void {
+        self.active -= 1;
+    }
+
+    /// Take a pooled connection or open a new one, bound to `user`.
+    pub fn acquire(self: *Peer, user: *Proxy) !*UpConn {
+        self.attach();
+        errdefer self.detach();
         while (self.idle_head) |c| {
             self.unlinkIdle(c);
             if (!c.sock.isOpen()) continue;
@@ -177,7 +187,7 @@ pub const Peer = struct {
     /// Give a connection back. Only keep it if the response was fully read
     /// and the request fully sent, so the next user starts on a clean stream.
     pub fn release(self: *Peer, c: *UpConn, reusable: bool) void {
-        self.active -= 1;
+        self.detach();
         c.user = null;
         if (!reusable or !c.sock.isOpen() or self.idle_count >= self.group.cfg.keepalive or self.group.worker.stopping) {
             c.state = .closing;

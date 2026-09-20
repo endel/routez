@@ -15,6 +15,7 @@ const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
 const file_io = @import("file_io.zig");
 const open_file_cache = @import("open_file_cache.zig");
+const fd_budget = @import("fd_budget.zig");
 const realip = @import("realip.zig");
 const access = @import("access.zig");
 const build_options = @import("build_options");
@@ -108,9 +109,9 @@ const Generation = struct {
         if (g.shared.guards.any_auth) g.shared.auth_pool = try authPool(io);
         if (servesFiles(&g.cfg)) {
             g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
-            g.shared.open_file_cache_max = open_file_cache.effectiveMax(g.cfg.open_file_cache.max, g.cfg.workers);
+            g.shared.open_file_cache_max = fd_budget.effective(.open_files, "open_file_cache.max", g.cfg.open_file_cache.max, g.cfg.workers);
         }
-        g.shared.max_connections = worker_mod.effectiveMaxConnections(g.cfg.limits.max_connections, g.cfg.workers);
+        g.shared.max_connections = fd_budget.effective(.connections, "limits.max_connections", g.cfg.limits.max_connections, g.cfg.workers);
         g.shared.access_format = try access_log.compile(arena, g.cfg.access_log_format, g.cfg.access_log_escape);
         if (g.cfg.access_log) if (g.cfg.access_log_path) |p| {
             g.access_file = logs.acquire(io, p) catch |err| {
@@ -443,6 +444,7 @@ test {
     _ = @import("worker.zig");
     _ = @import("udp_proxy.zig");
     _ = @import("tcp_proxy.zig");
+    _ = @import("fd_budget.zig");
     _ = @import("h3/server.zig");
     _ = @import("gzip.zig");
     _ = @import("encoding.zig");
