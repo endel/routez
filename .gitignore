@@ -2,3 +2,5 @@
 zig-out/
 zig-pkg/
 bench/results/
+# scorecard.py writes here when it is given directories to read.
+bench/scorecard.md
