@@ -550,6 +550,11 @@ pub const Conn = struct {
         // client asks again, so give the buffers back rather than hold what the
         // last request happened to need. They come from the worker's allocator,
         // which recycles them to the connections that are mid-request.
+        //
+        // This trades a re-allocation on the next request for the memory a
+        // parked connection would otherwise sit on (2.0 KB down to 0.7 KB each).
+        // Keeping a small buffer back instead would undo that; measure both
+        // rows before changing it.
         if (self.in.items.len == 0) {
             self.in.clearAndFree(self.worker.alloc);
             self.out.clearAndFree(self.worker.alloc);
@@ -593,8 +598,13 @@ pub const Conn = struct {
         // with `Connection: close`, since keep_alive is off from here on; the
         // drain timeout is the backstop if the client sent a partial head and
         // stopped.
+        //
+        // The graceful close below is not a substitute: it lingers for the
+        // client's FIN, and a connection that never sent anything would then
+        // hold a stop for the whole linger window.
         if (self.sock.hasUnread()) return;
         if (self.tls) |t| {
+            // close_notify is output, so this has to run before the check below.
             t.close();
             self.flushTls();
         }

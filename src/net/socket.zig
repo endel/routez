@@ -304,13 +304,6 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         /// idle: a parked keep-alive connection has nothing to send, and holding
         /// the buffer it needed for its last response is what makes an idle
         /// connection expensive. Does nothing while a write is in flight.
-        pub fn releaseOutput(self: *Self) void {
-            if (self.writing or self.buffered() != 0) return;
-            self.active.clearAndFree(self.alloc);
-            self.active_off = 0;
-            self.pending.clearAndFree(self.alloc);
-        }
-
         /// Whether the kernel holds bytes for us that we have not read yet.
         ///
         /// A connection whose next request is still in the receive queue looks
@@ -323,6 +316,12 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             var byte: [1]u8 = undefined;
             const flags = std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT;
             return std.c.recv(self.tcp.fd, &byte, 1, flags) > 0;
+        }
+
+        /// Hand back the send buffers of a connection with nothing in flight.
+        pub fn releaseOutput(self: *Self) void {
+            if (self.writing or self.buffered() != 0) return;
+            self.dropOutput();
         }
 
         fn kickWrite(self: *Self) void {

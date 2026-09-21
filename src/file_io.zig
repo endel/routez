@@ -184,9 +184,7 @@ pub const cached = if (builtin.os.tag == .linux) linux_cached else struct {
     pub fn enabled() bool {
         return false;
     }
-    pub fn readEnabled() bool {
-        return false;
-    }
+    pub const readEnabled = enabled;
     pub fn open(_: [:0]const u8) linux_cached.OpenError!std.Io.File {
         return error.WouldBlock;
     }

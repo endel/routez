@@ -354,8 +354,9 @@ pub const Transfer = struct {
         const e = t.entry.?;
         const want: usize = @intCast(@min(t.end - t.offset, chunk_size));
         const buf = t.buf.?[0..want];
+        // Small enough that the read costs less than asking whether it would.
         if (t.end - t.offset <= inline_read_max) {
-            t.filled = e.file.readPositional(t.io, &.{buf}, t.offset) catch 0;
+            t.read(e, t.offset, t.end);
             return true;
         }
         if (file_io.cached.readEnabled()) {
@@ -535,9 +536,10 @@ fn serve(ex: *Exchange, t: *Transfer) void {
     t.end = range_end;
     ex.respondHead(&.{ .status = status, .headers = headers[0..n], .content_length = range_end - range_start });
     if (is_head) return finish(ex);
-    // A body that fits one read costs a read and a write either way, and
-    // on ext4 the read needs no residency check.
+    // A body that fits one read costs a read and a write either way.
     t.sendfile = range_end - range_start > chunk_size and ex.canSendFile();
+    // Up to a point, risking a blocking page-in inside sendfile beats asking
+    // about residency first: that check is a syscall per chunk.
     t.trust_sendfile = range_end - range_start <= sendfile_trust_max;
     // The prefetch read from 0 and there's no range: it's the body's start.
     if (t.prefetch and t.filled > 0) {
