@@ -791,11 +791,13 @@ What is known about the top of that list:
   at a time per worker, and `std.compress.flate` manages 146 MB/s at level 4
   where zlib does 342. Moving it off the loop would fix the tail, not the rate;
   the rate means a faster deflate.
-- **Handshakes** are the asymmetric crypto. quic-zig signs with its own
-  Montgomery exponentiation now, which took RSA from 0.7k to 1.0k a second, and
-  the remainder is a 1024-bit modexp against OpenSSL's assembly, plus about
-  1.2 ms per signature still spent in `std.crypto.ff` preparing moduli that do
-  not change.
+- **Handshakes** are the asymmetric crypto, and for RSA they are almost nothing
+  else. quic-zig signs with its own Montgomery exponentiation now, which took RSA
+  from 0.7k to 1.0k a second. A 1024-bit exponentiation measures 437 µs against
+  `std.crypto.ff`'s 1.52 ms, and the two a CRT signature needs account for 874 µs
+  of the 1 ms a handshake takes: there is no bookkeeping left to remove, only the
+  multiplication itself, which is Zig codegen against OpenSSL's hand-written
+  aarch64 assembly. ECDSA, which routez prefers, is within 1.5x.
 - **The file-set row** is no longer CPU-bound: at 85% of its cores with the
   client at 15%, it is waiting. Every cache miss hands a 4 KB read to four I/O
   threads, and the handoff costs two futex round trips and an eventfd wakeup.
