@@ -49,6 +49,15 @@ const inline_read_max = 64 * 1024;
 /// Most handed to one sendfile segment; within what `Residency.cached`
 /// checks in one call.
 const sendfile_chunk = 256 * 1024;
+/// A body this size or smaller is handed to sendfile without first asking
+/// whether the page cache holds it.
+///
+/// The check is a `mincore` per chunk, and on the 100 KB row it was 4.5% of the
+/// server's CPU, which nginx does not spend. It is there so a cold range cannot
+/// stall the loop inside sendfile, and up to this size that stall is one disk
+/// read: the same trade as `inline_read_max`. Above it a body is worth asking
+/// about, since a cold 256 KB range would hold the loop for every chunk of it.
+const sendfile_trust_max = 1024 * 1024;
 const n_codings = std.meta.fields(Coding).len;
 const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
 
@@ -114,6 +123,9 @@ pub const Transfer = struct {
     filled: usize = 0,
     /// The downstream may take the body as file ranges.
     sendfile: bool = false,
+    /// Hand ranges to sendfile without asking the page cache first; see
+    /// `sendfile_trust_max`.
+    trust_sendfile: bool = false,
     /// Its own allocation: with it inline the transfer would outgrow the
     /// allocator's slabs and cost an mmap per request.
     buf: ?*[chunk_size]u8 = null,
@@ -526,6 +538,7 @@ fn serve(ex: *Exchange, t: *Transfer) void {
     // A body that fits one read costs a read and a write either way, and
     // on ext4 the read needs no residency check.
     t.sendfile = range_end - range_start > chunk_size and ex.canSendFile();
+    t.trust_sendfile = range_end - range_start <= sendfile_trust_max;
     // The prefetch read from 0 and there's no range: it's the body's start.
     if (t.prefetch and t.filled > 0) {
         if (!send(ex, t)) return;
@@ -614,7 +627,8 @@ pub fn pump(ex: *Exchange) void {
 fn sendRange(ex: *Exchange, t: *Transfer) bool {
     const e = t.entry.?;
     const len: usize = @intCast(@min(t.end - t.offset, sendfile_chunk));
-    if (slowRead(t.candidates[t.chosen]) or !e.resident(t.offset, len)) return false;
+    if (slowRead(t.candidates[t.chosen])) return false;
+    if (!t.trust_sendfile and !e.resident(t.offset, len)) return false;
     e.retain();
     switch (ex.respondFile(.{ .fd = e.file.handle, .offset = t.offset, .len = len, .hold = e, .release = releaseEntry })) {
         .sent => {
