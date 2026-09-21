@@ -546,6 +546,15 @@ pub const Conn = struct {
             return;
         }
         self.phase = .head;
+        // Nothing read and nothing to send: the connection is parked until the
+        // client asks again, so give the buffers back rather than hold what the
+        // last request happened to need. They come from the worker's allocator,
+        // which recycles them to the connections that are mid-request.
+        if (self.in.items.len == 0) {
+            self.in.clearAndFree(self.worker.alloc);
+            self.out.clearAndFree(self.worker.alloc);
+            self.sock.releaseOutput();
+        }
         self.worker.timers.set(&self.deadline, if (self.in.items.len == 0) self.limits().keepalive_timeout_ms else self.limits().header_timeout_ms);
         self.scheduleProcess();
     }

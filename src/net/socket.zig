@@ -300,6 +300,17 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             return (self.active.items.len - self.active_off) + self.pending.items.len + file_len;
         }
 
+        /// Gives back the queued-output capacity, for a connection that is going
+        /// idle: a parked keep-alive connection has nothing to send, and holding
+        /// the buffer it needed for its last response is what makes an idle
+        /// connection expensive. Does nothing while a write is in flight.
+        pub fn releaseOutput(self: *Self) void {
+            if (self.writing or self.buffered() != 0) return;
+            self.active.clearAndFree(self.alloc);
+            self.active_off = 0;
+            self.pending.clearAndFree(self.alloc);
+        }
+
         /// Whether the kernel holds bytes for us that we have not read yet.
         ///
         /// A connection whose next request is still in the receive queue looks
