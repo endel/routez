@@ -13,7 +13,22 @@ OUT="${OUT:-$HERE/results/all-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
 read -ra SUITES <<< "${SUITES:-http rate h3 l4 hostile ws soak}"
 
+# A whole chain of these was once killed partway through for low memory, which
+# looks like a suite failing rather than the machine giving up. Say so instead.
+free_pct() {
+    if [ "$(uname -s)" == Darwin ]; then
+        memory_pressure 2>/dev/null | awk '/free percentage/ {gsub("%", "", $NF); print $NF; exit}'
+    else
+        awk '/MemAvailable/ {a=$2} /MemTotal/ {t=$2} END {if (t) printf "%d", 100 * a / t}' /proc/meminfo
+    fi
+}
+
 for s in "${SUITES[@]}"; do
+    pct=$(free_pct)
+    if [ -n "$pct" ] && [ "$pct" -lt "${MIN_FREE_PCT:-20}" ]; then
+        echo "=== $s: skipped, only $pct% of memory free (MIN_FREE_PCT=${MIN_FREE_PCT:-20}) ==="
+        continue
+    fi
     echo "=== $s ==="
     started=$SECONDS
     # The long-held and long-running suites get fewer rounds; the rest are
