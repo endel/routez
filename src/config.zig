@@ -74,6 +74,11 @@ pub const Config = struct {
     /// Take the rightmost address in `real_ip_header` that isn't itself in
     /// `real_ip_from` (the leftmost when all are), for a chain of proxies.
     real_ip_recursive: bool = false,
+    /// Write a qlog trace per QUIC connection into this directory: the packets
+    /// sent and received with their frames and timestamps, in the format the
+    /// other QUIC implementations share. For working out where a connection
+    /// spent its time. One growing file per connection, so not for production.
+    qlog_dir: ?[]const u8 = null,
 };
 
 pub const LogEscape = enum { default, json };

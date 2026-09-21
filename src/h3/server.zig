@@ -88,6 +88,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             var conn_config: quic.connection.ConnectionConfig = .{
                 .token_key = w.shared.quic_keys.retry,
                 .max_idle_timeout = w.cfg.limits.quic_idle_timeout_ms,
+                .qlog_dir = w.cfg.qlog_dir,
             };
             if (proto != .h3) conn_config.max_datagram_frame_size = (event_loop.Config{}).max_datagram_frame_size;
             self.server = Server.init(w.alloc, &self.handler, .{
