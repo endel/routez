@@ -13,8 +13,12 @@ OUT="${OUT:-$HERE/results/all-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
 read -ra SUITES <<< "${SUITES:-http rate h3 l4 hostile ws soak}"
 
-# A whole chain of these was once killed partway through for low memory, which
-# looks like a suite failing rather than the machine giving up. Say so instead.
+# A whole chain of these has been killed partway through for low memory more than
+# once, which looks like a suite failing rather than the machine giving up. Say so
+# instead. The check is before each suite, and a suite can still be killed during
+# one: the container's page cache grows with the fixtures, and the HTTP suite
+# writes a 100 MB file and ten thousand small ones. On a 16 GB machine, run the
+# suites one invocation at a time rather than chaining all seven.
 free_pct() {
     if [ "$(uname -s)" == Darwin ]; then
         memory_pressure 2>/dev/null | awk '/free percentage/ {gsub("%", "", $NF); print $NF; exit}'
