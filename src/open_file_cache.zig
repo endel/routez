@@ -157,12 +157,10 @@ fn found(gpa: std.mem.Allocator, file: std.Io.File, meta: file_io.Meta) Answer {
 pub const Cache = struct {
     gpa: std.mem.Allocator,
     settings: Settings,
-    map: std.StringHashMapUnmanaged(*Entry) = .empty,
+    map: std.StringArrayHashMapUnmanaged(*Entry) = .empty,
     /// Most recently used first.
     head: ?*Entry = null,
     tail: ?*Entry = null,
-    /// Evictions since the table was last rebuilt; see `rebuild`.
-    evicted: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, settings: Settings) Cache {
         return .{ .gpa = gpa, .settings = settings };
@@ -210,7 +208,6 @@ pub const Cache = struct {
             self.evict(old);
         }
         while (self.map.count() >= self.settings.max) self.evict(self.tail.?);
-        if (self.evicted >= self.settings.max) self.rebuild();
         const key = self.gpa.dupe(u8, path) catch return fresh;
         self.map.put(self.gpa, key, fresh) catch {
             self.gpa.free(key);
@@ -233,32 +230,16 @@ pub const Cache = struct {
     }
 
     fn evict(self: *Cache, e: *Entry) void {
-        _ = self.map.remove(e.key);
-        self.evicted += 1;
+        // swapRemove, not remove: `std.HashMap` leaves a tombstone it never
+        // reclaims, and a working set larger than the cache evicts one entry per
+        // request, so lookups degraded without bound — 2.9 µs on a 1000-entry
+        // cache. An array-backed map has none, which is why ack_handler's sent
+        // packets and client_limits' table are shaped this way too. Order is not
+        // ours: the LRU list below is.
+        _ = self.map.swapRemove(e.key);
         self.unlink(e);
         e.in_table = false;
         if (e.refs == 0) e.destroy();
-    }
-
-    /// Re-inserts the live entries into a fresh table.
-    ///
-    /// `std.HashMap.remove` leaves a tombstone it never reclaims, and a file set
-    /// larger than the cache evicts one entry per request, so probe sequences
-    /// grow without bound: on a 1000-entry cache a lookup reached 2.9 µs and an
-    /// insert 5.4 µs, against 47 ns and 38 ns on a table with no tombstones.
-    /// Rebuilding every `max` evictions costs one re-insert per eviction.
-    ///
-    /// Keys belong to their entries, so nothing is copied. Failing to allocate
-    /// leaves the old table in place: slower, still correct.
-    fn rebuild(self: *Cache) void {
-        var fresh: std.StringHashMapUnmanaged(*Entry) = .empty;
-        fresh.ensureTotalCapacity(self.gpa, self.settings.max) catch return;
-        var next = self.head;
-        while (next) |e| : (next = e.next) fresh.putAssumeCapacity(e.key, e);
-        std.debug.assert(fresh.count() == self.map.count());
-        self.map.deinit(self.gpa);
-        self.map = fresh;
-        self.evicted = 0;
     }
 
     fn unlink(self: *Cache, e: *Entry) void {
@@ -459,7 +440,6 @@ test "a working set larger than the cache stays correct, and the table stays com
     // The table holds only the live entries, whatever the churn before it.
     try testing.expectEqual(max, c.count());
     try testing.expect(c.map.capacity() <= 4 * max);
-    try testing.expect(c.evicted < max);
 
     // The most recent entries are the ones still served.
     const last = try d.path(&buf, &names[names.len - 1]);
