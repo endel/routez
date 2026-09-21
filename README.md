@@ -807,6 +807,17 @@ What is known about the top of that list:
   idle check and before the close. Reaching zero means HAProxy's model, never
   force-closing an established connection, which wants a bound on how many
   generations may coexist.
+- **The 1 MB HTTP/3 row** is CPU-bound at 98% and spends 3.92 ms per response, so
+  about 4.35 µs on each 1200-byte datagram, against a budget of maybe 1.7 µs for
+  encryption, packing and a `sendto`. A profile of it has no peak to remove: AEAD
+  15%, `memcpy` 12%, the kernel's UDP path 12%, and 11% in per-datagram
+  bookkeeping, of which `queueFlowControlUpdates` is 3% doing nothing at all,
+  since it runs before every datagram and a download has no credit to extend.
+  Datagrams stay at the 1200-byte floor with no path MTU discovery, and there is
+  no `sendmmsg` or `UDP_SEGMENT` batching where nginx runs this row with
+  `quic_gso on` — but syscall entry is only 3%, so batching is worth a fraction of
+  this, not the 3.6x. Whoever picks it up should confirm the datagram count first:
+  the `strace` pass that would do it does not finish on a 16 GB machine.
 
 **HTTP/3 is about per-connection cost, not per-request cost.** Holding 64
 requests in flight and moving them from streams onto connections:
