@@ -250,7 +250,10 @@ check_cell() { # workload server
             fetch "$url" -H 'Accept-Encoding: gzip'
             [ "$CODE" == 200 ] || { bad "$s $w: status $CODE"; return; }
             [ "$(hdr content-encoding)" == gzip ] || bad "$s $w: content-encoding '$(hdr content-encoding)', want gzip"
-            gzip -dc < "$RUN/body" | cmp -s - "$f" || bad "$s $w: body doesn't decompress to the file" ;;
+            gzip -dc < "$RUN/body" | cmp -s - "$f" || bad "$s $w: body doesn't decompress to the file"
+            # The row compares encoders, so say how well each one did: a server
+            # sending twice the bytes is not doing the same work as its neighbour.
+            echo "sanity: $s $w: $DL bytes from $(wc -c < "$f") compressed" ;;
         *) bad "$w: unknown check '${W_CHECK[$w]}'" ;;
     esac
 }
