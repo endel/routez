@@ -746,10 +746,18 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 | HTTP/3, 10 KB static file | 77k/s | 234k/s | nginx |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
 | Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
-| 100 KB static file | 157k/s | 186k/s | nginx |
 | A new connection per request | 187k/s | 235k/s | nginx |
 | Memory per parked keep-alive connection | 0.7 KB | 0.3 KB | nginx |
 | A reload every 2 s under load | 174 failed | 0 failed | HAProxy |
+
+A profile of the connection-storm row is 12% in `el0_svc`, the syscall entry
+path, and 4% reading the clock, with no allocation anywhere near the top. So that
+row is about how many syscalls a connection costs, around eleven, and not about
+the per-connection allocation it looked like. Two of them are known to be
+avoidable, an `fcntl` for `O_NONBLOCK` and a `getpeername`, and libxev offers the
+first through its accept flags: a first attempt at that did not take effect and
+two tests caught the still-blocking socket, so it wants understanding rather than
+another try.
 
 Rows that have come off this list, and what did it:
 
@@ -758,7 +766,14 @@ Rows that have come off this list, and what did it:
 | 10k files of 4 KB, one at random | 94k/s | 237k/s | 13% ahead of nginx |
 | 10 KB static file | 303k/s | 343k/s | 10% ahead |
 | 1 KB static file | 334k/s | 430k/s | 29% ahead |
+| 100 KB static file | 157k/s | 195k/s | 9% ahead |
+| 1 MB static file | 8% behind | 3% behind | |
 | Memory per UDP flow | 2.3 KB | 1.9 KB | against nginx's 61.5 |
+
+Both static fixes are the same trade, and it is the one nginx makes: stop asking
+whether the page cache holds the data and accept that being wrong costs one
+worker a single disk read. Asking cost a thread handoff on small bodies and a
+`mincore` per chunk on larger ones.
 
 What is known about the top of that list:
 
