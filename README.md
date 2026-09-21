@@ -738,13 +738,13 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 
 | Row | routez | best other | |
 |---|---|---|---|
-| gzip on the fly through the proxy | 4.2k/s | 15k/s | HAProxy |
-| gzip on the fly, 100 KB of text | 4.4k/s | 10k/s | nginx |
-| Full TLS handshakes, RSA 2048 | 1.0k/s | 3.4k/s | nginx |
-| HTTP/3, 64 connections, 1 stream each | 39k/s | 59k/s | nginx |
 | HTTP/3, 1 MB static file | 0.8k/s | 2.9k/s | nginx |
+| Full TLS handshakes, RSA 2048 | 1.0k/s | 3.4k/s | nginx |
 | HTTP/3, 10 KB static file | 77k/s | 234k/s | nginx |
+| gzip on the fly through the proxy | 5.4k/s | 15k/s | HAProxy |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
+| gzip on the fly, 100 KB of text | 6.6k/s | 10k/s | nginx |
+| HTTP/3, 64 connections, 1 stream each | 39k/s | 59k/s | nginx |
 | Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
 | A new connection per request | 187k/s | 235k/s | nginx |
 | Memory per parked keep-alive connection | 0.7 KB | 0.3 KB | nginx |
@@ -769,6 +769,13 @@ Rows that have come off this list, and what did it:
 | 100 KB static file | 157k/s | 195k/s | 9% ahead |
 | 1 MB static file | 8% behind | 3% behind | |
 | Memory per UDP flow | 2.3 KB | 1.9 KB | against nginx's 61.5 |
+| gzip on the fly, 100 KB of text | 4.4k/s | 6.6k/s | 33% less CPU per request |
+| gzip on the fly through the proxy | 4.0k/s | 5.4k/s | and all of it compressed |
+
+The proxied gzip row also stopped flattering itself. A worker compressed at most
+64 responses at once and sent the rest whole, which under that row's concurrency
+was 4.5% of them: 38 MB/s on the wire where 13 does, and a row that was not
+compressing everything nginx was. The cap is 256 now, for 7 MB of RSS.
 
 Both static fixes are the same trade, and it is the one nginx makes: stop asking
 whether the page cache holds the data and accept that being wrong costs one
@@ -777,10 +784,13 @@ worker a single disk read. Asking cost a thread handoff on small bodies and a
 
 What is known about the top of that list:
 
-- **The two gzip rows** are the codec. Compressing runs on the loop thread, so a
-  worker does one response at a time, and `std.compress.flate` manages 146 MB/s
-  at level 4 where zlib does 342. Moving compression off the loop would fix the
-  tail, not the rate; matching the rate means a faster deflate.
+- **The two gzip rows** are the codec, now that they are only the codec: a third
+  of the time was `std.hash.Crc32`, which steps one byte at a time through a
+  single table, so routez frames the gzip stream itself around raw deflate and a
+  CRC32 that reads eight. Compressing still runs on the loop thread, one response
+  at a time per worker, and `std.compress.flate` manages 146 MB/s at level 4
+  where zlib does 342. Moving it off the loop would fix the tail, not the rate;
+  the rate means a faster deflate.
 - **Handshakes** are the asymmetric crypto. quic-zig signs with its own
   Montgomery exponentiation now, which took RSA from 0.7k to 1.0k a second, and
   the remainder is a 1024-bit modexp against OpenSSL's assembly, plus about
