@@ -738,13 +738,13 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 
 | Row | routez | best other | |
 |---|---|---|---|
-| HTTP/3, 1 MB static file | 0.8k/s | 2.9k/s | nginx |
 | Full TLS handshakes, RSA 2048 | 1.0k/s | 3.4k/s | nginx |
-| HTTP/3, 10 KB static file | 77k/s | 234k/s | nginx |
+| HTTP/3, 1 MB static file | 0.9k/s | 2.9k/s | nginx |
+| HTTP/3, 10 KB static file | 89k/s | 234k/s | nginx |
 | gzip on the fly through the proxy | 5.4k/s | 15k/s | HAProxy |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
 | gzip on the fly, 100 KB of text | 6.6k/s | 10k/s | nginx |
-| HTTP/3, 64 connections, 1 stream each | 39k/s | 59k/s | nginx |
+| HTTP/3, 64 connections, 1 stream each | 34k/s | 93k/s | nginx |
 | Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
 | A new connection per request | 187k/s | 235k/s | nginx |
 | Memory per parked keep-alive connection | 0.7 KB | 0.3 KB | nginx |
@@ -771,6 +771,7 @@ Rows that have come off this list, and what did it:
 | Memory per UDP flow | 2.3 KB | 1.9 KB | against nginx's 61.5 |
 | gzip on the fly, 100 KB of text | 4.4k/s | 6.6k/s | 33% less CPU per request |
 | gzip on the fly through the proxy | 4.0k/s | 5.4k/s | and all of it compressed |
+| HTTP/3, 64 in flight over 16 connections | 133k/s | 273k/s | and far steadier |
 
 The proxied gzip row also stopped flattering itself. A worker compressed at most
 64 responses at once and sent the rest whole, which under that row's concurrency
@@ -807,17 +808,24 @@ What is known about the top of that list:
   idle check and before the close. Reaching zero means HAProxy's model, never
   force-closing an established connection, which wants a bound on how many
   generations may coexist.
-- **The 1 MB HTTP/3 row** is CPU-bound at 98% and spends 3.92 ms per response, so
-  about 4.35 µs on each 1200-byte datagram, against a budget of maybe 1.7 µs for
-  encryption, packing and a `sendto`. A profile of it has no peak to remove: AEAD
-  15%, `memcpy` 12%, the kernel's UDP path 12%, and 11% in per-datagram
-  bookkeeping, of which `queueFlowControlUpdates` is 3% doing nothing at all,
-  since it runs before every datagram and a download has no credit to extend.
-  Datagrams stay at the 1200-byte floor with no path MTU discovery, and there is
-  no `sendmmsg` or `UDP_SEGMENT` batching where nginx runs this row with
-  `quic_gso on` — but syscall entry is only 3%, so batching is worth a fraction of
-  this, not the 3.6x. Whoever picks it up should confirm the datagram count first:
-  the `strace` pass that would do it does not finish on a 16 GB machine.
+- **The HTTP/3 rows** paid a socket call per datagram until quic-zig's send batch
+  started using one. It collected up to 64 packets and then sent them one
+  `sendmsg` at a time, copying each one to do it; a run of same-sized packets to
+  one address now leaves as a single `sendmsg` carrying `UDP_SEGMENT`, which is
+  nginx's `quic_gso`, and the packer writes straight into the slot it will be sent
+  from. That was worth 29% on both static rows and doubled the 16-connection row.
+  What is left on the 1 MB row is 3.05 ms of CPU per response at 98% of its cores,
+  spread with no peak to remove: AEAD 20%, `memcpy` 12% copying the body into the
+  stream, `memset` 7%, the kernel's UDP path 9%, and `SendStream.onAck` 7%. That
+  last one is a symptom rather than a cause — the row loses 6700 datagrams to the
+  kernel's receive buffers where nginx loses 50, and the retransmissions fragment
+  the acknowledged-range set. Its RTT is a tenth of nginx's and its tail latency is
+  ten times worse, so routez sends this row in bursts the receiver cannot take:
+  pacing is the next thing to look at, not more per-packet trimming. Datagrams also
+  stay at the 1200-byte floor with no path MTU discovery, worth about 1.2x.
+  `queueFlowControlUpdates` still runs before every datagram for 3.6%, finding
+  nothing to do on a download; skipping it exactly needs a consumed-bytes counter
+  threaded out of the stream layer, and skipping it on a guess risks a stall.
 
 **HTTP/3 is about per-connection cost, not per-request cost.** Holding 64
 requests in flight and moving them from streams onto connections:
