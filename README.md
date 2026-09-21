@@ -741,9 +741,9 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 | gzip on the fly through the proxy | 4.2k/s | 15k/s | HAProxy |
 | gzip on the fly, 100 KB of text | 4.4k/s | 10k/s | nginx |
 | Full TLS handshakes, RSA 2048 | 1.0k/s | 3.4k/s | nginx |
-| HTTP/3, 64 connections, 1 stream each | 35k/s | 129k/s | HAProxy |
-| HTTP/3, 1 MB static file | 0.8k/s | 2.8k/s | nginx |
-| HTTP/3, 10 KB static file | 77k/s | 232k/s | nginx |
+| HTTP/3, 64 connections, 1 stream each | 39k/s | 59k/s | nginx |
+| HTTP/3, 1 MB static file | 0.8k/s | 2.9k/s | nginx |
+| HTTP/3, 10 KB static file | 77k/s | 234k/s | nginx |
 | 10k files of 4 KB, one at random | 103k/s | 209k/s | nginx |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
 | Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
@@ -776,21 +776,25 @@ What is known about the top of that list:
 **HTTP/3 is about per-connection cost, not per-request cost.** Holding 64
 requests in flight and moving them from streams onto connections:
 
-| Requests in flight | nginx | routez |
-|---|---|---|
-| 4 connections × 16 streams | 80k | 278k |
-| 16 connections × 4 streams | 299k | 132k |
-| 64 connections × 1 stream | 84k | 35k |
+| Requests in flight | nginx | HAProxy | routez |
+|---|---|---|---|
+| 4 connections × 16 streams | 50k | 114k | 251k |
+| 16 connections × 4 streams | 191k | 186k | 239k |
+| 64 connections × 1 stream | 59k | 38k | 39k |
 
-routez is the fastest of the three at four connections and the slowest at 64.
-Every received datagram runs a pass over all of that worker's connections, and
-QUIC sends go out one `sendmsg` per datagram with no GSO or `sendmmsg`, so cost
-grows with the number of connections rather than the amount of work. Its CPU per
-request is 22.8 ms per thousand at one stream per connection and 6.2 at ten,
-which is the same effect seen from the other side. A row with one stream per
-connection also carries h2load's own per-request QUIC cost, which is
-milliseconds and appears for every server, so read it as the connection-heavy
-end rather than as a rate.
+routez is the fastest of the three at four and sixteen connections and the
+slowest at 64. Over HTTP/1.1 with the same client it wins every row by 29 to
+50%, so this is not QUIC being slow in routez; it is cost that grows with the
+number of connections rather than with the work.
+
+Half of that cost was quic-zig calling `onTimeout` for every connection on every
+pass before asking whether any deadline had passed. Guarding it took the 64-
+connection row from 36.2 to 16.2 ms of CPU per thousand requests and from 30k to
+39k a second. routez now spends less CPU per request there than nginx does, 16.2
+against 19.3, and still serves fewer: what remains on that row is not CPU. Its
+median request takes 2.0 ms against nginx's 0.3 ms over a 75 µs round trip, with
+the server at 32% and the client at 12%, so it is waiting on something that has
+not been located yet. qlog timestamps would settle it.
 
 Rows where routez was thought to be behind and is not, once the comparison was
 fixed: memory per UDP flow reads 1.9 KB against nginx's 61.5 KB, after dropping
