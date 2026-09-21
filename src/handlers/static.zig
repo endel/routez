@@ -31,6 +31,21 @@ const timers = @import("../timers.zig");
 const Coding = encoding.Coding;
 
 const chunk_size = 32 * 1024;
+/// A body this size or smaller is read on the worker's loop rather than handed to
+/// the file I/O threads, whether or not the page cache is known to hold it.
+///
+/// The handoff is two futex round trips and an eventfd wakeup, and under load it
+/// queues: a set of 10k small files, most of them missing the open-file cache,
+/// spent 2.4 ms per request waiting for four threads while the worker sat at 85%.
+/// Being wrong about the page cache costs that one worker a single disk read
+/// instead. nginx makes the same trade, and only moves reads off the loop when
+/// asked with `aio on`.
+///
+/// The whole remaining body has to fit, not just the next chunk: a large file
+/// read a chunk at a time still belongs on the threads, and taking its first
+/// chunk here would find a file truncated under a cached entry before the head
+/// was queued, answering with nothing instead of a short body.
+const inline_read_max = 64 * 1024;
 /// Most handed to one sendfile segment; within what `Residency.cached`
 /// checks in one call.
 const sendfile_chunk = 256 * 1024;
@@ -327,6 +342,10 @@ pub const Transfer = struct {
         const e = t.entry.?;
         const want: usize = @intCast(@min(t.end - t.offset, chunk_size));
         const buf = t.buf.?[0..want];
+        if (t.end - t.offset <= inline_read_max) {
+            t.filled = e.file.readPositional(t.io, &.{buf}, t.offset) catch 0;
+            return true;
+        }
         if (file_io.cached.readEnabled()) {
             if (file_io.cached.read(e.file, buf, t.offset)) |n| {
                 t.filled = n;
