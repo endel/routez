@@ -793,8 +793,22 @@ connection row from 36.2 to 16.2 ms of CPU per thousand requests and from 30k to
 39k a second. routez now spends less CPU per request there than nginx does, 16.2
 against 19.3, and still serves fewer: what remains on that row is not CPU. Its
 median request takes 2.0 ms against nginx's 0.3 ms over a 75 µs round trip, with
-the server at 32% and the client at 12%, so it is waiting on something that has
-not been located yet. qlog timestamps would settle it.
+the server at 32% and the client at 12%.
+
+A qlog trace splits that 2 ms in two. The server's own share is real and comes
+from the shape of the event loop: it empties the socket, processes every
+connection, then sends. A request therefore waits for everything already queued,
+and with 64 connections a median of 130 packets belonging to other connections
+passed between a request arriving and its answer leaving. Bounding how many
+datagrams one pass takes cuts that gap from 10.0 ms to 1.0 ms in the trace.
+
+The rest is the measurement. Bounding the drain does not move what the client
+sees, and h2load reports about 2.6 ms for every server at one connection, so a
+row with one stream per connection is partly reporting its own client. That also
+means this row overstates the deficit, and settling the remainder wants a load
+generator that is not the limit. The bound is not committed: its effect on
+throughput and CPU here sits inside a 36k-54k spread, which is too noisy to tune
+a constant against.
 
 Rows where routez was thought to be behind and is not, once the comparison was
 fixed: memory per UDP flow reads 1.9 KB against nginx's 61.5 KB, after dropping
