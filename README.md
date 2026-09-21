@@ -744,13 +744,21 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 | HTTP/3, 64 connections, 1 stream each | 39k/s | 59k/s | nginx |
 | HTTP/3, 1 MB static file | 0.8k/s | 2.9k/s | nginx |
 | HTTP/3, 10 KB static file | 77k/s | 234k/s | nginx |
-| 10k files of 4 KB, one at random | 103k/s | 209k/s | nginx |
 | Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
 | Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
-| 100 KB static file | 156k/s | 185k/s | nginx |
-| Memory per parked keep-alive connection | 2.0 KB | 0.5 KB | nginx |
+| 100 KB static file | 157k/s | 186k/s | nginx |
 | A new connection per request | 187k/s | 235k/s | nginx |
+| Memory per parked keep-alive connection | 0.7 KB | 0.3 KB | nginx |
 | A reload every 2 s under load | 174 failed | 0 failed | HAProxy |
+
+Rows that have come off this list, and what did it:
+
+| Row | was | now | |
+|---|---|---|---|
+| 10k files of 4 KB, one at random | 94k/s | 237k/s | 13% ahead of nginx |
+| 10 KB static file | 303k/s | 343k/s | 10% ahead |
+| 1 KB static file | 334k/s | 430k/s | 29% ahead |
+| Memory per UDP flow | 2.3 KB | 1.9 KB | against nginx's 61.5 |
 
 What is known about the top of that list:
 
