@@ -2,6 +2,7 @@
 .{
     .workers = WORKERS,
     .access_log = false,
+    .qlog_dir = ROUTEZ_QLOG,
     .limits = .{ .max_connections = 100_000 },
     .servers = .{.{
         .listen = .{

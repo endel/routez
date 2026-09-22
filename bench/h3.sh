@@ -80,9 +80,18 @@ for f in 10k.bin:10240 1m.bin:$((1024 * 1024)); do
     [ -s "$WWW/${f%%:*}" ] || head -c "${f##*:}" /dev/urandom > "$WWW/${f%%:*}"
 done
 cat "$CERTS/server.crt" "$CERTS/server.key" > "$RUN/server.pem"
+# QLOG=1 makes routez write a per-connection trace, for working out where a
+# request's time went. It writes a file per connection and slows the server
+# down, so it is a diagnostic run, not a measured one.
+QLOG_DIR=null
+if [ "${QLOG:-0}" != 0 ]; then
+    mkdir -p "$RUN/qlog"
+    QLOG_DIR='"'"$RUN/qlog"'"'
+fi
 for f in nginx-h3.conf haproxy-h3.cfg routez-h3.zon upstream.conf; do
     sed "s|UPSTREAM_WORKERS|$UPSTREAM_WORKERS|g; s|WORKERS|$WORKERS|g; s|WWW|$WWW|g; s|CERTS|$CERTS|g; \
-         s|ACCESS_LOG|off|g; s|ROUTEZ_LOG|false|g; s|HAPROXY_LOG|no log|g; s|RUN|$RUN|g" \
+         s|ACCESS_LOG|off|g; s|ROUTEZ_LOG|false|g; s|HAPROXY_LOG|no log|g; s|RUN|$RUN|g; \
+         s|ROUTEZ_QLOG|$QLOG_DIR|g" \
         "$HERE/conf/$f" > "$RUN/$f"
 done
 
@@ -183,5 +192,7 @@ for r in "${ROWS[@]}"; do
     done
     down_servers
 done
+
+[ "${QLOG:-0}" != 0 ] && cp -r "$RUN/qlog" "$OUT/qlog"
 
 python3 "$HERE/report_h3.py" "$OUT" && echo && cat "$OUT/table.md"
