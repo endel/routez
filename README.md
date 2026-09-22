@@ -841,6 +841,24 @@ What is known about the top of that list:
   `queueFlowControlUpdates` still runs before every datagram for 3.6%, finding
   nothing to do on a download; skipping it exactly needs a consumed-bytes counter
   threaded out of the stream layer, and skipping it on a guess risks a stall.
+- **Three HTTP/3 hypotheses are dead**, each measured over three rounds against
+  the same routez. Answering each batch of received datagrams before taking the
+  next, so one connection's response does not queue behind every other
+  connection's request, cost 24% on the 4-connection row and 12% on the
+  16-connection one and bought 4% where it was aimed. Raising the stream window
+  200-fold, in case a client doing one request per connection was waiting on
+  MAX_STREAMS credit, changed nothing at all: 36k either way, p50 1.99 ms either
+  way. Raising datagrams from the 1200-byte floor to 1452 is worth 10% on the
+  1 MB row and 5% on the 10 KB one, and costs 10% on the proxy row, so the size
+  is worth having only where the path is known to carry it — which means
+  discovering it, not assuming it.
+- **The row that runs one request at a time per connection is about per-request
+  latency, not connection count.** Sixty-four connections with ten streams each
+  reach 545k; the same sixty-four with one stream each reach 36k, because each
+  connection then spends 1.78 ms per request where nginx spends 1.08 ms and the
+  network costs 164 µs. Most of that ~1 ms is h2load itself, so the server's own
+  excess is a few hundred microseconds, and finding it wants a qlog trace of one
+  connection rather than another guess.
 
 **HTTP/3 is about per-connection cost, not per-request cost.** Holding 64
 requests in flight and moving them from streams onto connections:
