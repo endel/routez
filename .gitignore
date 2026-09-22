@@ -4,3 +4,5 @@ zig-pkg/
 bench/results/
 # scorecard.py writes here when it is given directories to read.
 bench/scorecard.md
+# Working notes on what to try next: local, and superseded by every new run.
+TODO/
