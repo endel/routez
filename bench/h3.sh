@@ -109,6 +109,12 @@ up_servers() {
 down_servers() {
     local s
     profile_report
+    # A diagnostic run wants what the servers said; a normal one would just be
+    # collecting empty files.
+    if [ "${QLOG:-0}" != 0 ]; then
+        mkdir -p "$OUT/logs"
+        for s in "${SERVERS[@]}"; do cat "$RUN/$s.log" >> "$OUT/logs/$s.log" 2>/dev/null; done
+    fi
     for s in "${SERVERS[@]}"; do kill "${SPID[$s]}" 2>/dev/null; done
     for s in "${SERVERS[@]}"; do wait "${SPID[$s]}" 2>/dev/null; done
     PIDS=("${PIDS[0]}")
