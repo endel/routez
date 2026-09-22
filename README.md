@@ -761,9 +761,17 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 best or near-best p50 on almost every row there and two to two and a half times
 the p99 on seven of them. wrk's closed-loop rows cannot show this, because their
 percentiles are the reciprocal of throughput; offering all three servers the same
-rate can. Whatever produces it also fits the connection-storm row, which keeps 27%
-of its own throughput where HAProxy keeps 56%, and the HTTP/3 row that runs one
-request at a time per connection.
+rate can.
+
+It is not routez's tail, though — it is everyone's but HAProxy's. Sweeping the
+proxied row over 8, 64 and 256 connections puts routez's p99 at 1.92, 4.32 and
+5.24 ms against nginx's 2.18, 4.48 and 5.22: routez is the best of the three at
+8 connections and tracks nginx within noise above it, while HAProxy holds 2.22,
+1.90 and 2.45. HAProxy keeps a flat tail as concurrency rises and the other two
+do not, and it is the same server that keeps 56% of its throughput under a
+connection storm where routez keeps 27%. Whatever HAProxy's scheduler does about
+fairness is the thing worth understanding here; there is no routez-specific
+anomaly to chase.
 
 A profile of the connection-storm row is 12% in `el0_svc`, the syscall entry
 path, and 4% reading the clock, with no allocation anywhere near the top. So that
