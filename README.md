@@ -738,17 +738,32 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 
 | Row | routez | best other | |
 |---|---|---|---|
-| Full TLS handshakes, RSA 2048 | 1.0k/s | 3.4k/s | nginx |
-| HTTP/3, 1 MB static file | 0.9k/s | 2.9k/s | nginx |
-| HTTP/3, 10 KB static file | 89k/s | 234k/s | nginx |
-| gzip on the fly through the proxy | 5.4k/s | 15k/s | HAProxy |
-| Layer 4, TCP, 1 MB responses | 5.0k/s | 8.7k/s | HAProxy |
-| gzip on the fly, 100 KB of text | 6.6k/s | 10k/s | nginx |
-| HTTP/3, 64 connections, 1 stream each | 34k/s | 93k/s | nginx |
-| Full TLS handshakes, ECDSA P-256 | 6.2k/s | 9.1k/s | nginx |
-| A new connection per request | 187k/s | 235k/s | nginx |
-| Memory per parked keep-alive connection | 0.7 KB | 0.3 KB | nginx |
-| A reload every 2 s under load | 174 failed | 0 failed | HAProxy |
+| Full TLS handshakes, RSA 2048 | 1.0k/s | 3.6k/s | nginx |
+| HTTP/3, 1 MB static file | 1.0k/s | 2.9k/s | nginx |
+| gzip on the fly through the proxy | 5.5k/s | 15k/s | HAProxy |
+| HTTP/3, 10 KB static file | 94k/s | 247k/s | nginx |
+| p99 at a held rate, proxied | 4.30 ms | 1.79 ms | HAProxy |
+| HTTP/3, 64 connections, 1 stream each | 36k/s | 83k/s | HAProxy |
+| p99 at a held rate, 10 KB static file | 5.44 ms | 2.38 ms | nginx |
+| Throughput kept under a connection storm | 27% | 56% | HAProxy |
+| Layer 4, TCP, 1 MB responses | 5.0k/s | 9.5k/s | HAProxy |
+| HTTP/3 reverse proxy | 105k/s | 203k/s | HAProxy |
+| Reverse proxy, 1 MB response | 4.7k/s | 7.5k/s | HAProxy |
+| gzip on the fly, 100 KB of text | 6.7k/s | 10k/s | nginx |
+| HTTP/3, 10 streams per connection | 545k/s | 762k/s | nginx |
+| Layer 4, a new TCP connection per request | 62k/s | 85k/s | nginx |
+| A new connection per request | 187k/s | 231k/s | nginx |
+| Full TLS handshakes, ECDSA P-256 | 7.1k/s | 8.8k/s | HAProxy |
+| Memory per parked keep-alive connection | 0.7 KB | 0.2 KB | nginx |
+| A reload every 2 s under load | 74 failed | 0 failed | HAProxy |
+
+**Every loss in the held-rate suite is a tail, never a median.** routez has the
+best or near-best p50 on almost every row there and two to two and a half times
+the p99 on seven of them. wrk's closed-loop rows cannot show this, because their
+percentiles are the reciprocal of throughput; offering all three servers the same
+rate can. Whatever produces it also fits the connection-storm row, which keeps 27%
+of its own throughput where HAProxy keeps 56%, and the HTTP/3 row that runs one
+request at a time per connection.
 
 A profile of the connection-storm row is 12% in `el0_svc`, the syscall entry
 path, and 4% reading the clock, with no allocation anywhere near the top. So that
