@@ -85,6 +85,15 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
 
         state: State = .open,
         fd_closed: bool = false,
+        /// A relay reads this socket instead of us: never arm a read of our
+        /// own, or the two would race for the same bytes.
+        relayed: bool = false,
+        /// The relay reported our input ended: there is no read left to wait
+        /// for when the write side finishes.
+        read_ended: bool = false,
+        /// Completions the owner armed against this fd. The close waits for
+        /// them: on epoll a disarm after the fd is gone fails the ctl.
+        external: u8 = 0,
         own_read_buf: if (shared_read_buf) void else [read_buffer_size]u8 = undefined,
 
         pub const State = enum {
@@ -142,7 +151,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         }
 
         pub fn startReading(self: *Self) void {
-            if (self.reading or self.connecting or self.read_paused) return;
+            if (self.reading or self.connecting or self.read_paused or self.relayed) return;
             if (self.state == .closing or self.state == .closed) return;
             self.reading = true;
             self.tcp.read(self.loop, &self.read_c, .{ .slice = self.readBuf() }, Self, self, onRead);
@@ -426,6 +435,36 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             return .disarm;
         }
 
+        /// Hand this socket's read side to a relay. The in-flight read
+        /// disarms as its callback returns, so this must be called from
+        /// inside one.
+        pub fn beginRelay(self: *Self) void {
+            self.relayed = true;
+            self.read_paused = true;
+        }
+
+        /// The relay saw our input end: what `onRead` does with an EOF.
+        pub fn readEnded(self: *Self) void {
+            self.read_ended = true;
+            switch (self.state) {
+                .open, .flushing => Owner.onSocketEof(self.owner),
+                .lingering => self.abort(),
+                .closing, .closed => {},
+            }
+        }
+
+        /// Keep the fd alive while the owner has a completion of its own on
+        /// it; `release` may close the socket, so the caller holds nothing
+        /// across it.
+        pub fn retain(self: *Self) void {
+            self.external += 1;
+        }
+
+        pub fn release(self: *Self) void {
+            self.external -= 1;
+            if (self.external == 0) self.maybeFinishClose();
+        }
+
         /// Send what is queued, then close gracefully.
         pub fn closeAfterFlush(self: *Self) void {
             if (self.state != .open) return;
@@ -438,6 +477,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             // that closing with unread input would trigger.
             _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.WR);
             self.state = .lingering;
+            if (self.read_ended) return self.abort();
             self.read_paused = false;
             self.startReading();
         }
@@ -466,7 +506,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
 
         fn maybeFinishClose(self: *Self) void {
             if (self.state != .closing) return;
-            if (self.reading or self.writing or self.connecting) return;
+            if (self.reading or self.writing or self.connecting or self.external > 0) return;
             self.state = .closed;
             self.dropFile();
             // The fd is closed from the deferred callback, not here: this

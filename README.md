@@ -210,7 +210,9 @@ A ZON file; see `src/config.zig` for every field and default.
   either side closes and the other has drained. Tunnels count against
   `limits.max_connections` like any connection, and a reload hands the
   listening socket over as it does for HTTP. A port serving `servers` can't
-  also be a `tcp_proxy`.
+  also be a `tcp_proxy`. On Linux a direction that keeps filling the read
+  buffer is handed to `splice(2)`, which moves the bytes through a pipe
+  without copying them into the process; there is nothing to configure.
 
 ### Locations
 
@@ -746,7 +748,6 @@ verdict: the figure is routez against whichever of nginx and HAProxy does best.
 | HTTP/3, 64 connections, 1 stream each | 36k/s | 83k/s | HAProxy |
 | p99 at a held rate, 10 KB static file | 5.44 ms | 2.38 ms | nginx |
 | Throughput kept under a connection storm | 27% | 56% | HAProxy |
-| Layer 4, TCP, 1 MB responses | 5.0k/s | 9.5k/s | HAProxy |
 | HTTP/3 reverse proxy | 105k/s | 203k/s | HAProxy |
 | Reverse proxy, 1 MB response | 4.7k/s | 7.5k/s | HAProxy |
 | gzip on the fly, 100 KB of text | 6.7k/s | 10k/s | nginx |
@@ -827,6 +828,15 @@ What is known about the top of that list:
   threads, and the handoff costs two futex round trips and an eventfd wakeup.
   Reading small files inline, as nginx does unless `aio` is on, is the change
   that would close it.
+- **The layer-4 bulk row** has left the list. A tunnel that has read four full
+  buffers in a row from one side hands that direction to `splice(2)` through a
+  pipe, so the bytes never enter the process; re-measured against both
+  competitors, 5.0k 1 MB responses a second at 626 ms of CPU per thousand became
+  8.1k at 170 ms, against HAProxy's 8.5k at 178 on the same run. The tail goes
+  with it: p99 was 70 ms while the row was throughput-bound, and is now 1.03 s,
+  a queue at the higher rate rather than a slower response — HAProxy's is 1.06 s.
+  Small exchanges never reach four full buffers and keep copying, which is the
+  path that already wins the keep-alive row.
 - **The reload row** is down to the race itself: a request that arrives after the
   idle check and before the close. Reaching zero means HAProxy's model, never
   force-closing an established connection, which wants a bound on how many
