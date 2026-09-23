@@ -134,7 +134,6 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                 Owner.onSocketConnect(self.owner, err);
                 return .disarm;
             };
-            setNoDelay(self.tcp.fd);
             Owner.onSocketConnect(self.owner, null);
             if (self.state == .open or self.state == .flushing) self.kickWrite();
             if (self.state == .open) self.startReading();

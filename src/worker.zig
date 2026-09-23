@@ -192,6 +192,8 @@ const log = std.log.scoped(.worker);
 
 /// How often a worker may say it is refusing connections at the cap.
 const max_conn_log_interval_ms = 60_000;
+/// Connections taken off the backlog per accept wakeup, beyond libxev's one.
+const max_accepts_per_wake = 64;
 
 /// How long a stopping worker waits for in-flight requests.
 const drain_timeout_ms = 10_000;
@@ -883,7 +885,18 @@ pub const Listener = struct {
             return .disarm;
         };
         self.accept_errors = 0;
+        // libxev's epoll accept leaves the socket blocking, and a direct
+        // send or sendfile into a full socket would stall the whole loop.
+        if (xev.backend == .epoll) socket.setNonBlocking(tcp.fd);
         self.serve(tcp);
+        // libxev accepts one connection per wakeup, with plain accept(2) and
+        // two fcntls. Take the rest of the backlog with accept4 instead: one
+        // syscall each. Capped so a storm cannot starve the rest of the loop.
+        var n: usize = 0;
+        while (n < max_accepts_per_wake) : (n += 1) {
+            const fd = socket.acceptNow(self.tcp.fd) orelse break;
+            self.serve(xev.TCP.initFd(fd));
+        }
         return .rearm;
     }
 
@@ -900,9 +913,6 @@ pub const Listener = struct {
             return;
         }
         stats.inc(&stats.accepted);
-        // libxev's epoll accept leaves the socket blocking, and a direct
-        // send or sendfile into a full socket would stall the whole loop.
-        if (xev.backend == .epoll) socket.setNonBlocking(tcp.fd);
         var ip_key: ?[16]u8 = null;
         if (self.proxy_protocol) {
             // Counted per IP once the header names the client.
