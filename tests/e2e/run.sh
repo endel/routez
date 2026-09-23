@@ -322,6 +322,11 @@ SCURL="$CURL_BIN -s --max-time 10 --cacert $CERTS/ca.crt"
 # is 10 (11 if a second ticks by), where per-worker buckets would allow 40.
 codes=$(for i in $(seq 1 40); do echo "url = \"http://127.0.0.1:18471/burst\""; done | $SCURL -K - -Z --parallel-max 8 -H 'Connection: close' -o /dev/null -w '%{http_code}\n')
 ok=$(grep -c 200 <<< "$codes")
+# Counted, not inferred from `40 - ok`: 8 parallel connections against a per-IP
+# limit of 8 can have one refused while another's close is in flight, which
+# curl reports as 000 and routez counts as a per-IP refusal, not a limited
+# request.
+limited=$(grep -c 429 <<< "$codes")
 SUITE=shared-limits check limit-req-across-workers "$([ "$ok" -ge 10 ] && [ "$ok" -le 11 ] && echo ok || echo "$ok allowed")" ok
 # One zone behind two locations, and both protocols when curl has HTTP/3:
 # 6 in all, then 429.
@@ -338,11 +343,12 @@ SUITE=shared-limits check per-ip-across-workers "$(python3 "$HERE/conn_limit.py"
 # a fresh bucket would allow 6), and releases what the old workers counted.
 kill -HUP $SHARED
 for _ in $(seq 1 100); do [ "$(grep -c 'worker [0-3] stopped' "$WORK/shared.log")" -ge 4 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
-after=$(for i in $(seq 1 10); do echo 'url = "http://127.0.0.1:18471/za"'; done | $SCURL -K - -o /dev/null -w '%{http_code}\n' | grep -c 200)
+after_codes=$(for i in $(seq 1 10); do echo 'url = "http://127.0.0.1:18471/za"'; done | $SCURL -K - -o /dev/null -w '%{http_code}\n')
+after=$(grep -c 200 <<< "$after_codes")
 SUITE=shared-limits check bucket-survives-reload "$([ "$after" -le 4 ] && echo kept || echo "$after allowed")" kept
 SUITE=shared-limits check per-ip-after-reload "$(python3 "$HERE/conn_limit.py" 12 18471)" 4
 for _ in $(seq 1 20); do $SCURL -o /dev/null http://127.0.0.1:18471/ && break; perl -e 'select(undef,undef,undef,0.05)'; done
-SUITE=shared-limits check metrics "$($SCURL http://127.0.0.1:18471/metrics | python3 "$HERE/check_metrics.py" routez_http_requests_limited_total routez_limit_table_capacity)" "$((40 - ok + 1 + 10 - after)) 100032"
+SUITE=shared-limits check metrics "$($SCURL http://127.0.0.1:18471/metrics | python3 "$HERE/check_metrics.py" routez_http_requests_limited_total routez_limit_table_capacity)" "$((limited + 1 + $(grep -c 429 <<< "$after_codes"))) 100032"
 kill $SHARED; wait $SHARED 2>/dev/null
 
 # max_connections counts per worker: one worker holding 8, so 12 of 20 are
@@ -450,6 +456,9 @@ while [ "$(quic_conns)" != 0 ] && [ $(($(now_ms) - t0)) -lt 15000 ]; do perl -e 
 waited=$(($(now_ms) - t0))
 kill $IC 2>/dev/null; wait $IC 2>/dev/null
 SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 700 ] && [ $waited -lt 12000 ] && echo in-time || echo "after ${waited}ms")" "1 in-time"
+# The deadline is at least 3 PTOs, so a late drop needs RTT samples of seconds;
+# say what the client saw, so a failure tells a slow runner from a missed timer.
+[ $waited -lt 12000 ] || { echo "  quic-idle client:"; tail -3 "$WORK/idle_client.log"; echo "  server:"; tail -3 "$WORK/idle.log"; }
 kill $IDLE; wait $IDLE 2>/dev/null
 
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
@@ -892,6 +901,7 @@ SUITE=wt check webtransport-backpressure "$([ $((peak - base)) -lt 32768 ] && ec
 for _ in $(seq 1 300); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
 kill $WT 2>/dev/null; wait $WT 2>/dev/null
 SUITE=wt check webtransport-session-credit "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wtcredit.log")" "wt-ok"
+grep -q wt-ok "$WORK/wtcredit.log" || tail -5 "$WORK/wtcredit.log"
 
 B=http://127.0.0.1:18080
 CURL="$CURL_BIN -s --max-time 10"
@@ -908,7 +918,7 @@ python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 1808
 perl -e 'select(undef,undef,undef,0.3)'
 kill -TERM $SERVER
 for _ in $(seq 1 30); do kill -0 $SERVER 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
-if kill -0 $SERVER 2>/dev/null; then fail=$((fail+1)); echo "FAIL graceful stop within 3 s"; else pass=$((pass+1)); fi
+if kill -0 $SERVER 2>/dev/null; then fail=$((fail+1)); echo "FAIL graceful stop within 3 s"; tail -5 "$WORK/server.log"; else pass=$((pass+1)); fi
 echo "passed=$pass failed=$fail"
 if [ $fail -ne 0 ]; then echo "--- routez log (tail)"; tail -50 "$WORK/server.log"; fi
 [ $fail -eq 0 ]
