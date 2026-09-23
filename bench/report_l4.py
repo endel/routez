@@ -135,7 +135,8 @@ if tcp:
                 [s for s, _ in SERVERS], lambda rs: rate(med(rs, "rps")))
     md += table("**Added latency at p99** (lower is better): the row's p99 less the unproxied p99.", tcp,
                 PROXIES,
-                lambda rs: METRICS["overhead_us"].fmt(
+                # A run limited to some SERVERS (profile.sh) may have no baseline.
+                lambda rs: "—" if (rs[0]["workload"], "direct") not in cells else METRICS["overhead_us"].fmt(
                     med(rs, "p99_us") - med(cells[rs[0]["workload"], "direct"], "p99_us")))
 if udp:
     md += table("**Datagrams echoed per second** (higher is better).", udp,

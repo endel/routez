@@ -67,7 +67,11 @@ start() {
         # Only the syscall families the rows are about. Tracing everything on a
         # threaded server pushes every syscall through ptrace and the run stops
         # making progress at all, rather than merely slowing down.
-        pre=(strace -c -f -e "trace=${PROFILE_TRACE:-%net,%desc}" -o "$OUT/$name.strace")
+        # strace ignores the SIGTERM a suite stops a server with and exits only
+        # once its tracee does, so the suite's `wait` hung for good. Hand the
+        # suite a shell instead, which passes the signal on to the server.
+        pre=(bash -c 'strace "$@" & t=$!; trap "pkill -TERM -P \$t; wait \$t" TERM; wait $t' strace-wrap
+             -c -f -e "trace=${PROFILE_TRACE:-%net,%desc}" -o "$OUT/$name.strace")
     fi
     taskset -c "$cpus" "${pre[@]}" "$@" > "$RUN/$name.log" 2>&1 &
     local pid=$!
