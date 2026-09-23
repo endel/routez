@@ -12,6 +12,8 @@ const quic = @import("quic");
 const xev = quic.event_loop.Xev;
 const config = @import("config.zig");
 const socket = @import("net/socket.zig");
+const splice = @import("net/splice.zig");
+const stats = @import("stats.zig");
 const timers = @import("timers.zig");
 const upstream = @import("upstream.zig");
 const worker_mod = @import("worker.zig");
@@ -23,6 +25,14 @@ const log = std.log.scoped(.tcp_proxy);
 /// HTTP path's `high_water`: a byte relay gains nothing from reading far
 /// ahead of a slow peer, and every queued chunk is heap.
 const pause_above = 2 * socket.low_water;
+
+/// Reads that filled the buffer in a row before a direction is handed to the
+/// kernel. Small exchanges never reach it, which is the point: routez is
+/// ahead of both competitors on the keep-alive layer-4 row, and a pipe there
+/// would only add syscalls.
+const splice_after = 4;
+
+const Relay = if (splice.supported) splice.Relay(Tunnel) else void;
 
 pub const Tunnel = struct {
     worker: *Worker,
@@ -36,6 +46,10 @@ pub const Tunnel = struct {
     /// Sockets whose close has been delivered. Both abort together when a
     /// tunnel fails, so the tunnel outlives the first callback.
     sides_closed: u8 = 0,
+    /// Bulk forwarding through the kernel, one per direction, started only
+    /// once a direction has proved itself bulk. See `net/splice.zig`.
+    up: Relay = undefined,
+    down: Relay = undefined,
 
     /// One direction. Only the upstream side connects, which is what
     /// `Socket`'s `connects` parameter costs a completion for.
@@ -46,9 +60,19 @@ pub const Tunnel = struct {
             tunnel: *Tunnel,
             /// Sends this side's bytes on, and pauses when it falls behind.
             from_client: bool,
+            /// Reads in a row that filled the buffer: a stream that keeps
+            /// coming, and worth splicing.
+            full_reads: u8 = 0,
 
             pub fn onSocketData(self: *Self, data: []const u8) void {
                 self.tunnel.forward(self.from_client, data);
+                if (comptime !splice.supported) return;
+                if (data.len < socket.read_buffer_size) {
+                    self.full_reads = 0;
+                    return;
+                }
+                self.full_reads += 1;
+                if (self.full_reads >= splice_after) self.tunnel.startRelay(self.from_client);
             }
 
             pub fn onSocketEof(self: *Self) void {
@@ -94,6 +118,8 @@ pub const Tunnel = struct {
             .peer = peer,
             .client = .{ .sock = undefined, .tunnel = self, .from_client = true },
             .server = .{ .sock = undefined, .tunnel = self, .from_client = false },
+            .up = if (splice.supported) .{ .owner = self, .from_client = true } else {},
+            .down = if (splice.supported) .{ .owner = self, .from_client = false } else {},
         };
         // Connect first: nothing owns the accepted socket until it succeeds.
         try self.server.sock.connect(&self.server, &w.loop, &w.timers, w.alloc, peer.addr);
@@ -138,6 +164,55 @@ pub const Tunnel = struct {
         self.touch();
     }
 
+    /// Hand one direction to the kernel. Bytes still queued for the far side
+    /// would land after the spliced ones, so only a destination the kernel
+    /// has caught up with can be taken over; a direction that never gets
+    /// there keeps copying, which costs nothing it wasn't paying already.
+    fn startRelay(self: *Tunnel, from_client: bool) void {
+        if (comptime !splice.supported) return;
+        // The two sockets are different types, hence the two arms, as in
+        // `forward`.
+        if (from_client) {
+            self.handOver(&self.up, &self.client.sock, &self.server.sock);
+        } else {
+            self.handOver(&self.down, &self.server.sock, &self.client.sock);
+        }
+    }
+
+    fn handOver(self: *Tunnel, relay: *Relay, src: anytype, dst: anytype) void {
+        if (relay.isRunning()) return;
+        if (!src.isOpen() or !dst.isOpen()) return;
+        if (dst.writing or dst.buffered() != 0) return;
+        // The relay's completions outlive this call; the fds have to too.
+        self.client.sock.retain();
+        self.server.sock.retain();
+        if (!relay.start(&self.worker.loop, src.fd(), dst.fd())) {
+            self.client.sock.release();
+            self.server.sock.release();
+            return;
+        }
+        src.beginRelay();
+    }
+
+    pub fn onRelayEof(self: *Tunnel, from_client: bool) void {
+        if (from_client) self.client.sock.readEnded() else self.server.sock.readEnded();
+    }
+
+    pub fn onRelayError(self: *Tunnel, _: bool) void {
+        self.abort();
+    }
+
+    pub fn onRelayProgress(self: *Tunnel, _: bool, n: usize) void {
+        stats.add(&stats.tcp_spliced_bytes, n);
+        self.touch();
+    }
+
+    /// Nothing is armed against the fds any more.
+    pub fn onRelayDone(self: *Tunnel, _: bool) void {
+        self.client.sock.release();
+        self.server.sock.release();
+    }
+
     pub fn abort(self: *Tunnel) void {
         self.client.sock.abort();
         self.server.sock.abort();
@@ -145,6 +220,10 @@ pub const Tunnel = struct {
 
     /// Both sockets outlived the worker's drain.
     pub fn abandon(self: *Tunnel) void {
+        if (comptime splice.supported) {
+            self.up.abandon();
+            self.down.abandon();
+        }
         _ = std.c.close(self.client.sock.fd());
         _ = std.c.close(self.server.sock.fd());
     }

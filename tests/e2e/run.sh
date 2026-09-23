@@ -390,6 +390,13 @@ SUITE=tcp-proxy check tcp-proxy-upload "$($CURL_BIN -s --data-binary @"$WORK/www
 SUITE=tcp-proxy check tcp-proxy-websocket "$(node "$HERE/ws_client.mjs" ws://127.0.0.1:18473/ws/echo)" "ws-ok"
 # An upstream that refuses: the tunnel closes instead of hanging.
 SUITE=tcp-proxy check tcp-proxy-upstream-down "$($CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18475/ping)" 000
+# A client that walks away mid-transfer: the tunnel goes with it, splice or not.
+$CURL_BIN -s --max-time 0.3 --limit-rate 20k -o /dev/null "$L4URL/big.bin" || true
+# The bulk direction moved through the kernel, where there is a splice.
+if [ "$(uname -s)" = Linux ]; then
+    spliced=$($CURL_BIN -s http://127.0.0.1:18474/metrics | python3 "$HERE/check_metrics.py" routez_tcp_spliced_bytes_total)
+    SUITE=tcp-proxy check tcp-proxy-spliced "$([ "${spliced:-0}" -gt 1000000 ] && echo bulk)" bulk
+fi
 # Only the metrics request itself is left, so every tunnel was released.
 active_l4() { $CURL_BIN -s http://127.0.0.1:18474/metrics | python3 "$HERE/check_metrics.py" 'routez_connections_active{protocol="tcp"}'; }
 for _ in $(seq 1 20); do active=$(active_l4); [ "$active" == 1 ] && break; perl -e 'select(undef,undef,undef,0.05)'; done

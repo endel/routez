@@ -27,6 +27,8 @@ pub var responses: [2][5]Counter = @splat(@splat(.{}));
 /// Request and response body bytes, the latter as sent (compressed).
 pub var request_bytes: Counter = .{};
 pub var response_bytes: Counter = .{};
+/// Bytes a layer-4 tunnel moved with splice, never entering the process.
+pub var tcp_spliced_bytes: Counter = .{};
 pub var reloads: std.atomic.Value(u64) = .init(0);
 pub var reload_failures: std.atomic.Value(u64) = .init(0);
 pub var workers: std.atomic.Value(u64) = .init(0);
@@ -197,6 +199,8 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_http_request_body_bytes_total {d}\n", .{load(&request_bytes)});
     try header(w, "routez_http_response_body_bytes_total", "counter", "Response body bytes sent.");
     try w.print("routez_http_response_body_bytes_total {d}\n", .{load(&response_bytes)});
+    try header(w, "routez_tcp_spliced_bytes_total", "counter", "Bytes layer-4 tunnels moved through the kernel with splice.");
+    try w.print("routez_tcp_spliced_bytes_total {d}\n", .{load(&tcp_spliced_bytes)});
     try header(w, "routez_quic_steered_datagrams_total", "counter", "QUIC datagrams passed to the worker owning their connection.");
     try w.print("routez_quic_steered_datagrams_total {d}\n", .{load(&quic_steered)});
 
