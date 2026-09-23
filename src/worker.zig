@@ -887,6 +887,8 @@ pub const Listener = struct {
         self.accept_errors = 0;
         // libxev's epoll accept leaves the socket blocking, and a direct
         // send or sendfile into a full socket would stall the whole loop.
+        // Fixed by mitchellh/libxev#246, in endel/libxev quic-zig-2026-09-23:
+        // drop this once quic-zig's pushed pin includes it.
         if (xev.backend == .epoll) socket.setNonBlocking(tcp.fd);
         self.serve(tcp);
         // libxev accepts one connection per wakeup, with plain accept(2) and
