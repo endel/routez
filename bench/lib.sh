@@ -97,7 +97,9 @@ profile_report() {
     # Collapsed stacks, the input a flamegraph wants.
     perf script -i "$f.perf" 2>/dev/null |
         awk '/^[a-zA-Z]/ { if (n) print s, n; s = ""; n = 0; next }
-             /^\t/ { gsub(/^\t| .*$/, ""); s = (s == "" ? $0 : $0 ";" s); n = 1 }
+             /^\t/ { sub(/^[ \t]+/, ""); split($0, f, " "); fn = f[2]; sub(/\+0x[0-9a-f]+$/, "", fn)
+                    if (fn == "" || fn == "[unknown]") fn = f[1]  # no symbol: keep the address
+                    s = (s == "" ? fn : fn ";" s); n = 1 }
              END { if (n) print s, n }' |
         sort | uniq -c | awk '{ c = $1; $1 = ""; sub(/ [0-9]+$/, ""); print substr($0, 2), c }' \
         > "$f.folded" 2>/dev/null || true
