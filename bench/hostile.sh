@@ -103,9 +103,9 @@ up2_start() {
 up2_start
 
 up_servers() {
-    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-hostile.conf"; SPID[nginx]=$!
-    start haproxy "$SERVER_CPUS" haproxy -W -f "$RUN/haproxy-hostile.cfg"; SPID[haproxy]=$!
-    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-hostile.zon"; SPID[routez]=$!
+    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-hostile.conf"; SPID[nginx]=$STARTED
+    start haproxy "$SERVER_CPUS" haproxy -W -f "$RUN/haproxy-hostile.cfg"; SPID[haproxy]=$STARTED
+    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-hostile.zon"; SPID[routez]=$STARTED
     local p
     for p in "${PLAIN[@]}" "${TLS[@]}" "${RSA[@]}"; do wait_port "$p"; done
     until pgrep -P "${SPID[nginx]}" >/dev/null; do sleep 0.05; done

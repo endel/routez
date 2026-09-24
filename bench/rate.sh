@@ -79,9 +79,9 @@ sed "s|UPSTREAM_WORKERS|$UPSTREAM_WORKERS|g; s|WWW|$WWW|g; s|CERTS|$CERTS|g; s|R
 start upstream "$UP_CPUS" nginx -c "$RUN/upstream.conf"
 wait_port 19090
 up_servers() {
-    start nginx "$SERVER_CPUS" nginx -c "$RUN/main/nginx.conf"; SPID[nginx]=$!
-    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/main/haproxy.cfg"; SPID[haproxy]=$!
-    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/main/routez.zon"; SPID[routez]=$!
+    start nginx "$SERVER_CPUS" nginx -c "$RUN/main/nginx.conf"; SPID[nginx]=$STARTED
+    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/main/haproxy.cfg"; SPID[haproxy]=$STARTED
+    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/main/routez.zon"; SPID[routez]=$STARTED
     local p
     for p in "${PLAIN[@]}" "${TLS[@]}"; do wait_port "$p"; done
     until pgrep -P "${SPID[nginx]}" >/dev/null; do sleep 0.05; done
