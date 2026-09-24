@@ -469,18 +469,17 @@ fn serve(ex: *Exchange, t: *Transfer) void {
     const is_head = ex.req.isHead();
     const content_type = mimeType(t.candidates[t.chosen]);
     const mtime_s = st.mtime_s;
-    const etag = (if (t.coding) |c|
-        std.fmt.allocPrint(a, "\"{x}-{x}-{s}\"", .{ mtime_s, st.size, c.token() })
-    else
-        std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime_s, st.size })) catch return fail(ex);
-    const lm_buf = a.create([29]u8) catch return fail(ex);
-    const last_modified = common.formatHttpDate(mtime_s, lm_buf);
+    const etag = entryEtag(t.entry.?, t.coding);
+    const last_modified = entryLastModified(t.entry.?);
     // Whether another client could get another coding of this path.
     const varies = t.varied or (loc.gzip and gzip.compressible(content_type));
 
     if (notModified(ex, etag, mtime_s)) {
+        // Both point into the entry, which release may free.
+        const etag_copy = a.dupe(u8, etag) catch return fail(ex);
+        const lm_copy = a.dupe(u8, last_modified) catch return fail(ex);
         release(ex);
-        const headers = [_]Header{ .{ .name = "etag", .value = etag }, .{ .name = "last-modified", .value = last_modified }, vary };
+        const headers = [_]Header{ .{ .name = "etag", .value = etag_copy }, .{ .name = "last-modified", .value = lm_copy }, vary };
         ex.respondHead(&.{ .status = 304, .headers = headers[0..if (varies) 3 else 2] });
         return ex.respondEnd();
     }
@@ -546,6 +545,29 @@ fn serve(ex: *Exchange, t: *Transfer) void {
         if (!send(ex, t)) return;
     }
     pump(ex);
+}
+
+/// The entry's ETag for `coding`, formatted once per entry and coding.
+fn entryEtag(e: *ofc.Entry, coding: ?Coding) []const u8 {
+    const key: u8 = if (coding) |c| @as(u8, @intFromEnum(c)) + 1 else 0;
+    if (e.etag_len == 0 or e.etag_key != key) {
+        const st = e.meta;
+        const s = (if (coding) |c|
+            std.fmt.bufPrint(&e.etag_buf, "\"{x}-{x}-{s}\"", .{ st.mtime_s, st.size, c.token() })
+        else
+            std.fmt.bufPrint(&e.etag_buf, "\"{x}-{x}\"", .{ st.mtime_s, st.size })) catch unreachable; // 48 bytes fit the longest
+        e.etag_len = @intCast(s.len);
+        e.etag_key = key;
+    }
+    return e.etag_buf[0..e.etag_len];
+}
+
+fn entryLastModified(e: *ofc.Entry) []const u8 {
+    if (!e.has_last_modified) {
+        _ = common.formatHttpDate(e.meta.mtime_s, &e.last_modified);
+        e.has_last_modified = true;
+    }
+    return &e.last_modified;
 }
 
 fn fail(ex: *Exchange) void {
