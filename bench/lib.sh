@@ -76,6 +76,7 @@ start() {
     taskset -c "$cpus" "${pre[@]}" "$@" > "$RUN/$name.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
+    STARTED=$pid # not $!: a profiled server's perf starts after it
     if [ "$PROFILE" == perf ] && [ "$name" == "$PROFILE_SERVER" ]; then
         # Sample the whole tree: nginx's work is in its children, not its master.
         perf record -F "${PROFILE_HZ:-999}" -g --inherit --pid "$pid" \

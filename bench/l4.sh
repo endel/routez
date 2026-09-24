@@ -80,9 +80,9 @@ wait_port 19090
 wait_udp 19201
 
 up_proxies() {
-    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-l4.conf"; SPID[nginx]=$!
-    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/haproxy-l4.cfg"; SPID[haproxy]=$!
-    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-l4.zon"; SPID[routez]=$!
+    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-l4.conf"; SPID[nginx]=$STARTED
+    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/haproxy-l4.cfg"; SPID[haproxy]=$STARTED
+    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-l4.zon"; SPID[routez]=$STARTED
     SPID[direct]=
     wait_port "${TCP[nginx]}"; wait_port "${TCP[routez]}"; wait_port "${TCP[haproxy]}"
     wait_udp "${UDP[nginx]}"; wait_udp "${UDP[routez]}"

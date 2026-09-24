@@ -98,9 +98,9 @@ done
 start upstream "$UP_CPUS" nginx -c "$RUN/upstream.conf"
 wait_port 19090
 up_servers() {
-    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-h3.conf"; SPID[nginx]=$!
-    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/haproxy-h3.cfg"; SPID[haproxy]=$!
-    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-h3.zon"; SPID[routez]=$!
+    start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-h3.conf"; SPID[nginx]=$STARTED
+    start haproxy "$SERVER_CPUS" haproxy -f "$RUN/haproxy-h3.cfg"; SPID[haproxy]=$STARTED
+    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-h3.zon"; SPID[routez]=$STARTED
     local p
     for p in "${TLS[@]}"; do wait_port "$p"; done
     for p in "${QUIC[@]}"; do wait_udp "$p"; done
