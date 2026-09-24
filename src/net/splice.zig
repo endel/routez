@@ -176,7 +176,7 @@ pub fn Relay(comptime Owner: type) type {
         fn step(self: *Self, next: Next) void {
             switch (next) {
                 .poll_src => xev.TCP.initFd(self.src).poll(self.loop, &self.poll_c, .read, Self, self, onPollable),
-                .wait_dst => xev.TCP.initFd(self.dst).write(self.loop, &self.write_c, socket.wait_writable, Self, self, onWritable),
+                .wait_dst => xev.TCP.initFd(self.dst).write(self.loop, &self.write_c, .{ .slice = socket.wait_writable }, Self, self, onWritable),
                 .eof => self.finish(false),
                 .failed => self.finish(true),
             }

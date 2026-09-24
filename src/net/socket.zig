@@ -36,11 +36,11 @@ const send_flags: c_int = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL e
 pub const high_water = 256 * 1024;
 pub const low_water = 64 * 1024;
 
-/// An empty write, which completes once the socket is writable. It needs a
-/// real address: `&.{}` is 0xaaaa... in x86_64 Debug builds, and Linux fails
-/// even a zero-length send from there with EFAULT, which libxev treats as
-/// unreachable.
-pub const wait_writable: xev.WriteBuffer = .{ .slice = (&[1]u8{0})[0..0] };
+/// Written as an empty write, which completes once the socket is writable.
+/// It needs a real address: `&.{}` is 0xaaaa... in x86_64 Debug builds, and
+/// Linux fails even a zero-length send from there with EFAULT, which libxev
+/// treats as unreachable. A plain slice, so the fuzz build (no xev) can test it.
+pub const wait_writable: []const u8 = (&[1]u8{0})[0..0];
 
 /// A range of a file to send as-is (sendfile), after the bytes queued
 /// before it. `release(hold)` is called once the socket is done with it.
@@ -358,7 +358,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                         .done, .copied => continue,
                         .blocked => {
                             self.writing = true;
-                            self.tcp.write(self.loop, &self.write_c, wait_writable, Self, self, onWrite);
+                            self.tcp.write(self.loop, &self.write_c, .{ .slice = wait_writable }, Self, self, onWrite);
                             return;
                         },
                         .failed => return self.abort(),
@@ -700,8 +700,7 @@ test "wait_writable is a send the kernel accepts" {
     defer for (fds) |fd| {
         _ = std.c.close(fd);
     };
-    const s = wait_writable.slice;
-    try std.testing.expectEqual(@as(isize, 0), std.c.send(fds[0], s.ptr, s.len, 0));
+    try std.testing.expectEqual(@as(isize, 0), std.c.send(fds[0], wait_writable.ptr, wait_writable.len, 0));
 }
 
 test "ipv6 formatting" {
