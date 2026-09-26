@@ -229,6 +229,9 @@ python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 1808
 perl -e 'select(undef,undef,undef,0.3)'
 SUITE=sendfile check stalled-reader "$($CURL_BIN -s --max-time 5 -o /dev/null -w '%{http_code} %{time_total}' http://127.0.0.1:18080/sub/a.txt | LC_ALL=C awk '{print $1, ($2 < 1 ? "prompt" : "took " $2)}')" "200 prompt"
 kill $STALLED; wait $STALLED 2>/dev/null
+# A client sending into a connection that is flushing its last response.
+head -c 200000 /dev/urandom > "$WORK/www/small-sndbuf-200k.bin"
+SUITE=http check closing-input "$(python3 "$HERE/closing_flood.py" 18080 small-sndbuf-200k.bin 64 $SERVER 2>&1 | tail -1)" bounded
 # Open-file cache: a change on disk shows within valid_ms (1 s by default).
 # The body if 200, else the status.
 ofc_get() {

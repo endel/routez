@@ -134,6 +134,8 @@ pub const Conn = struct {
     // ---- transport ----
 
     pub fn onSocketData(self: *Conn, data: []const u8) void {
+        // Nothing is parsed once closing: buffering it would grow `in` unbounded.
+        if (self.phase == .closing) return;
         if (self.proxy_pending) return self.readProxyHeader(data);
         if (self.tls) |t| {
             t.feed(data) catch |err| {
