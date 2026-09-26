@@ -66,6 +66,10 @@ pub const Downstream = struct {
         /// Response failed after it started; the client must see an error
         /// (connection or stream reset). The downstream detaches.
         abort: *const fn (*anyopaque) void,
+        /// `abort`, for a downstream that may still send what it queued when
+        /// the client can tell the response is short: true when some is
+        /// still queued, and `ex.onFlushed` follows as with `finishTracked`.
+        abortTracked: ?*const fn (*anyopaque, *Exchange) bool = null,
         /// Response bytes queued but not yet sent.
         buffered: *const fn (*anyopaque) usize,
         setRequestBodyPaused: *const fn (*anyopaque, bool) void,
@@ -686,7 +690,13 @@ pub const Exchange = struct {
         self.done = true;
         self.failed = true;
         if (self.down) |d| {
-            if (d.vtable.unsent) |u| self.unsent = u(d.ptr);
+            if (d.vtable.abortTracked) |f| {
+                self.down = null;
+                self.flushing = f(d.ptr, self);
+                if (self.flushing) return;
+            } else if (d.vtable.unsent) |u| {
+                self.unsent = u(d.ptr);
+            }
         }
         self.finished();
         if (self.down) |d| {

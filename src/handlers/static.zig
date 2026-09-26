@@ -42,9 +42,7 @@ const chunk_size = 32 * 1024;
 /// asked with `aio on`.
 ///
 /// The whole remaining body has to fit, not just the next chunk: a large file
-/// read a chunk at a time still belongs on the threads, and taking its first
-/// chunk here would find a file truncated under a cached entry before the head
-/// was queued, answering with nothing instead of a short body.
+/// read a chunk at a time still belongs on the threads.
 const inline_read_max = 64 * 1024;
 /// Most handed to one sendfile segment; within what `Residency.cached`
 /// checks in one call.
