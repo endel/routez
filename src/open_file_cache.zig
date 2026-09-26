@@ -50,6 +50,14 @@ pub const Entry = struct {
     /// Page-cache residency, mapped on first need.
     residency: ?file_io.Residency = null,
     mapped: bool = false,
+    /// Response validators, formatted by the static handler on first use:
+    /// they depend only on `meta` and the coding the file is served as.
+    etag_buf: [48]u8 = undefined,
+    etag_len: u8 = 0,
+    /// Which coding `etag_buf` was formatted for; 0 is none.
+    etag_key: u8 = 0,
+    last_modified: [29]u8 = undefined,
+    has_last_modified: bool = false,
 
     /// A new entry with one reference; takes `file` for `.file`.
     pub fn create(gpa: std.mem.Allocator, outcome: Outcome, file: std.Io.File, meta: file_io.Meta) !*Entry {
