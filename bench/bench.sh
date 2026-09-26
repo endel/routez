@@ -183,9 +183,9 @@ wait_port 19090
 
 up_servers() { # profile
     local d=$RUN/$1
-    start nginx "$SERVER_CPUS" nginx -c "$d/nginx.conf"; SPID[nginx]=$!
-    start haproxy "$SERVER_CPUS" haproxy -f "$d/haproxy.cfg"; SPID[haproxy]=$!
-    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$d/routez.zon"; SPID[routez]=$!
+    start nginx "$SERVER_CPUS" nginx -c "$d/nginx.conf"; SPID[nginx]=$STARTED
+    start haproxy "$SERVER_CPUS" haproxy -f "$d/haproxy.cfg"; SPID[haproxy]=$STARTED
+    start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$d/routez.zon"; SPID[routez]=$STARTED
     local p
     for p in "${PLAIN[@]}" "${TLS[@]}"; do wait_port "$p"; done
     # nginx's master listens before its worker exists; the RSS baseline needs both.

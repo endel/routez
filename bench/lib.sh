@@ -40,7 +40,7 @@ chmod 755 "$RUN" # nginx's workers drop to an unprivileged user
 PIDS=()
 cleanup() {
     local p
-    [ -n "$PERF_PID" ] && { kill -INT "$PERF_PID" 2>/dev/null; wait "$PERF_PID" 2>/dev/null; }
+    [ -n "$PERF_PID" ] && { kill -TERM "$PERF_PID" 2>/dev/null; wait "$PERF_PID" 2>/dev/null; }
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
     for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null; done
     rm -rf "$RUN"
@@ -76,6 +76,7 @@ start() {
     taskset -c "$cpus" "${pre[@]}" "$@" > "$RUN/$name.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
+    STARTED=$pid # not $!: a profiled server's perf starts after it
     if [ "$PROFILE" == perf ] && [ "$name" == "$PROFILE_SERVER" ]; then
         # Sample the whole tree: nginx's work is in its children, not its master.
         perf record -F "${PROFILE_HZ:-999}" -g --inherit --pid "$pid" \
@@ -88,7 +89,9 @@ start() {
 # perf can still resolve their symbols.
 profile_report() {
     [ -n "$PERF_PID" ] || return 0
-    kill -INT "$PERF_PID" 2>/dev/null
+    # TERM, not INT: a background job starts with INT ignored, so an INT that
+    # beats perf's handler (a one-row sanity pass) is lost and the wait hangs.
+    kill -TERM "$PERF_PID" 2>/dev/null
     wait "$PERF_PID" 2>/dev/null
     PERF_PID=
     local f=$OUT/$PROFILE_SERVER
