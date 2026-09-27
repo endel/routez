@@ -12,6 +12,7 @@
 //! container hashes with a one-byte-at-a-time CRC32 that cost more than the
 //! compression did. `Crc32` below reads eight bytes a round instead.
 const std = @import("std");
+const builtin = @import("builtin");
 const flate = std.compress.flate;
 const common = @import("http/common.zig");
 const Header = common.Header;
@@ -184,10 +185,13 @@ pub const Pool = struct {
     }
 };
 
-/// CRC-32 (the one gzip wants), eight bytes a round off comptime tables.
+/// CRC-32 (the one gzip wants): carry-less multiplication where x86_64 has it,
+/// else eight bytes a round off comptime tables.
 ///
 /// std's is a single 256-entry table stepped one byte at a time, which showed up
-/// as a third of the time spent compressing a response.
+/// as a third of the time spent compressing a response. The tables made that
+/// 7% of a proxied gzip response; PCLMULQDQ folds 64 bytes a round, several
+/// times faster again.
 pub const Crc32 = struct {
     v: u32 = 0xffffffff,
 
@@ -211,6 +215,11 @@ pub const Crc32 = struct {
     pub fn update(self: *Crc32, bytes: []const u8) void {
         var c = self.v;
         var rest = bytes;
+        if (has_clmul and rest.len >= 64) {
+            const n = rest.len & ~@as(usize, 15);
+            c = fold(rest[0..n], c);
+            rest = rest[n..];
+        }
         while (rest.len >= 8) {
             const lo = std.mem.readInt(u32, rest[0..4], .little) ^ c;
             const hi = std.mem.readInt(u32, rest[4..8], .little);
@@ -226,6 +235,65 @@ pub const Crc32 = struct {
 
     pub fn final(self: *const Crc32) u32 {
         return ~self.v;
+    }
+
+    const has_clmul = builtin.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHas(builtin.cpu.features, .pclmul) and
+        std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_1);
+    const V = @Vector(2, u64);
+
+    /// PCLMULQDQ with `imm` choosing the halves, as `_mm_clmulepi64_si128`.
+    inline fn clmul(a: V, b: V, comptime imm: u8) V {
+        return asm (std.fmt.comptimePrint("pclmulqdq ${d}, %[b], %[a]", .{imm})
+            : [a] "=x" (-> V),
+            : [a_in] "0" (a),
+              [b] "x" (b),
+        );
+    }
+
+    inline fn load(p: *const [16]u8) V {
+        return @bitCast(p.*);
+    }
+
+    /// Folding for the bit-reflected CRC-32, from Intel's "Fast CRC
+    /// Computation for Generic Polynomials Using PCLMULQDQ" (Gopal et al.,
+    /// 2009), as zlib and Chromium implement it: four lanes of 128 bits fold
+    /// 64 bytes a round, then fold to one lane, to 64 bits, and a Barrett
+    /// reduction to 32. `data.len` is a multiple of 16, at least 64; `c` is
+    /// the running (inverted) value, as `v` holds it.
+    fn fold(data: []const u8, c: u32) u32 {
+        const k1k2: V = .{ 0x0154442bd4, 0x01c6e41596 };
+        const k3k4: V = .{ 0x01751997d0, 0x00ccaa009e };
+        const k5k0: V = .{ 0x0163cd6124, 0 };
+        const poly: V = .{ 0x01db710641, 0x01f7011641 };
+        const low32: V = .{ 0xffffffff, 0xffffffff };
+
+        var x1 = load(data[0..16]) ^ V{ c, 0 };
+        var x2 = load(data[16..32]);
+        var x3 = load(data[32..48]);
+        var x4 = load(data[48..64]);
+        var rest = data[64..];
+        while (rest.len >= 64) : (rest = rest[64..]) {
+            x1 = clmul(x1, k1k2, 0x00) ^ clmul(x1, k1k2, 0x11) ^ load(rest[0..16]);
+            x2 = clmul(x2, k1k2, 0x00) ^ clmul(x2, k1k2, 0x11) ^ load(rest[16..32]);
+            x3 = clmul(x3, k1k2, 0x00) ^ clmul(x3, k1k2, 0x11) ^ load(rest[32..48]);
+            x4 = clmul(x4, k1k2, 0x00) ^ clmul(x4, k1k2, 0x11) ^ load(rest[48..64]);
+        }
+        x1 = clmul(x1, k3k4, 0x00) ^ clmul(x1, k3k4, 0x11) ^ x2;
+        x1 = clmul(x1, k3k4, 0x00) ^ clmul(x1, k3k4, 0x11) ^ x3;
+        x1 = clmul(x1, k3k4, 0x00) ^ clmul(x1, k3k4, 0x11) ^ x4;
+        while (rest.len >= 16) : (rest = rest[16..]) {
+            x1 = clmul(x1, k3k4, 0x00) ^ clmul(x1, k3k4, 0x11) ^ load(rest[0..16]);
+        }
+        // 128 bits to 64.
+        x1 = clmul(x1, k3k4, 0x10) ^ V{ x1[1], 0 };
+        const hi32: V = .{ (x1[0] >> 32) | (x1[1] << 32), x1[1] >> 32 };
+        x1 = clmul(x1 & low32, k5k0, 0x00) ^ hi32;
+        // Barrett reduction to 32.
+        var x = clmul(x1 & low32, poly, 0x10) & low32;
+        x = clmul(x, poly, 0x00);
+        x1 ^= x;
+        return @truncate(x1[0] >> 32);
     }
 };
 
@@ -371,7 +439,7 @@ test "the pool reuses encoders, trims back to max_idle, and stops at max_active"
 test "the crc matches std's, at every alignment and in pieces" {
     var data: [1000]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
-    for ([_]usize{ 0, 1, 7, 8, 9, 63, 64, 511, 1000 }) |n| {
+    for ([_]usize{ 0, 1, 7, 8, 9, 15, 16, 63, 64, 65, 79, 80, 127, 128, 129, 191, 192, 511, 1000 }) |n| {
         var ours: Crc32 = .{};
         ours.update(data[0..n]);
         try std.testing.expectEqual(std.hash.Crc32.hash(data[0..n]), ours.final());
@@ -383,6 +451,17 @@ test "the crc matches std's, at every alignment and in pieces" {
     split.update(data[100..]);
     try std.testing.expectEqual(std.hash.Crc32.hash(&data), split.final());
 
+    // Every length and start up to a few folding rounds, both paths meeting.
+    var prng = std.Random.DefaultPrng.init(0x72c);
+    var big: [700]u8 = undefined;
+    prng.random().bytes(&big);
+    for (0..big.len) |n| {
+        const off = n % 13;
+        if (off + n > big.len) continue;
+        var ours: Crc32 = .{};
+        ours.update(big[off..][0..n]);
+        try std.testing.expectEqual(std.hash.Crc32.hash(big[off..][0..n]), ours.final());
+    }
 }
 
 test "an encoder's output is a gzip stream std can read back" {
