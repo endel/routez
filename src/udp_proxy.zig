@@ -79,7 +79,7 @@ pub const UdpProxy = struct {
     poll_c: xev.Completion = .{},
     cancel_c: xev.Completion = .{},
     stopped: bool = false,
-    flows: std.AutoHashMapUnmanaged(AddrKey, *Flow) = .empty,
+    flows: std.AutoArrayHashMapUnmanaged(AddrKey, *Flow) = .empty,
     lb: ?quic_lb.Config = null,
     /// Server ID per peer, in the group's peer order.
     lb_ids: [][15]u8 = &.{},
@@ -204,15 +204,14 @@ pub const UdpProxy = struct {
 
     fn removeFlow(self: *UdpProxy, flow: *Flow) void {
         if (self.flows.get(flow.key)) |f| {
-            if (f == flow) _ = self.flows.remove(flow.key);
+            if (f == flow) _ = self.flows.swapRemove(flow.key);
         }
     }
 
     pub fn closeAll(self: *UdpProxy) void {
-        var it = self.flows.valueIterator();
         var list: std.ArrayListUnmanaged(*Flow) = .empty;
         defer list.deinit(self.worker.alloc);
-        while (it.next()) |f| list.append(self.worker.alloc, f.*) catch break;
+        for (self.flows.values()) |f| list.append(self.worker.alloc, f) catch break;
         for (list.items) |f| f.close();
     }
 };

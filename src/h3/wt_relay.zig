@@ -46,10 +46,10 @@ pub fn Relay(comptime Listener: type) type {
     return struct {
         const Self = @This();
 
-        sessions: std.AutoHashMapUnmanaged(Key, *RSession) = .empty,
-        down_streams: std.AutoHashMapUnmanaged(Key, *Pair) = .empty,
+        sessions: std.AutoArrayHashMapUnmanaged(Key, *RSession) = .empty,
+        down_streams: std.AutoArrayHashMapUnmanaged(Key, *Pair) = .empty,
         /// CONNECTs waiting for a verifier thread to check a password.
-        pending: std.AutoHashMapUnmanaged(Key, *Pending) = .empty,
+        pending: std.AutoArrayHashMapUnmanaged(Key, *Pending) = .empty,
 
         /// A CONNECT held while its password is checked; owns copies of
         /// what `open` needs.
@@ -85,7 +85,7 @@ pub fn Relay(comptime Listener: type) type {
             up: *Up,
             up_sid: ?u64 = null,
             accepted: bool = false,
-            by_up: std.AutoHashMapUnmanaged(u64, *Pair) = .empty,
+            by_up: std.AutoArrayHashMapUnmanaged(u64, *Pair) = .empty,
 
             fn down(self: *RSession) event_loop.Session {
                 return .{ .entry = self.down_entry };
@@ -104,14 +104,14 @@ pub fn Relay(comptime Listener: type) type {
                     return;
                 };
                 self.by_up.put(a, up_stream, p) catch {
-                    _ = self.relay.down_streams.remove(.{ .conn = self.down_conn, .id = down_stream });
+                    _ = self.relay.down_streams.swapRemove(.{ .conn = self.down_conn, .id = down_stream });
                     a.destroy(p);
                 };
             }
 
             fn unpair(self: *RSession, p: *Pair) void {
-                _ = self.relay.down_streams.remove(.{ .conn = self.down_conn, .id = p.down_stream });
-                _ = self.by_up.remove(p.up_stream);
+                _ = self.relay.down_streams.swapRemove(.{ .conn = self.down_conn, .id = p.down_stream });
+                _ = self.by_up.swapRemove(p.up_stream);
                 p.deinit(self.worker.alloc);
             }
 
@@ -133,13 +133,12 @@ pub fn Relay(comptime Listener: type) type {
                         u.closeSessionWithError(sid, code, reason) catch {};
                     }
                 }
-                var it = self.by_up.valueIterator();
-                while (it.next()) |p| {
-                    _ = self.relay.down_streams.remove(.{ .conn = self.down_conn, .id = p.*.down_stream });
-                    p.*.deinit(a);
+                for (self.by_up.values()) |p| {
+                    _ = self.relay.down_streams.swapRemove(.{ .conn = self.down_conn, .id = p.down_stream });
+                    p.deinit(a);
                 }
                 self.by_up.deinit(a);
-                _ = self.relay.sessions.remove(.{ .conn = self.down_conn, .id = self.down_sid });
+                _ = self.relay.sessions.swapRemove(.{ .conn = self.down_conn, .id = self.down_sid });
                 self.peer.detach();
                 self.up.retire();
                 self.arena_state.deinit();
@@ -480,7 +479,7 @@ pub fn Relay(comptime Listener: type) type {
         fn onPasswordChecked(job: *auth_pool.Job) void {
             const p: *Pending = @ptrCast(@alignCast(job.ctx.?));
             const self = p.relay;
-            _ = self.pending.remove(p.key);
+            _ = self.pending.swapRemove(p.key);
             defer p.destroy();
             var session: event_loop.Session = .{ .entry = p.entry };
             if (!job.ok) {
@@ -587,8 +586,7 @@ pub fn Relay(comptime Listener: type) type {
         /// Resume streams whose destination has caught up. Called on every
         /// worker tick.
         pub fn checkPaused(self: *Self) void {
-            var it = self.down_streams.valueIterator();
-            while (it.next()) |pp| resumeCaughtUp(pp.*);
+            for (self.down_streams.values()) |p| resumeCaughtUp(p);
         }
 
         fn resumeCaughtUp(p: *Pair) void {
@@ -643,7 +641,7 @@ pub fn Relay(comptime Listener: type) type {
                 const p = while (it.next()) |e| {
                     if (e.key_ptr.conn == conn) break e.value_ptr.*;
                 } else break;
-                _ = self.pending.remove(p.key);
+                _ = self.pending.swapRemove(p.key);
                 p.job.ctx = null;
                 p.destroy();
             }
