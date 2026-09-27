@@ -100,6 +100,8 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         /// The connection ended in an error (a reset, say) rather than the
         /// peer's FIN. Set before `onSocketEof`.
         failed: bool = false,
+        /// Closing with a reset: see `reset`.
+        resetting: bool = false,
         /// Completions the owner armed against this fd. The close waits for
         /// them: on epoll a disarm after the fd is gone fails the ctl.
         external: u8 = 0,
@@ -491,16 +493,41 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             self.startReading();
         }
 
-        /// Close now, discarding queued output. Idempotent.
+        /// Close now, discarding queued output. Idempotent. After `reset`, it
+        /// ends a write the peer never made room for.
         pub fn abort(self: *Self) void {
             switch (self.state) {
-                .closing, .closed => return,
+                .closed => return,
+                .closing => {
+                    // The FIN queues behind unsent bytes the reset discards.
+                    if (self.resetting and self.writing) _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RDWR);
+                    return;
+                },
                 else => {},
             }
             self.state = .closing;
             self.dropOutput();
             // Wakes any in-flight read or write so it completes promptly.
             _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RDWR);
+            self.maybeFinishClose();
+        }
+
+        /// Close with a reset instead of a FIN, discarding queued output: to a
+        /// peer reading until the close, a FIN says the stream is complete.
+        /// A write in flight is left to finish, since waking it would send
+        /// that FIN; `abort` ends it if the peer never makes room.
+        pub fn reset(self: *Self) void {
+            switch (self.state) {
+                .closing, .closed => return,
+                else => {},
+            }
+            const l: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+            _ = std.c.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&l), @sizeOf(std.posix.linger));
+            self.state = .closing;
+            self.resetting = true;
+            self.dropOutput();
+            // Wakes a read without sending anything.
+            _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RD);
             self.maybeFinishClose();
         }
 

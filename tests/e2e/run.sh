@@ -288,10 +288,13 @@ SUITE=features check rejects-backreference "$? $(grep -c "backreferences aren't 
 SUITE=features check rate-limit "$(for i in 1 2 3 4 5 6; do $CURL_BIN -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:18080/limited; done)" "200 200 200 429 429 429 "
 # An upstream body that ends early reaches the client as short: chunked and cut
 # by a FIN, or read until the close and ended by a reset, where only a FIN (or
-# close_notify) ends it complete. Prints the bytes curl got and its exit code.
+# close_notify) ends it complete. HTTP/1.0 can't frame it, so its client gets a
+# reset. Prints the bytes curl got and its exit code.
 cut_get() { $CURL_BIN -s -o /dev/null -w '%{size_download}' "$@"; echo " $?"; }
 SUITE=upstream-cut check chunked-fin "$(cut_get http://127.0.0.1:18080/api/cut/chunked)" "1000 18"
+SUITE=upstream-cut check chunked-fin-http10 "$(cut_get --http1.0 http://127.0.0.1:18080/api/cut/chunked | cut -d' ' -f2)" 56
 SUITE=upstream-cut check close-reset "$(cut_get http://127.0.0.1:18080/api/cut/close-reset)" "1000 18"
+SUITE=upstream-cut check close-reset-http10 "$(cut_get --http1.0 http://127.0.0.1:18080/api/cut/close-reset | cut -d' ' -f2)" 56
 SUITE=upstream-cut check close-fin "$(cut_get http://127.0.0.1:18080/api/cut/close)" "1000 0"
 
 # HTTPS upstreams. The health checks (TLS too) have had two rounds by now,
