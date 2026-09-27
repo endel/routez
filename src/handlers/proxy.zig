@@ -506,7 +506,9 @@ pub const Proxy = struct {
         self.replay_ok = false;
     }
 
-    pub fn onUpstreamEof(self: *Proxy) void {
+    /// `clean`: a FIN (or close_notify), not a reset or failed record. Only
+    /// that ends a body read until the close.
+    pub fn onUpstreamEof(self: *Proxy, clean: bool) void {
         switch (self.phase) {
             .done => {},
             .connecting, .waiting_head => {
@@ -522,7 +524,8 @@ pub const Proxy = struct {
                 self.fail(502);
             },
             .body => {
-                if (self.decoder.finishOnEof()) return self.complete(false);
+                if (clean and self.decoder.finishOnEof()) return self.complete(false);
+                log.warn("{s} closed the connection mid-response", .{self.peer.?.label});
                 self.abortResponse();
             },
             .tunnel => self.complete(false),

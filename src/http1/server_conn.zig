@@ -318,7 +318,8 @@ pub const Conn = struct {
     }
 
     /// While output is flushing, the I/O timeout since the last progress;
-    /// after it, a short linger for the client's FIN.
+    /// after it, a short linger for the client's FIN, or for a write a reset
+    /// waits on.
     fn armClosingDeadline(self: *Conn) void {
         self.worker.timers.set(&self.deadline, if (self.sock.state == .flushing) self.limits().io_timeout_ms else linger_ms);
     }
@@ -801,20 +802,23 @@ pub const Conn = struct {
 
     /// End a response that failed. Where its framing already tells the
     /// client it's short, what's queued still goes out (earlier pipelined
-    /// responses, this head and the body so far) before the close; a
-    /// response the client couldn't tell from complete is cut off now.
+    /// responses, this head and the body so far) before the close. One read
+    /// until the close is reset instead, since a clean close would complete
+    /// it; anything else is cut off now.
     fn endFailed(self: *Conn) void {
         self.ex = null;
-        const visibly_short = self.resp.started and switch (self.resp.framing) {
-            .length => self.resp.remaining > 0,
-            .chunked => true,
-            .none, .close, .tunnel => false,
+        if (self.resp.started) switch (self.resp.framing) {
+            .length => if (self.resp.remaining > 0) return self.closeGracefully(),
+            .chunked => return self.closeGracefully(),
+            .close => {
+                self.phase = .closing;
+                self.sock.reset();
+                return self.armClosingDeadline();
+            },
+            .none, .tunnel => {},
         };
-        if (!visibly_short) {
-            self.phase = .closing;
-            return self.sock.abort();
-        }
-        self.closeGracefully();
+        self.phase = .closing;
+        self.sock.abort();
     }
 
     fn dsBuffered(ptr: *anyopaque) usize {

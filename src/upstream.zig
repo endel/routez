@@ -284,7 +284,8 @@ pub const UpConn = struct {
             if (t.ended) return;
             t.ended = true;
         }
-        self.onTlsEof();
+        // Clean without close_notify too, as in nginx; see README, Limitations.
+        self.onTlsEof(!self.sock.failed);
     }
 
     pub fn onTlsHandshake(self: *UpConn, err: ?anyerror) void {
@@ -299,8 +300,9 @@ pub const UpConn = struct {
         self.dropIdle();
     }
 
-    pub fn onTlsEof(self: *UpConn) void {
-        if (self.user) |u| return u.onUpstreamEof();
+    /// `clean`: the upstream ended the connection itself, not in an error.
+    pub fn onTlsEof(self: *UpConn, clean: bool) void {
+        if (self.user) |u| return u.onUpstreamEof(clean);
         self.dropIdle();
     }
 
@@ -383,7 +385,7 @@ pub const Probe = struct {
         if (err != null) self.done(false);
     }
 
-    pub fn onTlsEof(self: *Probe) void {
+    pub fn onTlsEof(self: *Probe, _: bool) void {
         self.done(false);
     }
 
