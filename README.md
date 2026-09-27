@@ -1001,11 +1001,6 @@ to the app directly.
   ones don't). On macOS a lookup the open-file cache can't answer (a path's
   first request, or its first after `valid_ms`) takes a round trip to an
   I/O thread: nothing there can tell that an open won't wait.
-- An upstream body with neither a length nor chunks ends when the
-  connection does: a reset fails it, a clean close completes it. Over TLS,
-  a close without `close_notify` completes it too, as in nginx, though
-  RFC 2818 §2.2.2 counts that as possibly truncated: an upstream that ends
-  its bodies this way should send `close_notify`.
 - `sendfile` is used for plain HTTP/1.1 only: TLS and HTTP/3 encrypt in
   userspace, and bodies compressed on the fly are made there.
 - Compression on the fly is gzip only: Zig's standard library has no

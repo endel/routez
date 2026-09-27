@@ -278,13 +278,15 @@ pub const UpConn = struct {
         self.onTlsData(data);
     }
 
+    /// Clean unless the connection failed. Over TLS that includes a close
+    /// without close_notify, as in nginx, though RFC 2818 §2.2.2 counts it
+    /// as possibly truncated: a body read until the close then ends complete.
     pub fn onSocketEof(self: *UpConn) void {
         if (self.tls) |t| {
             // Already reported: close_notify or a failed record came first.
             if (t.ended) return;
             t.ended = true;
         }
-        // Clean without close_notify too, as in nginx; see README, Limitations.
         self.onTlsEof(!self.sock.failed);
     }
 
