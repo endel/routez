@@ -216,7 +216,7 @@ pub fn Relay(comptime Listener: type) type {
             if (held.empty()) return true;
             const items = held.bytes.items;
             const n = sendSome(dst, stream, items);
-            std.mem.copyForwards(u8, items[0 .. items.len - n], items[n..]);
+            @memmove(items[0 .. items.len - n], items[n..]);
             held.bytes.items.len -= n;
             if (!held.empty()) {
                 dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};

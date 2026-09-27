@@ -263,7 +263,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                         const sent: usize = @intCast(rc);
                         self.sent_total += sent;
                         const rest = self.pending.items.len - sent;
-                        std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[sent..]);
+                        @memmove(self.pending.items[0..rest], self.pending.items[sent..]);
                         self.pending.items.len = rest;
                         if (self.file != null) self.file_before -= sent;
                     }
@@ -358,7 +358,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                         // The bytes ahead of the file go first.
                         self.active.appendSlice(self.alloc, self.pending.items[0..self.file_before]) catch return self.abort();
                         const rest = self.pending.items.len - self.file_before;
-                        std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[self.file_before..]);
+                        @memmove(self.pending.items[0..rest], self.pending.items[self.file_before..]);
                         self.pending.items.len = rest;
                         self.file_before = 0;
                         break;
