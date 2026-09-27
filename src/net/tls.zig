@@ -141,8 +141,8 @@ pub const ClientCert = struct {
 /// TLS to an upstream, between its socket and its owner (`UpConn`, `Probe`).
 ///
 /// The owner hears `onTlsHandshake(?anyerror)` once, then plaintext through
-/// `onTlsData`, and `onTlsEof` when the server closes the TLS session or a
-/// record fails after the handshake.
+/// `onTlsData`, and `onTlsEof(clean)` when the server closes the TLS session
+/// (clean) or a record fails after the handshake.
 pub const Client = struct {
     conn: tls_client.Conn,
     alloc: std.mem.Allocator,
@@ -184,7 +184,7 @@ pub const Client = struct {
             self.flush(sock); // the alert
             self.ended = true;
             if (!self.handshake_done) return owner.onTlsHandshake(err);
-            return owner.onTlsEof();
+            return owner.onTlsEof(false);
         };
         self.flush(sock);
         if (!self.handshake_done and self.conn.handshakeComplete()) {
@@ -199,7 +199,7 @@ pub const Client = struct {
         }
         if (sock.isOpen() and self.conn.peerClosed()) {
             self.ended = true;
-            owner.onTlsEof();
+            owner.onTlsEof(true);
         }
     }
 };

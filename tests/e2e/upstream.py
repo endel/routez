@@ -1,4 +1,4 @@
-import http.server, sys, json, ssl, gzip, random, time
+import http.server, sys, json, ssl, gzip, random, time, socket, struct
 # Text that doesn't shrink much: gzipped, still past routez's 1 KiB minimum.
 NOISE = "".join(random.Random(1).choice("0123456789abcdef") for _ in range(8000)).encode()
 class H(http.server.BaseHTTPRequestHandler):
@@ -20,7 +20,32 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+    def _cut(self, how):
+        # 1000 bytes, then the end: a chunked body cut by a FIN, or one read
+        # until the close and ended by a reset, a FIN, or a close_notify.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Transfer-Encoding" if how == "chunked" else "Connection", "chunked" if how == "chunked" else "close")
+        self.end_headers()
+        body = b"x" * 1000
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(body), body) if how == "chunked" else body)
+        self.close_connection = True
+        if how == "close-reset":
+            time.sleep(0.2)  # the proxy has the body before the reset
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            self.reset = True
+        elif how == "close-notify":
+            try:
+                self.connection.unwrap()
+            except OSError:
+                pass  # the peer closed without answering the close_notify
+    def finish(self):
+        super().finish()
+        # Closed before the server's shutdown(SHUT_WR) can send a FIN.
+        if getattr(self, "reset", False): self.connection.close()
     def do_GET(self):
+        if self.path in ("/cut/chunked", "/cut/close-reset", "/cut/close", "/cut/close-notify"):
+            return self._cut(self.path[len("/cut/"):])
         if self.path.startswith("/chunked"):
             return self._reply(200, b"x" * 5000, "text/plain", chunked=True)
         if self.path.startswith("/bytes/"):

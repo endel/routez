@@ -286,6 +286,13 @@ EOF2
 "$ROOT/zig-out/bin/routez" -t "$WORK/badre.zon" 2> "$WORK/badre.log"
 SUITE=features check rejects-backreference "$? $(grep -c "backreferences aren't supported" "$WORK/badre.log")" "1 1"
 SUITE=features check rate-limit "$(for i in 1 2 3 4 5 6; do $CURL_BIN -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:18080/limited; done)" "200 200 200 429 429 429 "
+# An upstream body that ends early reaches the client as short: chunked and cut
+# by a FIN, or read until the close and ended by a reset, where only a FIN (or
+# close_notify) ends it complete. Prints the bytes curl got and its exit code.
+cut_get() { $CURL_BIN -s -o /dev/null -w '%{size_download}' "$@"; echo " $?"; }
+SUITE=upstream-cut check chunked-fin "$(cut_get http://127.0.0.1:18080/api/cut/chunked)" "1000 18"
+SUITE=upstream-cut check close-reset "$(cut_get http://127.0.0.1:18080/api/cut/close-reset)" "1000 18"
+SUITE=upstream-cut check close-fin "$(cut_get http://127.0.0.1:18080/api/cut/close)" "1000 0"
 
 # HTTPS upstreams. The health checks (TLS too) have had two rounds by now,
 # enough to take the upstream down if they failed.
@@ -298,6 +305,9 @@ check keepalive "$(for i in 1 2 3; do $CURL_BIN -s $B/tls/k | json '["peer_port"
 check unverified "$($CURL_BIN -s -o /dev/null -w '%{http_code}' $B/tls-insecure/x)" 200
 check wrong-ca "$($CURL_BIN -s -o /dev/null -w '%{http_code}' $B/tls-wrong-ca/x)" 502
 check wrong-name "$($CURL_BIN -s -o /dev/null -w '%{http_code}' $B/tls-wrong-name/x)" 502
+# Read until the close: complete with or without close_notify, as in nginx.
+check close-no-notify "$(cut_get $B/tls/cut/close)" "1000 0"
+check close-notify "$(cut_get $B/tls/cut/close-notify)" "1000 0"
 check health "$(grep -c '19005 is unhealthy' "$WORK/server.log")" 0
 
 # Reload: edit the config, SIGHUP, keep serving throughout.

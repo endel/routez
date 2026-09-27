@@ -8,7 +8,7 @@
 //! `Owner` receives events through these methods:
 //!   - `onSocketData(owner, bytes)`: bytes are only valid during the call.
 //!   - `onSocketEof(owner)`: the peer finished sending, or the connection
-//!     failed. The owner usually aborts.
+//!     failed (`failed` tells which). The owner usually aborts.
 //!   - `onSocketWritable(owner)`: output drained below `low_water`.
 //!   - `onSocketSent(owner)`, optional: a queued write went (partly) out,
 //!     also while flushing before a close.
@@ -97,6 +97,9 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         /// The relay reported our input ended: there is no read left to wait
         /// for when the write side finishes.
         read_ended: bool = false,
+        /// The connection ended in an error (a reset, say) rather than the
+        /// peer's FIN. Set before `onSocketEof`.
+        failed: bool = false,
         /// Completions the owner armed against this fd. The close waits for
         /// them: on epoll a disarm after the fd is gone fails the ctl.
         external: u8 = 0,
@@ -178,8 +181,9 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
 
         fn onRead(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
             const self = ud.?;
-            const n = r catch {
+            const n = r catch |err| {
                 self.reading = false;
+                if (err != error.EOF) self.failed = true;
                 switch (self.state) {
                     .open, .flushing => Owner.onSocketEof(self.owner),
                     .lingering => self.abort(),
@@ -422,6 +426,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                 return .disarm;
             }
             const n = r catch {
+                self.failed = true;
                 self.dropOutput();
                 if (self.state == .open) Owner.onSocketEof(self.owner) else self.abort();
                 self.maybeFinishClose();
