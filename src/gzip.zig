@@ -29,11 +29,16 @@ pub const max_active = 256;
 const window_len = flate.max_window_len;
 /// Bodies known to be smaller than this aren't worth the CPU.
 pub const min_length = 1024;
-/// Encoders a worker keeps between responses. Compressing is synchronous, so
-/// only the responses still streaming hold one and a handful covers the reuse;
-/// keeping `max_active` of them would park 19 MB per worker for a feature that
-/// may be idle.
+/// Encoders a worker keeps between responses for good. Compressing is
+/// synchronous, so only the responses still streaming hold one and a handful
+/// covers the reuse; keeping `max_active` of them would park 19 MB per worker
+/// for a feature that may be idle.
 pub const max_idle = 4;
+/// How long an encoder past `max_idle` is kept unused before it is freed.
+/// Freed on release instead, a proxy streaming 256 compressed responses at once
+/// made a fresh encoder for nearly every one: an mmap, faulting in and zeroing
+/// 300 KB, and a munmap, a fifth of the time the row spent.
+pub const surplus_idle_ms = 1_000;
 
 /// deflate, no mtime, unknown OS: everything a response needs.
 const gzip_header = [10]u8{ 0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff };
@@ -48,6 +53,8 @@ pub const Encoder = struct {
     size: u32 = 0,
     /// Next on a `Pool` freelist; meaningless while in use.
     next: ?*Encoder = null,
+    /// When it went on the freelist.
+    idle_since_ms: i64 = 0,
 
     /// Heap-allocated: the compressor points at `out`.
     pub fn create(alloc: std.mem.Allocator) !*Encoder {
@@ -106,7 +113,9 @@ pub const Encoder = struct {
     }
 };
 
-/// One worker's encoders: those in use, and up to `max_idle` waiting.
+/// One worker's encoders: those in use, and those waiting, most recently
+/// used first. Past `max_idle`, waiting ones are freed by `trim` once unused
+/// for `surplus_idle_ms`.
 ///
 /// Touched only on its worker's loop thread, so no locks.
 pub const Pool = struct {
@@ -139,13 +148,31 @@ pub const Pool = struct {
         return e;
     }
 
-    pub fn release(self: *Pool, e: *Encoder) void {
+    pub fn release(self: *Pool, e: *Encoder, now_ms: i64) void {
         std.debug.assert(self.active > 0);
         self.active -= 1;
-        if (self.idle_count >= max_idle) return e.destroy();
+        e.idle_since_ms = now_ms;
         e.next = self.idle;
         self.idle = e;
         self.idle_count += 1;
+    }
+
+    /// Free the waiting encoders past `max_idle` that have gone unused for
+    /// `surplus_idle_ms`. Most recently used first, so they are the tail.
+    pub fn trim(self: *Pool, now_ms: i64) void {
+        if (self.idle_count <= max_idle) return;
+        var link = &self.idle;
+        var kept: u32 = 0;
+        while (link.*) |e| {
+            if (kept >= max_idle and now_ms - e.idle_since_ms >= surplus_idle_ms) {
+                link.* = e.next;
+                self.idle_count -= 1;
+                e.destroy();
+                continue;
+            }
+            kept += 1;
+            link = &e.next;
+        }
     }
 
     pub fn deinit(self: *Pool) void {
@@ -301,35 +328,41 @@ test "round trip" {
     try std.testing.expectEqualStrings(input.items, got);
 }
 
-test "the pool reuses encoders, keeps at most max_idle, and stops at max_active" {
+test "the pool reuses encoders, trims back to max_idle, and stops at max_active" {
     const alloc = std.testing.allocator;
     var pool: Pool = .{ .alloc = alloc };
     defer pool.deinit();
 
     // A released encoder comes back rather than being allocated again.
     const first = pool.acquire().?;
-    pool.release(first);
+    pool.release(first, 0);
     try std.testing.expectEqual(first, pool.acquire().?);
     try std.testing.expectEqual(@as(u32, 1), pool.active);
 
-    // Past max_idle the extras are freed instead of parked.
+    // Past max_idle the extras wait, for the next burst, until trimmed.
     var held: [max_idle + 2]*Encoder = undefined;
     held[0] = first;
     for (held[1..]) |*e| e.* = pool.acquire().?;
-    for (held) |e| pool.release(e);
+    for (held, 0..) |e, t| pool.release(e, @intCast(t));
     try std.testing.expectEqual(@as(u32, 0), pool.active);
+    try std.testing.expectEqual(@as(u32, max_idle + 2), pool.idle_count);
+    pool.trim(surplus_idle_ms); // the two released first have waited long enough
+    try std.testing.expectEqual(@as(u32, max_idle + 1), pool.idle_count);
+    pool.trim(max_idle + 2 + surplus_idle_ms);
     try std.testing.expectEqual(@as(u32, max_idle), pool.idle_count);
+    // The ones kept are the most recently used.
+    try std.testing.expectEqual(held[held.len - 1], pool.idle.?);
 
     // max_active is a hard ceiling; past it a response goes out uncompressed.
     var out: [max_active]*Encoder = undefined;
     for (&out) |*e| e.* = pool.acquire().?;
     try std.testing.expect(pool.acquire() == null);
-    for (out) |e| pool.release(e);
+    for (out) |e| pool.release(e, 0);
     try std.testing.expectEqual(@as(u32, 0), pool.active);
 
     // A reused encoder still produces a valid stream.
     const e = pool.acquire().?;
-    defer pool.release(e);
+    defer pool.release(e, 0);
     try e.write("hello hello hello");
     try e.finish();
     try std.testing.expect(e.output().len > 0);
@@ -349,6 +382,7 @@ test "the crc matches std's, at every alignment and in pieces" {
     split.update(data[3..100]);
     split.update(data[100..]);
     try std.testing.expectEqual(std.hash.Crc32.hash(&data), split.final());
+
 }
 
 test "an encoder's output is a gzip stream std can read back" {

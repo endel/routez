@@ -599,6 +599,7 @@ pub const Worker = struct {
         const self: *Worker = @fieldParentPtr("timers", t);
         if (self.shared.clients) |tbl| tbl.sweepStep(self.io, quic.sys.nanoTimestamp());
         self.files.sweep(self.timers.now_ms);
+        self.gzip.trim(self.timers.now_ms);
         self.publishQuicStats();
         for (self.quic_listeners.items) |q| switch (q) {
             .wt => |l| l.relay.checkPaused(),
