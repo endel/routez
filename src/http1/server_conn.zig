@@ -134,6 +134,8 @@ pub const Conn = struct {
     // ---- transport ----
 
     pub fn onSocketData(self: *Conn, data: []const u8) void {
+        // Nothing is parsed once closing: buffering it would grow `in` unbounded.
+        if (self.phase == .closing) return;
         if (self.proxy_pending) return self.readProxyHeader(data);
         if (self.tls) |t| {
             t.feed(data) catch |err| {
@@ -625,6 +627,7 @@ pub const Conn = struct {
         .finishTracked = dsFinishTracked,
         .unsent = dsUnsent,
         .abort = dsAbort,
+        .abortTracked = dsAbortTracked,
         .buffered = dsBuffered,
         .setRequestBodyPaused = dsSetPaused,
         .startTunnel = dsStartTunnel,
@@ -743,11 +746,8 @@ pub const Conn = struct {
         self.ex = null;
         switch (self.resp.framing) {
             .chunked => self.output("0\r\n\r\n"),
-            .length => if (self.resp.remaining > 0) {
-                // Promised more than was produced; only closing tells the client.
-                self.phase = .closing;
-                return self.sock.abort();
-            },
+            // Promised more than was produced; only closing tells the client.
+            .length => if (self.resp.remaining > 0) return self.endFailed(),
             .close, .tunnel => self.keep_alive = false,
             .none => {},
         }
@@ -761,10 +761,17 @@ pub const Conn = struct {
 
     fn dsFinishTracked(ptr: *anyopaque, ex: *Exchange) bool {
         const self = cast(ptr);
+        // Short but flushed, so trackFlush won't see it as lost.
+        if (self.resp.framing == .length and self.resp.remaining > 0) ex.failed = true;
         dsFinish(ptr);
+        return self.trackFlush(ex);
+    }
+
+    /// True when some of `ex`'s response is still queued; `ex.onFlushed`
+    /// follows once it is sent or lost.
+    fn trackFlush(self: *Conn, ex: *Exchange) bool {
         const lost = self.sock.state == .closing or self.sock.state == .closed;
         if (lost or self.sock.sent_total >= self.sock.queued_total) {
-            // A short body aborts the connection: not a complete response.
             if (lost) {
                 ex.failed = true;
                 ex.unsent = self.unsent();
@@ -783,10 +790,31 @@ pub const Conn = struct {
     }
 
     fn dsAbort(ptr: *anyopaque) void {
+        cast(ptr).endFailed();
+    }
+
+    fn dsAbortTracked(ptr: *anyopaque, ex: *Exchange) bool {
         const self = cast(ptr);
+        self.endFailed();
+        return self.trackFlush(ex);
+    }
+
+    /// End a response that failed. Where its framing already tells the
+    /// client it's short, what's queued still goes out (earlier pipelined
+    /// responses, this head and the body so far) before the close; a
+    /// response the client couldn't tell from complete is cut off now.
+    fn endFailed(self: *Conn) void {
         self.ex = null;
-        self.phase = .closing;
-        self.sock.abort();
+        const visibly_short = self.resp.started and switch (self.resp.framing) {
+            .length => self.resp.remaining > 0,
+            .chunked => true,
+            .none, .close, .tunnel => false,
+        };
+        if (!visibly_short) {
+            self.phase = .closing;
+            return self.sock.abort();
+        }
+        self.closeGracefully();
     }
 
     fn dsBuffered(ptr: *anyopaque) usize {

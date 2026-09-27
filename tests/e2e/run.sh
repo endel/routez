@@ -229,6 +229,9 @@ python3 -c "import socket, time; s = socket.create_connection(('127.0.0.1', 1808
 perl -e 'select(undef,undef,undef,0.3)'
 SUITE=sendfile check stalled-reader "$($CURL_BIN -s --max-time 5 -o /dev/null -w '%{http_code} %{time_total}' http://127.0.0.1:18080/sub/a.txt | LC_ALL=C awk '{print $1, ($2 < 1 ? "prompt" : "took " $2)}')" "200 prompt"
 kill $STALLED; wait $STALLED 2>/dev/null
+# A client sending into a connection that is flushing its last response.
+head -c 200000 /dev/urandom > "$WORK/www/small-sndbuf-200k.bin"
+SUITE=http check closing-input "$(python3 "$HERE/closing_flood.py" 18080 small-sndbuf-200k.bin 64 $SERVER 2>&1 | tail -1)" bounded
 # Open-file cache: a change on disk shows within valid_ms (1 s by default).
 # The body if 200, else the status.
 ofc_get() {
@@ -247,13 +250,28 @@ SUITE=open-file-cache check deleted "$before, $(ofc_get)" "v2, 404"
 echo v3 > "$WORK/www/ofc.txt"
 before=$(ofc_get); pause 1.2
 SUITE=open-file-cache check created "$before, $(ofc_get)" "404, v3"
-# Truncated in place while cached: the old length is announced, and the
-# response ends early.
+# Truncated in place to 1000 bytes while cached: the old length is announced,
+# and the response ends early. Prints curl's exit code and the bytes it got.
+trunc_get() {
+    local file=$1 url=$2 got code; shift 2
+    $CURL_BIN -s -o /dev/null "$@" "$url"
+    python3 -c 'import sys; open(sys.argv[1], "r+b").truncate(1000)' "$file"
+    got=$($CURL_BIN -s -o /dev/null -w '%{size_download}' "$@" "$url"); code=$?
+    echo "$code $got"
+}
 head -c 2000000 /dev/urandom > "$WORK/www/trunc.bin"
-$CURL_BIN -s -o /dev/null http://127.0.0.1:18080/trunc.bin
-python3 -c 'import sys; open(sys.argv[1], "r+b").truncate(1000)' "$WORK/www/trunc.bin"
-$CURL_BIN -s -o /dev/null http://127.0.0.1:18080/trunc.bin; code=$?
-SUITE=open-file-cache check truncated "$code $($CURL_BIN -s http://127.0.0.1:18080/sub/a.txt)" "18 sub file"
+SUITE=open-file-cache check truncated "$(trunc_get "$WORK/www/trunc.bin" http://127.0.0.1:18080/trunc.bin), $($CURL_BIN -s http://127.0.0.1:18080/sub/a.txt)" "18 1000, sub file"
+# Read whole on the loop, in the pass that queued the head.
+head -c 20000 /dev/urandom > "$WORK/www/trunc-small.bin"
+SUITE=open-file-cache check truncated-inline "$(trunc_get "$WORK/www/trunc-small.bin" http://127.0.0.1:18080/trunc-small.bin)" "18 1000"
+# A response queued ahead of the short one still goes out.
+head -c 20000 /dev/urandom > "$WORK/www/trunc-pipe.bin"
+$CURL_BIN -s -o /dev/null http://127.0.0.1:18080/trunc-pipe.bin
+python3 -c 'import sys; open(sys.argv[1], "r+b").truncate(1000)' "$WORK/www/trunc-pipe.bin"
+SUITE=open-file-cache check truncated-pipelined "$(python3 "$HERE/pipe_truncated.py" 18080 trunc-pipe.bin)" "200 9/9, 200 1000/20000"
+# Chunked: the last chunk never comes.
+head -c 20000 "$WORK/gz/text.txt" > "$WORK/gz/trunc.txt"
+SUITE=open-file-cache check truncated-chunked "$(trunc_get "$WORK/gz/trunc.txt" http://127.0.0.1:18080/gz/trunc.txt -H 'Accept-Encoding: gzip' | cut -d' ' -f1)" 18
 SUITE=features check gzip-encoding "$($CURL_BIN -s -H 'Accept-Encoding: gzip' -D - -o /dev/null http://127.0.0.1:18080/gz/text.txt | grep -i '^content-encoding' | tr -d '\r' | tr A-Z a-z)" "content-encoding: gzip"
 SUITE=features check gzip-content "$($CURL_BIN -s --compressed http://127.0.0.1:18080/gz/text.txt | sha)" "$(sha < "$WORK/gz/text.txt")"
 SUITE=features check gzip-smaller "$([ "$($CURL_BIN -s -H 'Accept-Encoding: gzip' http://127.0.0.1:18080/gz/text.txt | wc -c)" -lt 20000 ] && echo yes)" yes
