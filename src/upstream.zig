@@ -20,6 +20,13 @@ const log = std.log.scoped(.upstream);
 
 /// How long an idle pooled connection is kept.
 const idle_timeout_ms = 60_000;
+/// How long a connection released into a full pool stays, in case the load
+/// that opened it is still coming. Closing it on release, as nginx does, made
+/// every burst past `keepalive` reconnect: 640 HTTP/3 requests in flight over a
+/// pool of 64 opened a new upstream connection for ~80% of requests, and over
+/// TLS that is a handshake each. Past this the pool is trimmed back to
+/// `keepalive`, so a burst leaves no more than it opened, and not for long.
+const surplus_idle_ms = 1_000;
 
 pub const Group = struct {
     worker: *Worker,
@@ -124,7 +131,8 @@ pub const Peer = struct {
     /// Connections serving a request right now (including connecting ones).
     active: u32 = 0,
     idle_head: ?*UpConn = null,
-    idle_count: u16 = 0,
+    /// Can pass `keepalive` for up to `surplus_idle_ms` after a burst.
+    idle_count: u32 = 0,
     fails: u16 = 0,
     down_until: i64 = 0,
     health_ok: bool = true,
@@ -189,7 +197,8 @@ pub const Peer = struct {
     pub fn release(self: *Peer, c: *UpConn, reusable: bool) void {
         self.detach();
         c.user = null;
-        if (!reusable or !c.sock.isOpen() or self.idle_count >= self.group.cfg.keepalive or self.group.worker.stopping) {
+        const cap = self.group.cfg.keepalive;
+        if (!reusable or !c.sock.isOpen() or cap == 0 or self.group.worker.stopping) {
             c.state = .closing;
             c.sock.abort();
             return;
@@ -203,7 +212,10 @@ pub const Peer = struct {
         // Keep a read armed so an upstream close is noticed while idle.
         c.sock.resumeRead();
         c.sock.startReading();
-        self.group.worker.timers.set(&c.idle_deadline, idle_timeout_ms);
+        // `acquire` takes the most recently used, so a surplus connection the
+        // load doesn't need sits untouched until its short deadline.
+        c.surplus = self.idle_count > cap;
+        self.group.worker.timers.set(&c.idle_deadline, if (c.surplus) surplus_idle_ms else idle_timeout_ms);
     }
 
     fn unlinkIdle(self: *Peer, c: *UpConn) void {
@@ -260,6 +272,8 @@ pub const UpConn = struct {
     idle_next: ?*UpConn = null,
     idle_prev: ?*UpConn = null,
     idle_deadline: timers.Deadline = .{ .callback = onIdleTimeout },
+    /// Idle past `keepalive`, on the short deadline.
+    surplus: bool = false,
 
     /// Request bytes for the upstream; over TLS, held until the handshake is done.
     pub fn send(self: *UpConn, bytes: []const u8) void {
@@ -330,7 +344,15 @@ pub const UpConn = struct {
 
     fn onIdleTimeout(d: *timers.Deadline) void {
         const self: *UpConn = @fieldParentPtr("idle_deadline", d);
-        if (self.state == .idle) self.dropIdle();
+        if (self.state != .idle) return;
+        const p = self.peer;
+        // A surplus deadline, but the pool has shrunk back under the cap:
+        // this one is part of it now, for the rest of the usual idle time.
+        if (p.idle_count <= p.group.cfg.keepalive and self.surplus) {
+            self.surplus = false;
+            return p.group.worker.timers.set(&self.idle_deadline, idle_timeout_ms - surplus_idle_ms);
+        }
+        self.dropIdle();
     }
 };
 
