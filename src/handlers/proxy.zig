@@ -447,7 +447,7 @@ pub const Proxy = struct {
 
     fn consumeIn(self: *Proxy, n: usize) void {
         const rest = self.in.items.len - n;
-        std.mem.copyForwards(u8, self.in.items[0..rest], self.in.items[n..]);
+        @memmove(self.in.items[0..rest], self.in.items[n..]);
         self.in.items.len = rest;
     }
 

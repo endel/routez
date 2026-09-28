@@ -405,7 +405,9 @@ pub const Upstream = struct {
     /// `host:port` entries.
     servers: []const []const u8,
     balance: Balance = .round_robin,
-    /// Idle keep-alive connections kept per server, per worker.
+    /// Idle keep-alive connections kept per server, per worker. A burst that
+    /// needed more leaves the extra ones idle for up to a second, for the
+    /// load still coming, before the pool is trimmed back to this.
     keepalive: u16 = 32,
     /// Consecutive failures that mark a server down.
     max_fails: u16 = 3,

@@ -509,7 +509,7 @@ pub const Conn = struct {
     fn consumeIn(self: *Conn, n: usize) void {
         if (n == 0) return;
         const rest = self.in.items.len - n;
-        std.mem.copyForwards(u8, self.in.items[0..rest], self.in.items[n..]);
+        @memmove(self.in.items[0..rest], self.in.items[n..]);
         self.in.items.len = rest;
         // Give back memory from a burst (large pipelined input); keeps len.
         if (self.in.capacity > 256 * 1024 and rest < 4096) self.in.shrinkAndFree(self.worker.alloc, rest);

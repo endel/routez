@@ -62,7 +62,9 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
         vhosts: router.VirtualHosts = .{ .servers = &.{} },
         handler: Handler,
         server: Server,
-        streams: std.AutoHashMapUnmanaged(StreamKey, *Stream) = .empty,
+        /// Array-backed: one insert and one removal per request, and
+        /// `std.HashMap`'s tombstones would fill it (see open_file_cache.zig).
+        streams: std.AutoArrayHashMapUnmanaged(StreamKey, *Stream) = .empty,
         relay: wt_relay.Relay(Self) = .{},
         alpn: [1][]const u8 = .{"h3"},
 
@@ -147,7 +149,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
         }
 
         fn removeStream(self: *Self, s: *Stream) void {
-            _ = self.streams.remove(.{ .conn = s.conn_id, .stream = s.stream_id });
+            _ = self.streams.swapRemove(.{ .conn = s.conn_id, .stream = s.stream_id });
         }
 
         // ---- the quic-zig handler ----

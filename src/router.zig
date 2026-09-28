@@ -70,7 +70,7 @@ pub fn normalizeTarget(target_in: []const u8, buf: []u8) TargetError!Target {
             while (out > 0 and buf[out - 1] != '/') out -= 1;
             trailing_slash = true;
         } else {
-            std.mem.copyForwards(u8, buf[out .. out + seg_len], buf[r..seg_end]);
+            @memmove(buf[out .. out + seg_len], buf[r..seg_end]);
             out += seg_len;
             buf[out] = '/';
             out += 1;

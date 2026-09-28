@@ -627,7 +627,7 @@ pub const Exchange = struct {
     fn releaseGzip(self: *Exchange) void {
         const e = self.gz orelse return;
         self.gz = null;
-        self.worker.gzip.release(e);
+        self.worker.gzip.release(e, self.worker.timers.now_ms);
     }
 
     pub fn respondBody(self: *Exchange, data: []const u8) void {
