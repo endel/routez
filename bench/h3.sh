@@ -166,6 +166,10 @@ EOF
 } > "$OUT/env.txt"
 
 udp_errors() { awk '/^Udp:/ {getline; print $4 + $6}' /proc/net/snmp; } # InErrors + RcvbufErrors
+# Drops at the sockets bound to a port: the server's live through a run, so the
+# difference says which side of the kernel's total overflowed. h2load's close
+# with it, taking their counts along.
+port_drops() { cat /proc/net/udp /proc/net/udp6 2>/dev/null | awk -v p="$(printf ':%04X' "$1")" '$2 ~ p"$" {d += $NF} END {print d + 0}'; }
 
 run_load() { # row server seconds output
     local r=$1 cpus=$LOAD_CPUS threads=$LOAD_THREADS c alpn=--h1
@@ -189,9 +193,11 @@ for r in "${ROWS[@]}"; do
             sleep 1
             grep '^cpu[0-9]' /proc/stat > "$f.stat0"
             udp_errors > "$f.udp0"
+            port_drops "${QUIC[$s]}" > "$f.sdrop0"
             run_load "$r" "$s" "$DURATION" "$f.txt"
             grep '^cpu[0-9]' /proc/stat > "$f.stat1"
             udp_errors > "$f.udp1"
+            port_drops "${QUIC[$s]}" > "$f.sdrop1"
             tree_rss "${SPID[$s]}" > "$f.rss"
             echo "$r $s #$n: $(awk '/req\/s/ {print $4, $5; exit}' "$f.txt")"
         done
