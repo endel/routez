@@ -314,6 +314,10 @@ pub const Conn = struct {
             self.flushTls();
         }
         self.sock.closeAfterFlush();
+        // Input is discarded from here on, so a pause for it holds nothing
+        // back: kept, a client sending without reading waits on us as we wait
+        // on it, until the deadline.
+        self.sock.resumeRead();
         self.armClosingDeadline();
     }
 
