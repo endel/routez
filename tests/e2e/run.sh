@@ -254,6 +254,13 @@ SUITE=open-file-cache check deleted "$before, $(ofc_get)" "v2, 404"
 echo v3 > "$WORK/www/ofc.txt"
 before=$(ofc_get); pause 1.2
 SUITE=open-file-cache check created "$before, $(ofc_get)" "404, v3"
+# A small file's bytes are kept: an edit in place that keeps the size shows
+# within valid_ms, not at once, and whole either way.
+printf aaaa > "$WORK/www/kept.txt"
+first=$($CURL_BIN -s http://127.0.0.1:18080/kept.txt)
+python3 -c 'import sys; open(sys.argv[1], "r+b").write(b"bbbb")' "$WORK/www/kept.txt"
+before=$($CURL_BIN -s http://127.0.0.1:18080/kept.txt); pause 1.2
+SUITE=open-file-cache check kept-content "$first, $before, $($CURL_BIN -s http://127.0.0.1:18080/kept.txt)" "aaaa, aaaa, bbbb"
 # Truncated in place to 1000 bytes while cached: the old length is announced,
 # and the response ends early. Prints curl's exit code and the bytes it got.
 trunc_get() {

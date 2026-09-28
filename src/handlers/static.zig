@@ -355,6 +355,7 @@ pub const Transfer = struct {
         // Small enough that the read costs less than asking whether it would.
         if (t.end - t.offset <= inline_read_max) {
             t.read(e, t.offset, t.end);
+            if (t.offset == 0) t.cache.keepContent(e, buf[0..t.filled]);
             return true;
         }
         if (file_io.cached.readEnabled()) {
@@ -540,6 +541,7 @@ fn serve(ex: *Exchange, t: *Transfer) void {
     t.trust_sendfile = range_end - range_start <= sendfile_trust_max;
     // The prefetch read from 0 and there's no range: it's the body's start.
     if (t.prefetch and t.filled > 0) {
+        t.cache.keepContent(t.entry.?, t.buf.?[0..t.filled]);
         if (!send(ex, t)) return;
     }
     pump(ex);
@@ -611,7 +613,12 @@ fn send(ex: *Exchange, t: *Transfer) bool {
         return false;
     }
     t.offset += n;
-    ex.respondBody(t.buf.?[0..n]);
+    return respond(ex, t.buf.?[0..n]);
+}
+
+/// Send body bytes; false when that ended the response.
+fn respond(ex: *Exchange, bytes: []const u8) bool {
+    ex.respondBody(bytes);
     if (ex.down == null) {
         // The encoder failed and aborted the response.
         release(ex);
@@ -630,6 +637,13 @@ pub fn pump(ex: *Exchange) void {
         if (t.busy) return;
         if (t.offset >= t.end) return finish(ex);
         if (ex.downstreamBuffered() > socket.high_water) return;
+        if (t.entry.?.content) |c| {
+            // All of a small file, kept by the cache: no read, one write.
+            const rest = c[@intCast(t.offset)..@intCast(t.end)];
+            t.offset = t.end;
+            if (!respond(ex, rest)) return;
+            continue;
+        }
         if (t.sendfile and sendRange(ex, t)) continue;
         if (t.buf == null) t.buf = t.gpa.create([chunk_size]u8) catch {
             release(ex);

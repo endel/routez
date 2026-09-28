@@ -107,8 +107,11 @@ for txt in sorted((out / "raw").glob("*.txt")):
         flags.append(f"{j['packets_lost']:.0f} packets lost")
     if u0.exists() and u1.exists():
         dropped = int(u1.read_text()) - int(u0.read_text())
+        d0, d1 = (txt.with_suffix(f".sdrop{i}") for i in (0, 1))
+        at_server = int(d1.read_text()) - int(d0.read_text()) if d0.exists() and d1.exists() else None
         if dropped:
-            flags.append(f"{dropped} UDP datagrams the kernel dropped")
+            where = "" if at_server is None else f" ({at_server} at the server's sockets)"
+            flags.append(f"{dropped} UDP datagrams the kernel dropped{where}")
     limiter = max(cpu["load"], cpu["upstream"]) if "proxy" in workload else cpu["load"]
     if limiter >= SATURATED:
         flags.append(f"rig {limiter}% busy")

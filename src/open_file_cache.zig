@@ -15,6 +15,12 @@
 //! within that window is still announced at its old length; its response
 //! ends early with an aborted connection, as without the cache.
 //!
+//! A file of at most `content_max` bytes also has its bytes kept, from the
+//! first read of all of it, so it is served with no read per request. They
+//! go at each revalidation and are read again, so they are never older than
+//! `valid_ms` either: an edit in place that keeps the size and the second of
+//! the mtime passes `sameAs`, and would otherwise be served stale for good.
+//!
 //! A response (or a socket sending from the file) holds a reference: an
 //! entry evicted or replaced meanwhile keeps its descriptor until the last
 //! one is gone.
@@ -30,6 +36,13 @@ pub const Settings = struct {
 };
 
 pub const Outcome = enum { file, missing, directory };
+
+/// Largest file whose bytes an entry keeps. Below the size handed to
+/// sendfile, which reads the page cache without a copy of ours.
+pub const content_max = 16 * 1024;
+/// Bytes a cache keeps across its entries' contents; past it a file is read
+/// per request as usual.
+pub const content_budget = 4 * 1024 * 1024;
 
 pub const Entry = struct {
     gpa: std.mem.Allocator,
@@ -58,6 +71,10 @@ pub const Entry = struct {
     etag_key: u8 = 0,
     last_modified: [29]u8 = undefined,
     has_last_modified: bool = false,
+    /// The whole file, when small enough; see `Cache.keepContent`. Only read
+    /// within one call, never held across the loop: it goes at any
+    /// revalidation or eviction.
+    content: ?[]u8 = null,
 
     /// A new entry with one reference; takes `file` for `.file`.
     pub fn create(gpa: std.mem.Allocator, outcome: Outcome, file: std.Io.File, meta: file_io.Meta) !*Entry {
@@ -77,6 +94,7 @@ pub const Entry = struct {
     }
 
     fn destroy(e: *Entry) void {
+        if (e.content) |c| e.gpa.free(c);
         if (e.residency) |r| r.deinit();
         if (e.outcome == .file) _ = std.c.close(e.file.handle);
         if (e.key.len > 0) e.gpa.free(e.key);
@@ -169,6 +187,8 @@ pub const Cache = struct {
     /// Most recently used first.
     head: ?*Entry = null,
     tail: ?*Entry = null,
+    /// Bytes held in the entries' `content`, within `content_budget`.
+    content_bytes: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, settings: Settings) Cache {
         return .{ .gpa = gpa, .settings = settings };
@@ -205,6 +225,7 @@ pub const Cache = struct {
         if (self.settings.max == 0) return fresh;
         if (self.map.get(path)) |old| {
             if (old.sameAs(fresh)) {
+                self.dropContent(old);
                 old.validated_ms = now_ms;
                 old.used_ms = now_ms;
                 self.unlink(old);
@@ -246,8 +267,27 @@ pub const Cache = struct {
         // ours: the LRU list below is.
         _ = self.map.swapRemove(e.key);
         self.unlink(e);
+        self.dropContent(e);
         e.in_table = false;
         if (e.refs == 0) e.destroy();
+    }
+
+    /// Keep `bytes`, all of `e`'s file as just read, for later requests.
+    /// Ignored for a file past `content_max`, an entry not in the table, or
+    /// once the budget is spent.
+    pub fn keepContent(self: *Cache, e: *Entry, bytes: []const u8) void {
+        if (!e.in_table or e.content != null or e.outcome != .file) return;
+        if (bytes.len != e.meta.size or bytes.len > content_max) return;
+        if (self.content_bytes + bytes.len > content_budget) return;
+        e.content = self.gpa.dupe(u8, bytes) catch return;
+        self.content_bytes += bytes.len;
+    }
+
+    fn dropContent(self: *Cache, e: *Entry) void {
+        const c = e.content orelse return;
+        e.content = null;
+        self.content_bytes -= c.len;
+        self.gpa.free(c);
     }
 
     fn unlink(self: *Cache, e: *Entry) void {
@@ -453,4 +493,65 @@ test "a working set larger than the cache stays correct, and the table stays com
     const last = try d.path(&buf, &names[names.len - 1]);
     const hit = c.get(last, @intCast(8 * names.len)).?;
     hit.release();
+}
+
+test "a small file's bytes are kept until the entry is revalidated or evicted" {
+    var d = try TestDir.init();
+    defer d.deinit();
+    try d.write("small", "hello");
+    try d.write("other", "world");
+    var c = Cache.init(testing.allocator, .{ .max = 1, .valid_ms = 1000, .inactive_ms = 60_000 });
+    defer c.deinit();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const small = try d.path(&buf, "small");
+
+    const e = try probeAdopt(&c, small, 0);
+    // Only the whole file.
+    c.keepContent(e, "hel");
+    try testing.expect(e.content == null);
+    c.keepContent(e, "hello");
+    try testing.expectEqualStrings("hello", e.content.?);
+    try testing.expectEqual(5, c.content_bytes);
+    e.release();
+
+    // Revalidated unchanged, the bytes go all the same: an edit that kept
+    // the size and the mtime's second would pass as unchanged.
+    const again = try probeAdopt(&c, small, 1500);
+    try testing.expectEqual(e, again);
+    try testing.expect(again.content == null);
+    try testing.expectEqual(0, c.content_bytes);
+    c.keepContent(again, "hello");
+    again.release();
+
+    // Evicted: its bytes leave the budget with it.
+    var obuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const other = try probeAdopt(&c, try d.path(&obuf, "other"), 1600);
+    try testing.expectEqual(0, c.content_bytes);
+    other.release();
+}
+
+test "kept bytes stay within the budget and content_max" {
+    var d = try TestDir.init();
+    defer d.deinit();
+    const big = try testing.allocator.alloc(u8, content_max + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    try d.write("big", big);
+    var c = Cache.init(testing.allocator, .{ .max = 10, .valid_ms = 1000, .inactive_ms = 60_000 });
+    defer c.deinit();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const e = try probeAdopt(&c, try d.path(&buf, "big"), 0);
+    defer e.release();
+    c.keepContent(e, big);
+    try testing.expect(e.content == null);
+
+    // A budget already spent keeps nothing more.
+    c.content_bytes = content_budget;
+    try d.write("small", "hi");
+    var sbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const s = try probeAdopt(&c, try d.path(&sbuf, "small"), 0);
+    defer s.release();
+    c.keepContent(s, "hi");
+    try testing.expect(s.content == null);
+    c.content_bytes = 0;
 }
