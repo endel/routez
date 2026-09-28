@@ -449,9 +449,9 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             return .disarm;
         }
 
-        /// Hand this socket's read side to a relay. The in-flight read
-        /// disarms as its callback returns, so this must be called from
-        /// inside one.
+        /// Hand this socket's read side to a relay. No read may be armed:
+        /// call from inside the read's callback, which disarms as it
+        /// returns, or after a `pauseRead` taken there.
         pub fn beginRelay(self: *Self) void {
             self.relayed = true;
             self.read_paused = true;

@@ -26,11 +26,14 @@ const log = std.log.scoped(.tcp_proxy);
 /// ahead of a slow peer, and every queued chunk is heap.
 const pause_above = 2 * socket.low_water;
 
-/// Reads that filled the buffer in a row before a direction is handed to the
-/// kernel. Small exchanges never reach it, which is the point: routez is
-/// ahead of both competitors on the keep-alive layer-4 row, and a pipe there
-/// would only add syscalls.
-const splice_after = 4;
+/// Bytes read in a row, each read filling the buffer, before a direction is
+/// handed to the kernel: a 64 KiB backlog whatever the buffer's size (four
+/// reads at 16 KiB, one on epoll's shared 64 KiB). Small exchanges never
+/// reach it, which is the point: routez is ahead of both competitors on the
+/// keep-alive layer-4 row, and a pipe there would only add syscalls.
+const splice_after = 64 * 1024;
+
+const HandOver = enum { started, busy, declined };
 
 const Relay = if (splice.supported) splice.Relay(Tunnel) else void;
 
@@ -60,19 +63,42 @@ pub const Tunnel = struct {
             tunnel: *Tunnel,
             /// Sends this side's bytes on, and pauses when it falls behind.
             from_client: bool,
-            /// Reads in a row that filled the buffer: a stream that keeps
-            /// coming, and worth splicing.
-            full_reads: u8 = 0,
+            /// Bytes of full reads in a row: a stream that keeps coming, and
+            /// worth splicing.
+            bulk_bytes: u32 = 0,
+            /// Bulk, but the destination still held copied bytes: reading
+            /// stays paused until it has sent them, then the kernel takes
+            /// over.
+            splice_pending: bool = false,
 
             pub fn onSocketData(self: *Self, data: []const u8) void {
                 self.tunnel.forward(self.from_client, data);
                 if (comptime !splice.supported) return;
                 if (data.len < socket.read_buffer_size) {
-                    self.full_reads = 0;
+                    self.bulk_bytes = 0;
                     return;
                 }
-                self.full_reads += 1;
-                if (self.full_reads >= splice_after) self.tunnel.startRelay(self.from_client);
+                self.bulk_bytes = @min(self.bulk_bytes + @as(u32, @intCast(data.len)), splice_after);
+                if (self.bulk_bytes < splice_after) return;
+                // A slow destination rarely takes a whole 64 KiB read at once,
+                // so waiting for one that happens to be empty could wait forever.
+                if (self.tunnel.startRelay(self.from_client) == .busy) {
+                    self.splice_pending = true;
+                    self.sock.pauseRead();
+                }
+            }
+
+            /// Our destination sent some of its queue.
+            fn retryRelay(self: *Self) void {
+                if (!self.splice_pending) return;
+                switch (self.tunnel.startRelay(self.from_client)) {
+                    .busy => {},
+                    .started => self.splice_pending = false,
+                    .declined => {
+                        self.splice_pending = false;
+                        self.sock.resumeRead();
+                    },
+                }
             }
 
             pub fn onSocketEof(self: *Self) void {
@@ -80,9 +106,20 @@ pub const Tunnel = struct {
             }
 
             pub fn onSocketWritable(self: *Self) void {
-                // This side drained: let the side feeding it read again.
+                // This side drained: let the side feeding it read again,
+                // unless it waits for us to drain completely.
                 const t = self.tunnel;
-                if (self.from_client) t.server.sock.resumeRead() else t.client.sock.resumeRead();
+                if (self.from_client) {
+                    if (!t.server.splice_pending) t.server.sock.resumeRead();
+                } else {
+                    if (!t.client.splice_pending) t.client.sock.resumeRead();
+                }
+            }
+
+            pub fn onSocketSent(self: *Self) void {
+                if (comptime !splice.supported) return;
+                const t = self.tunnel;
+                if (self.from_client) t.server.retryRelay() else t.client.retryRelay();
             }
 
             pub fn onSocketConnect(self: *Self, err: ?anyerror) void {
@@ -166,32 +203,36 @@ pub const Tunnel = struct {
 
     /// Hand one direction to the kernel. Bytes still queued for the far side
     /// would land after the spliced ones, so only a destination the kernel
-    /// has caught up with can be taken over; a direction that never gets
-    /// there keeps copying, which costs nothing it wasn't paying already.
-    fn startRelay(self: *Tunnel, from_client: bool) void {
-        if (comptime !splice.supported) return;
+    /// has caught up with can be taken over (`busy` until then). Without a
+    /// pipe, or with a side closing, the direction keeps copying, which
+    /// costs nothing it wasn't paying already. The source must have no read
+    /// armed: call from inside its read callback, or after a pause taken
+    /// there.
+    fn startRelay(self: *Tunnel, from_client: bool) HandOver {
+        if (comptime !splice.supported) return .declined;
         // The two sockets are different types, hence the two arms, as in
         // `forward`.
         if (from_client) {
-            self.handOver(&self.up, &self.client.sock, &self.server.sock);
+            return self.handOver(&self.up, &self.client.sock, &self.server.sock);
         } else {
-            self.handOver(&self.down, &self.server.sock, &self.client.sock);
+            return self.handOver(&self.down, &self.server.sock, &self.client.sock);
         }
     }
 
-    fn handOver(self: *Tunnel, relay: *Relay, src: anytype, dst: anytype) void {
-        if (relay.isRunning()) return;
-        if (!src.isOpen() or !dst.isOpen()) return;
-        if (dst.writing or dst.buffered() != 0) return;
+    fn handOver(self: *Tunnel, relay: *Relay, src: anytype, dst: anytype) HandOver {
+        if (relay.isRunning()) return .started;
+        if (!src.isOpen() or !dst.isOpen()) return .declined;
+        if (dst.writing or dst.buffered() != 0) return .busy;
         // The relay's completions outlive this call; the fds have to too.
         self.client.sock.retain();
         self.server.sock.retain();
         if (!relay.start(&self.worker.loop, src.fd(), dst.fd())) {
             self.client.sock.release();
             self.server.sock.release();
-            return;
+            return .declined;
         }
         src.beginRelay();
+        return .started;
     }
 
     pub fn onRelayEof(self: *Tunnel, from_client: bool) void {
