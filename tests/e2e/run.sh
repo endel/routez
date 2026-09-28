@@ -232,6 +232,10 @@ kill $STALLED; wait $STALLED 2>/dev/null
 # A client sending into a connection that is flushing its last response.
 head -c 200000 /dev/urandom > "$WORK/www/small-sndbuf-200k.bin"
 SUITE=http check closing-input "$(python3 "$HERE/closing_flood.py" 18080 small-sndbuf-200k.bin 64 $SERVER 2>&1 | tail -1)" bounded
+# The same, with reading paused by the time the close starts: the input sent
+# while the file was read (1 s per read here) filled what a request may buffer.
+head -c 70000 /dev/urandom > "$WORK/www/slow-read-small-sndbuf.bin"
+SUITE=http check closing-input-paused "$(python3 "$HERE/closing_flood.py" 18080 slow-read-small-sndbuf.bin 64 $SERVER 2>&1 | tail -1)" bounded
 # Open-file cache: a change on disk shows within valid_ms (1 s by default).
 # The body if 200, else the status.
 ofc_get() {
