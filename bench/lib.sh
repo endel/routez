@@ -55,6 +55,20 @@ ZIG_CPU=native
 echo "building routez (ReleaseFast, -Dcpu=$ZIG_CPU)"
 (cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dcpu="$ZIG_CPU") || exit 1
 
+# The B side of an A/B (run.sh's ROUTEZ_B and QUIC_ZIG_B): copied as siblings,
+# so its build.zig.zon's ../quic-zig is the B quic-zig.
+ROUTEZ_B_BIN=
+if [ -n "${AB:-}" ]; then
+    if [ -d /src/routez-b ]; then SRC_B=/src/routez-b SRC_QZ_B=/src/quic-zig-b
+    else SRC_B=${ROUTEZ_B:-$SRC} SRC_QZ_B=${QUIC_ZIG_B:-$SRC_QZ}; fi
+    mkdir -p "$RUN/b/quic-zig"
+    rsync -a --exclude .git --exclude .zig-cache --exclude zig-out "$SRC_B/" "$RUN/b/routez/" || exit 1
+    rsync -a "$SRC_QZ_B"/{build.zig,build.zig.zon,src} "$RUN/b/quic-zig/" || exit 1
+    echo "building routez-b"
+    (cd "$RUN/b/routez" && zig build -Doptimize=ReleaseFast -Dcpu="$ZIG_CPU") || exit 1
+    ROUTEZ_B_BIN=$RUN/b/routez/zig-out/bin/routez
+fi
+
 build_tool() { # name: build bench/tools/<name>.zig next to the routez binary
     [ -x "$RUN/$1" ] && return 0
     zig build-exe -OReleaseFast -lc -mcpu="$ZIG_CPU" -femit-bin="$RUN/$1" "$HERE/tools/$1.zig" || exit 1
@@ -153,6 +167,12 @@ env_header() {
 date: $(date -u +%Y-%m-%dT%H:%MZ)
 routez: ${ROUTEZ_REV:-$(git_rev "$SRC")}
 quic-zig: ${QUIC_ZIG_REV:-$(git_rev "$SRC_QZ")}
+HDR
+    [ -z "$ROUTEZ_B_BIN" ] || cat <<HDR
+routez_b: ${ROUTEZ_B_REV:-$(git_rev "$SRC_B")}
+quic-zig_b: ${QUIC_ZIG_B_REV:-$(git_rev "$SRC_QZ_B")}
+HDR
+    cat <<HDR
 nginx: $(nginx -v 2>&1 | sed 's|.*/||')
 haproxy: $(haproxy -v | awk 'NR == 1 {sub(/-.*/, "", $3); print $3}')
 zig_cpu: $ZIG_CPU
