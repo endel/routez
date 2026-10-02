@@ -3,7 +3,9 @@
 # HTTP/1.1 from the same client so each server's h3-to-h1 ratio comes from one
 # place. Runs inside `bench/run.sh h3`'s container; on a Linux host it needs
 # root and what bench/Dockerfile installs.
-# Knobs: WORKERS, CONNS (QUIC connections), DURATION (seconds), ROUNDS, ROWS, OUT.
+# Knobs: WORKERS, CONNS (QUIC connections), DURATION (seconds), ROUNDS, ROWS,
+# SERVERS, OUT. With run.sh's ROUTEZ_B or QUIC_ZIG_B, SERVERS defaults to
+# "routez routez-b".
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORKERS=${WORKERS:-3}
@@ -47,11 +49,14 @@ for r in "${ROWS[@]}"; do
     [ -n "${R_ALPN[$r]:-}" ] || { echo "unknown row '$r'; have: ${ORDER[*]}"; exit 1; }
 done
 
-read -ra SERVERS <<< "${SERVERS:-nginx haproxy routez}"
-declare -A QUIC=([nginx]=19543 [routez]=19544 [haproxy]=19545)
-declare -A TLS=([nginx]=19443 [routez]=19444 [haproxy]=19445)
+DEFAULT_SERVERS="nginx haproxy routez"
+[ -n "$ROUTEZ_B_BIN" ] && DEFAULT_SERVERS="routez routez-b"
+read -ra SERVERS <<< "${SERVERS:-$DEFAULT_SERVERS}"
+declare -A QUIC=([nginx]=19543 [routez]=19544 [haproxy]=19545 [routez-b]=19546)
+declare -A TLS=([nginx]=19443 [routez]=19444 [haproxy]=19445 [routez-b]=19446)
 for s in "${SERVERS[@]}"; do
     [ -n "${QUIC[$s]:-}" ] || { echo "unknown server '$s'; have: ${!QUIC[*]}"; exit 1; }
+    [ "$s" != routez-b ] || [ -n "$ROUTEZ_B_BIN" ] || { echo "routez-b needs ROUTEZ_B or QUIC_ZIG_B"; exit 1; }
 done
 declare -A SPID=()
 serves() { [ "${R_SERVERS[$1]}" == all ] || [ "$2" != haproxy ]; }
@@ -97,6 +102,7 @@ for f in nginx-h3.conf haproxy-h3.cfg routez-h3.zon upstream.conf; do
          s|ROUTEZ_QLOG|$QLOG_DIR|g" \
         "$HERE/conf/$f" > "$RUN/$f"
 done
+sed "s|19544|${QUIC[routez-b]}|; s|19444|${TLS[routez-b]}|" "$RUN/routez-h3.zon" > "$RUN/routez-b-h3.zon"
 
 start upstream "$UP_CPUS" nginx -c "$RUN/upstream.conf"
 wait_port 19090
@@ -107,6 +113,7 @@ up_servers() {
             nginx) start nginx "$SERVER_CPUS" nginx -c "$RUN/nginx-h3.conf" ;;
             haproxy) start haproxy "$SERVER_CPUS" haproxy -f "$RUN/haproxy-h3.cfg" ;;
             routez) start routez "$SERVER_CPUS" "$ROOT/zig-out/bin/routez" "$RUN/routez-h3.zon" ;;
+            routez-b) start routez-b "$SERVER_CPUS" "$ROUTEZ_B_BIN" "$RUN/routez-b-h3.zon" ;;
         esac
         SPID[$s]=$STARTED
     done

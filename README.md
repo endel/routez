@@ -698,6 +698,14 @@ list of things to fix rather than a table routez wins. A figure whose spread
 across rounds overlaps the rival's counts as a tie, not a difference; several of
 them move enough between rounds that a few percent means nothing.
 
+To see what a change to routez or quic-zig did to HTTP/3, measure both builds in
+one run: `ROUTEZ_B=<tree>` and/or `QUIC_ZIG_B=<tree>` with `bench/run.sh h3`
+builds a second routez and measures it as `routez-b` next to the first, round
+for round. The report pairs each round's two figures and gives the median
+change, its range and a sign test. Two separate runs of one build on a busy Mac
+have differed by 90%; paired, one build against itself stays within ±2.2% on
+every row but the `h3-conns` ones, whose two regimes no pairing can rank.
+
 The HTTP rows live in `bench/workloads.txt`, one per line, and `WORKLOADS=` picks
 a subset. Knobs: `WORKERS` (3), `CONNS` (256), `DURATION` (10 s), `ROUNDS` (3),
 `ACCESS_LOG` (off). A row needing settings that would change every other row's
