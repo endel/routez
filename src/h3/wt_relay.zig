@@ -543,7 +543,7 @@ pub fn Relay(comptime Listener: type) type {
                 .path = try arena.dupe(u8, path),
                 .connect_headers = fwd.items,
                 .ipv6 = peer.addr == .ip6,
-                .ca = if (cfg.tls_ca) |ca| .{ .file = ca } else if (cfg.tls_verify) .system else .none,
+                .ca = if (cfg.tls_ca) |ca| .{ .file = ca } else .system,
                 .skip_cert_verify = !verify,
                 .tls_config = tls_config,
                 .loop = &w.loop,
