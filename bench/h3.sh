@@ -89,7 +89,8 @@ for f in 10k.bin:10240 1m.bin:$((1024 * 1024)); do
 done
 cat "$CERTS/server.crt" "$CERTS/server.key" > "$RUN/server.pem"
 # QLOG=1 makes routez write a per-connection trace, for working out where a
-# request's time went. It writes a file per connection and slows the server
+# request's time went (bench/qlog_gaps.py splits it into the server's share
+# and the client's). It writes a file per connection and slows the server
 # down, so it is a diagnostic run, not a measured one.
 QLOG_DIR=null
 if [ "${QLOG:-0}" != 0 ]; then
