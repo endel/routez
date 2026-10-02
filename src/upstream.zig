@@ -50,6 +50,7 @@ pub const Group = struct {
                 .server_name = cfg.tls_server_name orelse hp.host,
                 .alpn = &.{"http/1.1"},
                 .ca_bundle = worker.shared.upstreamCa(cfg.name),
+                .skip_cert_verify = !cfg.tls_verify and cfg.tls_ca == null,
                 .client_certificate = worker.shared.upstreamCert(cfg.name),
             };
         }
