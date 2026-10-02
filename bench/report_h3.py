@@ -77,6 +77,10 @@ def parse(text):
     rtt = stat_row(text, "smoothed RTT")
     if "mean" in rtt:
         out["rtt_us"] = parse_time(rtt["mean"])
+    for key, name in (("Cipher", "cipher"), ("Negotiated Group", "group")):
+        m = re.search(rf"^{key}: (\S+)", text, re.M)
+        if m:
+            out[name] = m.group(1)
     lost = stat_row(text, "packets lost")
     if lost.get("max") and float(lost["max"]) > 0:
         out["packets_lost"] = float(lost["max"])
@@ -125,6 +129,7 @@ for txt in sorted((out / "raw").glob("*.txt")):
              **{k: j.get(k) for k in ("p50_us", "p99_us", "max_us", "connect_us", "rtt_us")}},
             flags)
     r["cpu"] = cpu
+    r["tls"] = " over ".join(j[k] for k in ("cipher", "group") if k in j)
     runs.append(r)
 write_jsonl(out, runs)
 
@@ -192,12 +197,22 @@ for h3, h1 in PAIRS:
         cols.append(f"{100 * med(a, 'rps') / med(b, 'rps'):.0f}%" if a and b else "—")
     ratio.append(f"| {h3.replace('h3-', '')} | " + " | ".join(cols) + " |")
 
+# What h2load reports it negotiated, not what the servers were told.
+tls = {}
+for r in runs:
+    if r["tls"]:
+        tls.setdefault(r["tls"], set()).add(LABEL[r["server"]])
+if len(tls) == 1:
+    tls_text = f"TLS 1.3 with {next(iter(tls))}"
+else:
+    tls_text = "TLS 1.3 with " + "; ".join(f"{t} ({', '.join(sorted(s))})" for t, s in sorted(tls.items()))
+
 md = [
     f"nginx {env['nginx']}, HAProxy {env['haproxy']}, routez {env['routez']} (quic-zig {env['quic-zig']}), "
     f"{env['workers']} workers each. h2load {env['h2load']}, {env['conns']} connections, median of "
     f"{env['rounds']} × {env['duration']} s runs, in requests per second. Linux {env['kernel']}, "
-    f"{env['cpus']} cpus; pinning: {env['pinning']}. TLS 1.3 with TLS_AES_128_GCM_SHA256, X25519 and an "
-    f"ECDSA P-256 certificate. routez built with `-Dcpu={env['zig_cpu']}`. {env['date']}.",
+    f"{env['cpus']} cpus; pinning: {env['pinning']}. {tls_text} and an ECDSA P-256 certificate. "
+    f"routez built with `-Dcpu={env['zig_cpu']}`. {env['date']}.",
     "", *table, "", "— HAProxy isn't a file server.",
 ]
 if notes:
