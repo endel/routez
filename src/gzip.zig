@@ -468,7 +468,7 @@ test "an encoder's output is a gzip stream std can read back" {
     const alloc = std.testing.allocator;
     const e = try Encoder.create(alloc);
     defer e.destroy();
-    const body = "the quick brown fox jumps over the lazy dog, " ** 200;
+    const body = repeat("the quick brown fox jumps over the lazy dog, ", 200);
     // In pieces, as a proxied response arrives.
     try e.write(body[0 .. body.len / 3]);
     try e.write(body[body.len / 3 ..]);
@@ -496,4 +496,14 @@ test "an encoder's output is a gzip stream std can read back" {
     defer plain2.deinit();
     _ = try d2.reader.streamRemaining(&plain2.writer);
     try std.testing.expectEqualSlices(u8, "second", plain2.written());
+}
+
+/// `s` repeated `n` times, at compile time.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const out = comptime blk: {
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        break :blk buf;
+    };
+    return &out;
 }

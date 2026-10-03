@@ -329,7 +329,7 @@ const TestDir = struct {
     }
 
     fn path(self: *const TestDir, buf: []u8, name: []const u8) ![:0]const u8 {
-        return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ self.root, name });
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ self.root, name }, 0);
     }
 
     fn write(self: *const TestDir, name: []const u8, data: []const u8) !void {

@@ -178,7 +178,7 @@ test "fuzz: PROXY protocol header" {
         "PROXY TCP6 2001:db8::5 2001:db8::1 65535 80\r\n",
         "PROXY UNKNOWN\r\n",
         proxy_protocol.v2_signature ++ "\x21\x11\x00\x0c\xcb\x00\x71\x07\xc0\x00\x02\x01\x1f\x90\x01\xbb",
-        proxy_protocol.v2_signature ++ "\x21\x21\x00\x27" ++ "\x20\x01\x0d\xb8" ++ "\x00" ** 32 ++ "\x00\x50\x01\xbb\x04\x00\x00",
+        proxy_protocol.v2_signature ++ "\x21\x21\x00\x27" ++ "\x20\x01\x0d\xb8" ++ &@as([32]u8, @splat('\x00')) ++ "\x00\x50\x01\xbb\x04\x00\x00",
         proxy_protocol.v2_signature ++ "\x20\x00\x00\x00",
     });
 }

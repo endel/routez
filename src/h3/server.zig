@@ -401,7 +401,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
 
             fn resetAndGone(self: *Stream) void {
                 var s = self.session();
-                s.resetRequest(self.stream_id, @intFromEnum(event_loop.H3Error.internal_error));
+                s.resetRequest(self.stream_id, @backingInt(event_loop.H3Error.internal_error));
                 self.gone();
             }
 
@@ -509,7 +509,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             fn dsAbort(ptr: *anyopaque) void {
                 const self = cast(ptr);
                 var s = self.session();
-                s.resetRequest(self.stream_id, @intFromEnum(event_loop.H3Error.internal_error));
+                s.resetRequest(self.stream_id, @backingInt(event_loop.H3Error.internal_error));
                 self.detach();
             }
 
@@ -518,7 +518,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             fn fail(self: *Stream) void {
                 if (self.failed) return;
                 var s = self.session();
-                s.resetRequest(self.stream_id, @intFromEnum(event_loop.H3Error.internal_error));
+                s.resetRequest(self.stream_id, @backingInt(event_loop.H3Error.internal_error));
                 self.failed = true;
                 self.listener.worker.timers.defer_(&self.deferred);
             }

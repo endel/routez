@@ -187,7 +187,7 @@ test "lengths and integers" {
     try w.begin(Tag.sequence);
     try w.small(0);
     try w.unsigned(&.{ 0x00, 0x80 });
-    try w.primitive(Tag.octet_string, &([_]u8{0xaa} ** 200));
+    try w.primitive(Tag.octet_string, &(@as([200]u8, @splat(0xaa))));
     try w.end();
     const out = try w.toOwnedSlice();
     defer gpa.free(out);

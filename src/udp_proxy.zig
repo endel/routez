@@ -381,7 +381,7 @@ const Flow = struct {
 };
 
 test "route short and long headers by QUIC-LB server id" {
-    inline for (.{ null, [_]u8{0x42} ** 16 }) |key| {
+    inline for (.{ null, @as([16]u8, @splat(0x42)) }) |key| {
         var ids = [_][15]u8{ std.mem.zeroes([15]u8), std.mem.zeroes([15]u8) };
         ids[0][0..2].* = .{ 0x00, 0x01 };
         ids[1][0..2].* = .{ 0x00, 0x02 };

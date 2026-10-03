@@ -9,10 +9,10 @@ const std = @import("std");
 const access_log = @import("access_log.zig");
 
 /// Least severe level logged; `std.log.Level` as an integer.
-pub var level: std.atomic.Value(u8) = .init(@intFromEnum(std.log.Level.info));
+pub var level: std.atomic.Value(u8) = .init(@backingInt(std.log.Level.info));
 
 pub fn setLevel(l: std.log.Level) void {
-    level.store(@intFromEnum(l), .monotonic);
+    level.store(@backingInt(l), .monotonic);
 }
 
 /// `std_options.logFn`: `2026/09/18 20:00:32 [info] scope: message`, one
@@ -23,7 +23,7 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(l) > level.load(.monotonic)) return;
+    if (@backingInt(l) > level.load(.monotonic)) return;
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
     const t = access_log.civil(@divFloor(realtimeMs(), 1000));
@@ -86,7 +86,7 @@ pub fn acquire(io: std.Io, path: []const u8) !*File {
         return f;
     };
     const gpa = std.heap.smp_allocator;
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     errdefer gpa.free(path_z);
     const f = try gpa.create(File);
     errdefer gpa.destroy(f);
@@ -119,7 +119,7 @@ pub fn setErrorLog(io: std.Io, path: ?[]const u8) !void {
     const p = path orelse return;
     if (error_path) |cur| if (std.mem.eql(u8, cur, p)) return;
     const gpa = std.heap.smp_allocator;
-    const path_z = try gpa.dupeZ(u8, p);
+    const path_z = try gpa.dupeSentinel(u8, p, 0);
     errdefer gpa.free(path_z);
     try redirect(path_z, 2);
     if (error_path) |old| gpa.free(old);

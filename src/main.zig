@@ -87,7 +87,7 @@ const Generation = struct {
         const arena = g.arena_state.allocator();
         // Certificates written up to here are the ones this generation loads.
         const certificates_seen = manager.reloadStarting();
-        g.source = if (source) |s| try arena.dupeZ(u8, s) else config.readSource(io, arena, path) catch |err| {
+        g.source = if (source) |s| try arena.dupeSentinel(u8, s, 0) else config.readSource(io, arena, path) catch |err| {
             log.err("{s}: {s}", .{ path, @errorName(err) });
             return err;
         };

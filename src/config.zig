@@ -507,11 +507,11 @@ pub fn parse(arena: std.mem.Allocator, source: [:0]const u8, name: []const u8) e
     // std.zon generates code per field; Location has more than its default allows.
     @setEvalBranchQuota(4000);
     // All in `arena`; freeing on error would also touch strings still in `source`.
-    var diag: std.zon.parse.Diagnostics = .{};
-    const cfg = std.zon.parse.fromSliceAlloc(Config, arena, source, &diag, .{ .free_on_error = false }) catch |err| switch (err) {
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const cfg = std.zon.parse.fromSlice(Config, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            std.log.err("{s}: {f}", .{ name, diag });
+            diag.log(name);
             return error.InvalidConfig;
         },
     };

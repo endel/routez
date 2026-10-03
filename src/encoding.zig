@@ -92,7 +92,7 @@ pub const Accept = struct {
     /// then in `offered` order. A coding weighted below an explicit
     /// `identity` entry is left out, since the client would rather have
     /// the original; unlisted, identity ranks last.
-    pub fn rank(self: Accept, offered: []const Coding, out: *[std.meta.fields(Coding).len]Coding) []const Coding {
+    pub fn rank(self: Accept, offered: []const Coding, out: *[@typeInfo(Coding).@"enum".field_names.len]Coding) []const Coding {
         var n: usize = 0;
         const id = self.identity orelse 0;
         for (offered) |c| {

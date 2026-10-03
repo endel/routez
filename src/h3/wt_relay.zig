@@ -124,7 +124,7 @@ pub fn Relay(comptime Listener: type) type {
                     if (self.accepted) {
                         d.closeSessionWithError(self.down_sid, code, reason) catch {};
                     } else {
-                        d.resetRequest(self.down_sid, @intFromEnum(event_loop.H3Error.connect_error));
+                        d.resetRequest(self.down_sid, @backingInt(event_loop.H3Error.connect_error));
                     }
                 }
                 if (!from_up) {

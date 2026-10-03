@@ -56,7 +56,7 @@ const sendfile_chunk = 256 * 1024;
 /// read: the same trade as `inline_read_max`. Above it a body is worth asking
 /// about, since a cold 256 KB range would hold the loop for every chunk of it.
 const sendfile_trust_max = 1024 * 1024;
-const n_codings = std.meta.fields(Coding).len;
+const n_codings = @typeInfo(Coding).@"enum".field_names.len;
 const vary: Header = .{ .name = "vary", .value = "Accept-Encoding" };
 
 /// A path looked at for this response, and what was there.
@@ -251,7 +251,7 @@ pub const Transfer = struct {
             break :blk try ofc.probeCached(t.gpa, path);
         } else ofc.probe(t.gpa, t.io, path);
         const a = t.arena.allocator();
-        const stored = a.dupeZ(u8, path) catch return drop(answer);
+        const stored = a.dupeSentinel(u8, path, 0) catch return drop(answer);
         t.probes.append(a, .{ .path = stored, .answer = answer }) catch return drop(answer);
         return answer;
     }
@@ -309,7 +309,7 @@ pub const Transfer = struct {
         if (t.offered_len == 0) return false;
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         for (t.accepted[0..t.accepted_len]) |c| {
-            const vpath = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, c.suffix() }) catch continue;
+            const vpath = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ path, c.suffix() }, 0) catch continue;
             const e = switch (try t.probe(vpath, on_loop)) {
                 .entry => |e| e,
                 else => continue,
@@ -323,7 +323,7 @@ pub const Transfer = struct {
         }
         if (!t.varied) for (t.offered[0..t.offered_len]) |c| {
             if (std.mem.indexOfScalar(Coding, t.accepted[0..t.accepted_len], c) != null) continue;
-            const vpath = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, c.suffix() }) catch continue;
+            const vpath = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ path, c.suffix() }, 0) catch continue;
             switch (try t.probe(vpath, on_loop)) {
                 .entry => |e| if (e.outcome == .file) {
                     t.varied = true;
@@ -549,7 +549,7 @@ fn serve(ex: *Exchange, t: *Transfer) void {
 
 /// The entry's ETag for `coding`, formatted once per entry and coding.
 fn entryEtag(e: *ofc.Entry, coding: ?Coding) []const u8 {
-    const key: u8 = if (coding) |c| @as(u8, @intFromEnum(c)) + 1 else 0;
+    const key: u8 = if (coding) |c| @as(u8, @backingInt(c)) + 1 else 0;
     if (e.etag_len == 0 or e.etag_key != key) {
         const st = e.meta;
         const s = (if (coding) |c|

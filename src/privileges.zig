@@ -41,7 +41,7 @@ pub fn resolve(arena: std.mem.Allocator, user: []const u8, group: ?[]const u8) !
             ids.gid = pw.gid;
         }
     } else |_| {
-        const name = try arena.dupeZ(u8, user);
+        const name = try arena.dupeSentinel(u8, user, 0);
         var pw: std.c.passwd = undefined;
         var res: ?*std.c.passwd = null;
         if (std.c.getpwnam_r(name, &pw, &buf, buf.len, &res) != 0 or res == null) return error.UnknownUser;
@@ -51,7 +51,7 @@ pub fn resolve(arena: std.mem.Allocator, user: []const u8, group: ?[]const u8) !
         if (std.fmt.parseInt(std.posix.gid_t, g, 10)) |gid| {
             ids.gid = gid;
         } else |_| {
-            const name = try arena.dupeZ(u8, g);
+            const name = try arena.dupeSentinel(u8, g, 0);
             var gr: std.c.group = undefined;
             var res: ?*std.c.group = null;
             if (std.c.getgrnam_r(name, &gr, &buf, buf.len, &res) != 0 or res == null) return error.UnknownGroup;
@@ -103,7 +103,7 @@ pub fn prepareAcmeStorage(io: std.Io, arena: std.mem.Allocator, cfg: *const conf
 }
 
 fn chownPath(arena: std.mem.Allocator, path: []const u8, ids: Ids) !void {
-    const z = try arena.dupeZ(u8, path);
+    const z = try arena.dupeSentinel(u8, path, 0);
     const rc = chown(z, ids.uid, ids.gid);
     if (rc != 0) {
         log.err("chown {s}: {s}", .{ path, @tagName(std.posix.errno(rc)) });

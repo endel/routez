@@ -135,7 +135,7 @@ test "bcrypt truncates at 72 bytes, like htpasswd" {
     defer arena_state.deinit();
     // htpasswd -nbB -C 4 long <72 'a'> + "tail"
     const h = try parseOne(arena_state.allocator(), "long:$2y$04$BVp4Fww6nEJ4NKbbP3lmsuHCKO..tb3dTDC1U9StKELZxJNO9fDg.");
-    const base = "a" ** 72;
+    const base = &@as([72]u8, @splat('a'));
     try testing.expect(check(&h, base ++ "tail"));
     try testing.expect(check(&h, base));
     try testing.expect(!check(&h, base[0..71]));

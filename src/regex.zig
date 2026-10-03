@@ -491,7 +491,7 @@ const Parser = struct {
 
     fn literal(p: *Parser, c: u8) Error!u32 {
         if (p.ci and std.ascii.isAlphabetic(c)) {
-            var s = Set.initEmpty();
+            var s = Set.empty;
             s.set(std.ascii.toLower(c));
             s.set(std.ascii.toUpper(c));
             return p.addSet(s);
@@ -552,7 +552,7 @@ const Parser = struct {
         p.pos += 1;
         switch (e) {
             'd', 'D', 'w', 'W', 's', 'S' => {
-                var s = Set.initEmpty();
+                var s = Set.empty;
                 for (0..256) |i| {
                     const c: u8 = @intCast(i);
                     const in = switch (std.ascii.toLower(e)) {
@@ -611,7 +611,7 @@ const Parser = struct {
             negate = true;
             p.pos += 1;
         }
-        var set = Set.initEmpty();
+        var set = Set.empty;
         var first = true;
         while (true) {
             const c = p.peek() orelse return p.fail("missing ]");
@@ -941,7 +941,7 @@ test "no catastrophic backtracking" {
     defer re.deinit(testing.allocator);
     var s = try Scratch.init(testing.allocator, re.states());
     defer s.deinit(testing.allocator);
-    const input = "a" ** 30 ++ "!";
+    const input = repeat("a", 30) ++ "!";
     const t0 = monoNs();
     try testing.expect(!re.match(input, &s, null));
     const took = monoNs() - t0;
@@ -949,7 +949,7 @@ test "no catastrophic backtracking" {
     try testing.expect(took < 5 * std.time.ns_per_ms);
 
     // And at size: the worst pattern allowed on a 16 KiB path stays linear.
-    const big = try Regex.compile(testing.allocator, "(?:(a|aa)+)+(x|y)*b" ++ ".?" ** 200, .{}, null);
+    const big = try Regex.compile(testing.allocator, "(?:(a|aa)+)+(x|y)*b" ++ repeat(".?", 200), .{}, null);
     defer big.deinit(testing.allocator);
     var s2 = try Scratch.init(testing.allocator, big.states());
     defer s2.deinit(testing.allocator);
@@ -957,4 +957,14 @@ test "no catastrophic backtracking" {
     defer testing.allocator.free(path);
     @memset(path, 'a');
     try testing.expect(!big.match(path, &s2, null));
+}
+
+/// `s` repeated `n` times, at compile time.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const out = comptime blk: {
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        break :blk buf;
+    };
+    return &out;
 }

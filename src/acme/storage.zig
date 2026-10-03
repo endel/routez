@@ -20,7 +20,7 @@ const log = std.log.scoped(.acme);
 pub fn caDir(a: std.mem.Allocator, acme: config.Acme) ![]u8 {
     const uri = std.Uri.parse(acme.directory) catch return error.InvalidDirectoryUrl;
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = (uri.getHost(&host_buf) catch return error.InvalidDirectoryUrl).bytes;
+    const host = (std.Io.net.HostName.fromUri(uri, &host_buf) catch return error.InvalidDirectoryUrl).bytes;
     if (uri.port) |p| return std.fmt.allocPrint(a, "{s}/{s}_{d}", .{ acme.storage, host, p });
     return std.fmt.allocPrint(a, "{s}/{s}", .{ acme.storage, host });
 }

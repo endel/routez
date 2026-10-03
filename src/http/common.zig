@@ -115,7 +115,7 @@ pub fn formatHttpDate(epoch_seconds: i64, buf: *[29]u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
         wdays[@intCast(day.day % 7)],
         md.day_index + 1,
-        months[@intFromEnum(md.month) - 1],
+        months[@backingInt(md.month) - 1],
         yd.year,
         ds.getHoursIntoDay(),
         ds.getMinutesIntoHour(),
@@ -144,7 +144,7 @@ pub fn parseHttpDate(s: []const u8) ?i64 {
     while (y < year) : (y += 1) days += std.time.epoch.getDaysInYear(y);
     var m: u8 = 1;
     while (m < month) : (m += 1) {
-        days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
+        days += std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(m)));
     }
     days += day - 1;
     return days * 86400 + @as(i64, hh) * 3600 + @as(i64, mm) * 60 + ss;

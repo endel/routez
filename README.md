@@ -1,6 +1,6 @@
 ![routez](./routez.svg)
 
-An nginx-style edge server in Zig 0.16, on [libxev](https://github.com/mitchellh/libxev)
+An nginx-style edge server in Zig 0.17, on [libxev](https://github.com/mitchellh/libxev)
 and [quic-zig](../quic-zig). No C dependencies beyond libc.
 
 - HTTP/1.1 server: keep-alive, pipelining, chunked bodies, strict parsing
@@ -73,10 +73,10 @@ zig build -Doptimize=ReleaseFast
 
 `build.zig.zon` depends on `../quic-zig` by path.
 
-On arm64, check that the build has AES: Zig 0.16 reads some CPUs as
-`generic` without it (Apple silicon inside a Linux VM, for one), and TLS then
-encrypts in software, about 10× slower serving a 10 KB file. Build with
-`-Dcpu=native+aes+sha2` there.
+On arm64, check that the build has AES. Zig 0.16 read some CPUs as `generic`
+without it (Apple silicon inside a Linux VM, for one), and TLS then encrypted
+in software, about 10× slower serving a 10 KB file; 0.17 finds AES there. If
+`-Dcpu=native` still lacks it, build with `-Dcpu=native+aes+sha2`.
 
 ## Configuration
 

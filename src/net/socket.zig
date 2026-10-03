@@ -645,7 +645,7 @@ pub fn peerIpKey(fd: std.posix.socket_t) ?[16]u8 {
 /// An address's IP as 16 bytes, IPv4 (plain or mapped) in mapped form.
 pub fn ipKey(storage: *const std.posix.sockaddr.storage) ?[16]u8 {
     const sa: *const std.posix.sockaddr = @ptrCast(storage);
-    var key = [_]u8{0} ** 16;
+    var key = @as([16]u8, @splat(0));
     switch (sa.family) {
         std.posix.AF.INET => {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(storage));
@@ -740,7 +740,7 @@ test "wait_writable is a send the kernel accepts" {
 
 test "ipv6 formatting" {
     var buf: [64]u8 = undefined;
-    var a = [_]u8{0} ** 16;
+    var a = @as([16]u8, @splat(0));
     a[15] = 1;
     try std.testing.expectEqualStrings("::1", formatIp6(a, &buf));
     const b = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };

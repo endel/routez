@@ -2,7 +2,7 @@
 # Zig, Node.js with `ws`, and strace/perf/eu-stack for bench/profile.sh, all for
 # bench/run.sh.
 FROM ubuntu:26.04
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 ARG HAPROXY_BRANCH=3.2
 ARG WRK_VERSION=4.2.0
 ENV DEBIAN_FRONTEND=noninteractive

@@ -49,7 +49,8 @@ trap cleanup EXIT
 
 # Zig 0.16 detects some arm64 cores as `generic` without AES (Apple silicon
 # under Docker Desktop reports CPU part 0x000), leaving AES-GCM in software
-# while OpenSSL finds the instructions at runtime.
+# while OpenSSL finds the instructions at runtime. 0.17 finds them; naming
+# them keeps a build comparable with one from 0.16.
 ZIG_CPU=native
 [ "$(uname -m)" == aarch64 ] && grep -qw aes /proc/cpuinfo && grep -qw sha2 /proc/cpuinfo && ZIG_CPU=native+aes+sha2
 echo "building routez (ReleaseFast, -Dcpu=$ZIG_CPU)"

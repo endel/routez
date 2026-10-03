@@ -111,7 +111,7 @@ pub const Client = struct {
         const resp = try self.send(.GET, self.directory_url, null, null);
         defer self.freeResponse(resp);
         if (resp.status != .ok) {
-            log.err("directory {s}: HTTP {d}", .{ self.directory_url, @intFromEnum(resp.status) });
+            log.err("directory {s}: HTTP {d}", .{ self.directory_url, @backingInt(resp.status) });
             return error.AcmeDirectory;
         }
         const d = try std.json.parseFromSliceLeaky(Directory, self.arena_state.allocator(), resp.body, json_options);
@@ -200,7 +200,7 @@ pub const Client = struct {
             const body = try jws.sign(self.gpa, self.account_key, signer, nonce, url, payload);
             defer self.gpa.free(body);
             const resp = try self.send(.POST, url, body, accept);
-            const code = @intFromEnum(resp.status);
+            const code = @backingInt(resp.status);
             if (code >= 200 and code < 300) return resp;
             defer self.freeResponse(resp);
             const problem = std.json.parseFromSlice(Problem, self.gpa, resp.body, json_options) catch null;

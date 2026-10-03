@@ -204,7 +204,7 @@ test "v1 malformed" {
         } else |_| {}
     }
     // No line end within 107 bytes.
-    const long = "PROXY UNKNOWN " ++ "x" ** 93;
+    const long = "PROXY UNKNOWN " ++ &@as([93]u8, @splat('x'));
     try testing.expectEqual(@as(?Header, null), try parse(long[0 .. v1_max - 1]));
     try testing.expectError(error.Invalid, parse(long));
     try testing.expectEqual(@as(usize, v1_max), (try parse(long[0 .. v1_max - 2] ++ "\r\n")).?.len);
@@ -222,8 +222,8 @@ test "v2 addresses, LOCAL and TLVs" {
     try testing.expectEqualSlices(u8, &v4(203, 0, 113, 7), &h.source.?.ip);
     try testing.expectEqual(@as(u16, 8080), h.source.?.port);
 
-    const six = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{9}; // 2001:db8::9
-    const inet6 = six ++ ([_]u8{0} ** 16) ++ [_]u8{ 0x00, 0x50, 0x01, 0xbb };
+    const six = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{9}; // 2001:db8::9
+    const inet6 = six ++ (@as([16]u8, @splat(0))) ++ [_]u8{ 0x00, 0x50, 0x01, 0xbb };
     const h6 = (try parse(comptime v2(1, 0x21, &inet6))).?;
     try testing.expectEqualSlices(u8, &six, &h6.source.?.ip);
     try testing.expectEqual(@as(u16, 80), h6.source.?.port);
@@ -237,7 +237,7 @@ test "v2 addresses, LOCAL and TLVs" {
     // LOCAL ignores whatever address block comes with it.
     try testing.expectEqual(@as(?Address, null), (try parse(comptime v2(0, 0x11, &inet))).?.source);
     try testing.expectEqual(@as(?Address, null), (try parse(comptime v2(1, 0x00, ""))).?.source);
-    try testing.expectEqual(@as(?Address, null), (try parse(comptime v2(1, 0x31, &([_]u8{0} ** 216)))).?.source);
+    try testing.expectEqual(@as(?Address, null), (try parse(comptime v2(1, 0x31, &(@as([216]u8, @splat(0)))))).?.source);
 }
 
 test "v2 incomplete, then complete" {
