@@ -58,7 +58,7 @@ pub fn build(arena: std.mem.Allocator, cfg: *const config.Config) !Guards {
                 if (!gop.found_existing) gop.value_ptr.* = try loadUserFile(arena, ab.user_file);
                 p.auth = .{
                     .file = gop.value_ptr.*,
-                    .challenge = try std.fmt.allocPrint(arena, "Basic realm=\"{s}\", charset=\"UTF-8\"", .{ab.realm}),
+                    .challenge = try arena.print("Basic realm=\"{s}\", charset=\"UTF-8\"", .{ab.realm}),
                 };
                 g.any_auth = true;
             }

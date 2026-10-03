@@ -493,7 +493,7 @@ fn serve(ex: *Exchange, t: *Transfer) void {
             .ignore => {},
             .unsatisfiable => {
                 release(ex);
-                const cr = std.fmt.allocPrint(a, "bytes */{d}", .{st.size}) catch return ex.sendError(500);
+                const cr = a.print("bytes */{d}", .{st.size}) catch return ex.sendError(500);
                 const headers = [_]Header{ .{ .name = "content-range", .value = cr }, vary };
                 ex.respondHead(&.{ .status = 416, .headers = headers[0..if (t.varied) 2 else 1], .content_length = 0 });
                 return ex.respondEnd();
@@ -502,7 +502,7 @@ fn serve(ex: *Exchange, t: *Transfer) void {
                 range_start = r.start;
                 range_end = r.end;
                 status = 206;
-                content_range = std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ r.start, r.end - 1, st.size }) catch return fail(ex);
+                content_range = a.print("bytes {d}-{d}/{d}", .{ r.start, r.end - 1, st.size }) catch return fail(ex);
             },
         };
     }
@@ -577,7 +577,7 @@ fn fail(ex: *Exchange) void {
 
 fn redirectToDir(ex: *Exchange) void {
     const a = ex.arena();
-    const location = std.fmt.allocPrint(a, "{s}/{s}{s}", .{
+    const location = a.print("{s}/{s}{s}", .{
         ex.req.path,
         if (ex.req.query != null) "?" else "",
         ex.req.query orelse "",

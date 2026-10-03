@@ -22,7 +22,7 @@ const quic = @import("quic");
 const xev = quic.event_loop.Xev;
 const socket = @import("socket.zig");
 
-pub const supported = builtin.os.tag == .linux;
+pub const supported = builtin.target.os.tag == .linux;
 
 /// What one splice asks for; the pipe's own capacity is the real cap.
 const chunk = 1 << 20;

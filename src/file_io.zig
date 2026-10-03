@@ -180,7 +180,7 @@ pub const Meta = struct {
 /// from its caches, and otherwise fail with `error.WouldBlock` so the work
 /// goes to the pool. Cached files then cost no round trip. Linux only:
 /// elsewhere nothing says whether a call would wait.
-pub const cached = if (builtin.os.tag == .linux) linux_cached else struct {
+pub const cached = if (builtin.target.os.tag == .linux) linux_cached else struct {
     pub fn enabled() bool {
         return false;
     }

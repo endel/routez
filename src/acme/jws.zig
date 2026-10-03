@@ -43,7 +43,7 @@ pub fn thumbprint(pk: Ecdsa.PublicKey) [43]u8 {
 /// `token.thumbprint`, what an HTTP-01 challenge response must contain.
 pub fn keyAuthorization(gpa: std.mem.Allocator, token: []const u8, pk: Ecdsa.PublicKey) ![]u8 {
     const tp = thumbprint(pk);
-    return std.fmt.allocPrint(gpa, "{s}.{s}", .{ token, &tp });
+    return gpa.print("{s}.{s}", .{ token, &tp });
 }
 
 /// Who signs: an account URL once registered, else the public key itself.
@@ -56,17 +56,17 @@ pub fn sign(gpa: std.mem.Allocator, kp: x509.KeyPair, signer: Signer, nonce: []c
     const a = arena_state.allocator();
 
     const header = switch (signer) {
-        .kid => |kid| try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"kid\":{f},\"nonce\":{f},\"url\":{f}}}", .{ std.json.fmt(kid, .{}), std.json.fmt(nonce, .{}), std.json.fmt(url, .{}) }),
-        .jwk => try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":{f},\"url\":{f}}}", .{ try jwk(a, kp.public_key), std.json.fmt(nonce, .{}), std.json.fmt(url, .{}) }),
+        .kid => |kid| try a.print("{{\"alg\":\"ES256\",\"kid\":{f},\"nonce\":{f},\"url\":{f}}}", .{ std.json.fmt(kid, .{}), std.json.fmt(nonce, .{}), std.json.fmt(url, .{}) }),
+        .jwk => try a.print("{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":{f},\"url\":{f}}}", .{ try jwk(a, kp.public_key), std.json.fmt(nonce, .{}), std.json.fmt(url, .{}) }),
     };
     const protected = try base64UrlAlloc(a, header);
     const body = try base64UrlAlloc(a, payload);
-    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ protected, body });
+    const signing_input = try a.print("{s}.{s}", .{ protected, body });
     // JWS ES256 wants the raw r || s, not DER.
     const sig = try kp.sign(signing_input, null);
     var sig_b64: [86]u8 = undefined;
     _ = b64.encode(&sig_b64, &sig.toBytes());
-    return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"{s}\",\"signature\":\"{s}\"}}", .{ protected, body, &sig_b64 });
+    return gpa.print("{{\"protected\":\"{s}\",\"payload\":\"{s}\",\"signature\":\"{s}\"}}", .{ protected, body, &sig_b64 });
 }
 
 const testing = std.testing;
@@ -111,7 +111,7 @@ test "signed JWS verifies and carries the protected header" {
 
     var raw_sig: [64]u8 = undefined;
     try dec.decode(&raw_sig, parsed.value.signature);
-    const input = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ parsed.value.protected, parsed.value.payload });
+    const input = try gpa.print("{s}.{s}", .{ parsed.value.protected, parsed.value.payload });
     defer gpa.free(input);
     try Ecdsa.Signature.fromBytes(raw_sig).verify(input, kp.public_key);
 }

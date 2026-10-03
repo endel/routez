@@ -21,17 +21,17 @@ pub fn caDir(a: std.mem.Allocator, acme: config.Acme) ![]u8 {
     const uri = std.Uri.parse(acme.directory) catch return error.InvalidDirectoryUrl;
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = (std.Io.net.HostName.fromUri(uri, &host_buf) catch return error.InvalidDirectoryUrl).bytes;
-    if (uri.port) |p| return std.fmt.allocPrint(a, "{s}/{s}_{d}", .{ acme.storage, host, p });
-    return std.fmt.allocPrint(a, "{s}/{s}", .{ acme.storage, host });
+    if (uri.port) |p| return a.print("{s}/{s}_{d}", .{ acme.storage, host, p });
+    return a.print("{s}/{s}", .{ acme.storage, host });
 }
 
 pub fn accountKeyPath(a: std.mem.Allocator, acme: config.Acme) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}/account.key", .{try caDir(a, acme)});
+    return a.print("{s}/account.key", .{try caDir(a, acme)});
 }
 
 /// Names are validated as DNS names, so any of them is a safe file name.
 pub fn bundlePath(a: std.mem.Allocator, acme: config.Acme, names: []const []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}/{s}.pem", .{ try caDir(a, acme), config.acmeStorageName(names) });
+    return a.print("{s}/{s}.pem", .{ try caDir(a, acme), config.acmeStorageName(names) });
 }
 
 pub const Bundle = struct {
@@ -85,7 +85,7 @@ pub fn bestBundle(a: std.mem.Allocator, io: std.Io, acme: config.Acme, names: []
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pem")) continue;
-        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir_path, entry.name });
+        const path = try a.print("{s}/{s}", .{ dir_path, entry.name });
         const b = loadAnyBundle(a, path) catch continue;
         if (b.not_after <= now) continue;
         const covered = coverage(b.chain[0], names);
@@ -126,7 +126,7 @@ pub fn probeWritable(io: std.Io, acme: config.Acme) !void {
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     const dir = try caDir(fba.allocator(), acme);
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .fromMode(0o700));
-    const probe = try std.fmt.allocPrint(fba.allocator(), "{s}/.probe", .{dir});
+    const probe = try fba.allocator().print("{s}/.probe", .{dir});
     // Never materialized: deinit removes the temporary file.
     var af = try std.Io.Dir.cwd().createFileAtomic(io, probe, .{ .permissions = .fromMode(0o600), .replace = true });
     defer af.deinit(io);
@@ -215,7 +215,7 @@ test "bundle round trip through writeAtomic" {
 
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
-    const path = try std.fmt.allocPrint(a, "{s}/ca/example.com.pem", .{dir});
+    const path = try a.print("{s}/ca/example.com.pem", .{dir});
     const names = [_][]const u8{"example.com"};
     const kp = x509.KeyPair.generate(io);
     const cert = try x509.selfSigned(a, kp, &names, 1_700_000_000, 4_000_000_000, @splat(1));

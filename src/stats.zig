@@ -40,11 +40,11 @@ pub const Counter = struct {
 
     const Slot = struct { v: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0) };
 
-    pub fn fetchAdd(self: *Counter, n: u64, comptime order: std.builtin.AtomicOrder) u64 {
+    pub fn fetchAdd(self: *Counter, n: u64, comptime order: std.lang.AtomicOrder) u64 {
         return self.slots[shardIndex()].v.fetchAdd(n, order);
     }
 
-    pub fn load(self: *const Counter, comptime order: std.builtin.AtomicOrder) u64 {
+    pub fn load(self: *const Counter, comptime order: std.lang.AtomicOrder) u64 {
         var sum: u64 = 0;
         for (&self.slots) |*s| sum +%= s.v.load(order);
         return sum;

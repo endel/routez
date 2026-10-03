@@ -34,7 +34,7 @@ const shared_read_buf = xev.backend == .epoll;
 pub const read_buffer_size = if (shared_read_buf) 64 * 1024 else 16 * 1024;
 threadlocal var thread_read_buf: [read_buffer_size]u8 = undefined;
 /// SIGPIPE is ignored process-wide; MSG_NOSIGNAL covers Linux regardless.
-const send_flags: c_int = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
+const send_flags: c_int = if (builtin.target.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
 /// Owners stop producing output above this.
 pub const high_water = 256 * 1024;
 pub const low_water = 64 * 1024;
@@ -574,7 +574,7 @@ const SendfileResult = struct {
 
 /// One non-blocking sendfile of up to `len` bytes of `file` at `offset`.
 fn sendfile(sock: std.posix.socket_t, file: std.posix.fd_t, offset: u64, len: u64) SendfileResult {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         var off: i64 = @intCast(offset);
         const rc = std.os.linux.sendfile(sock, file, &off, @intCast(@min(len, 0x7fff_f000)));
         return switch (std.os.linux.errno(rc)) {
@@ -583,7 +583,7 @@ fn sendfile(sock: std.posix.socket_t, file: std.posix.fd_t, offset: u64, len: u6
             .INVAL, .NOSYS, .OPNOTSUPP => .{ .sent = 0, .status = .unsupported },
             else => .{ .sent = 0, .status = .failed },
         };
-    } else if (comptime builtin.os.tag.isDarwin()) {
+    } else if (comptime builtin.target.os.tag.isDarwin()) {
         // Darwin reports what went out through `n`, also on EAGAIN.
         var n: std.c.off_t = @intCast(@min(len, std.math.maxInt(i32)));
         const rc = std.c.sendfile(file, sock, @intCast(offset), &n, null, 0);
@@ -601,7 +601,7 @@ fn sendfile(sock: std.posix.socket_t, file: std.posix.fd_t, offset: u64, len: u6
 
 /// Accept one queued connection without waiting; null when none is queued.
 pub fn acceptNow(listen_fd: std.posix.socket_t) ?std.posix.socket_t {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         const fd = std.c.accept4(listen_fd, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC);
         return if (fd < 0) null else fd;
     }
@@ -628,7 +628,7 @@ pub fn setNoDelay(fd: std.posix.socket_t) void {
 }
 
 fn setNoSigpipe(fd: std.posix.socket_t) void {
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         const one: c_int = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
     }

@@ -442,7 +442,7 @@ pub const Exchange = struct {
         const args = self.req.query orelse return uri;
         if (!keep_args) return uri;
         const sep: u8 = if (std.mem.indexOfScalar(u8, uri, '?') != null) '&' else '?';
-        return std.fmt.allocPrint(self.arena(), "{s}{c}{s}", .{ uri, sep, args });
+        return self.arena().print("{s}{c}{s}", .{ uri, sep, args });
     }
 
     fn sendRedirect(self: *Exchange, status: u16, location: []const u8) void {
@@ -601,7 +601,7 @@ pub const Exchange = struct {
                 for (list.items) |*h| {
                     // The compressed body is a different representation.
                     if (std.ascii.eqlIgnoreCase(h.name, "etag") and !std.mem.startsWith(u8, h.value, "W/")) {
-                        h.value = std.fmt.allocPrint(a, "W/{s}", .{h.value}) catch h.value;
+                        h.value = a.print("W/{s}", .{h.value}) catch h.value;
                     }
                 }
                 list.appendAssumeCapacity(.{ .name = "content-encoding", .value = "gzip" });

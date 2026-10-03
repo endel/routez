@@ -41,7 +41,7 @@ pub fn describe(arena: std.mem.Allocator, der: []const u8) Error!Info {
         .s_dn = try formatName(arena, der[subject.start..subject.end]),
         .i_dn = try formatName(arena, der[issuer.start..issuer.end]),
         .serial = try serialHex(arena, serial),
-        .fingerprint = try std.fmt.allocPrint(arena, "{x}", .{&fp}),
+        .fingerprint = try arena.print("{x}", .{&fp}),
     };
 }
 
@@ -49,7 +49,7 @@ fn serialHex(arena: std.mem.Allocator, raw: []const u8) Error![]const u8 {
     var s = raw;
     // A positive serial with its top bit set carries a leading zero byte.
     if (s.len > 1 and s[0] == 0) s = s[1..];
-    return std.fmt.allocPrint(arena, "{X}", .{s});
+    return arena.print("{X}", .{s});
 }
 
 /// `at` is where the element's tag is; `start..end` its contents.

@@ -43,7 +43,7 @@ pub const Diagnostic = struct {
 
 pub const Error = error{ InvalidPattern, OutOfMemory };
 
-const Set = std.StaticBitSet(256);
+const Set = std.bit_set.Static(256);
 
 const Assert = enum { begin, end, word, not_word };
 

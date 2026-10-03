@@ -144,7 +144,7 @@ pub fn addVary(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(Header)) void
             const t = std.mem.trim(u8, f, " \t");
             if (std.mem.eql(u8, t, "*") or std.ascii.eqlIgnoreCase(t, "accept-encoding")) return;
         }
-        h.value = std.fmt.allocPrint(a, "{s}, Accept-Encoding", .{h.value}) catch return;
+        h.value = a.print("{s}, Accept-Encoding", .{h.value}) catch return;
         return;
     }
     list.appendAssumeCapacity(.{ .name = "vary", .value = "Accept-Encoding" });

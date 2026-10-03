@@ -221,7 +221,7 @@ pub const Client = struct {
         if (self.kid != null) return;
         const d = try self.fetchDirectory();
         const payload = if (email) |e|
-            try std.fmt.allocPrint(self.gpa, "{{\"termsOfServiceAgreed\":true,\"contact\":[{f}]}}", .{std.json.fmt(try std.fmt.allocPrint(self.arena_state.allocator(), "mailto:{s}", .{e}), .{})})
+            try self.gpa.print("{{\"termsOfServiceAgreed\":true,\"contact\":[{f}]}}", .{std.json.fmt(try self.arena_state.allocator().print("mailto:{s}", .{e}), .{})})
         else
             try self.gpa.dupe(u8, "{\"termsOfServiceAgreed\":true}");
         defer self.gpa.free(payload);
@@ -263,7 +263,7 @@ pub const Client = struct {
         if (std.mem.eql(u8, order.status, "ready")) {
             const csr = try x509.csr(a, cert_key, names);
             const csr_b64 = try jws.base64UrlAlloc(a, csr);
-            const fin_payload = try std.fmt.allocPrint(a, "{{\"csr\":\"{s}\"}}", .{csr_b64});
+            const fin_payload = try a.print("{{\"csr\":\"{s}\"}}", .{csr_b64});
             const fin = try self.post(order.finalize, fin_payload, null);
             defer self.freeResponse(fin);
             finalized.* = try self.gpa.dupe(u8, order_url);

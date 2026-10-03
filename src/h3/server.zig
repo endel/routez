@@ -463,7 +463,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 const arena = arena_state.allocator();
 
                 var list: std.ArrayListUnmanaged(qpack.Header) = .empty;
-                const status = std.fmt.allocPrint(arena, "{d}", .{r.status}) catch return self.fail();
+                const status = arena.print("{d}", .{r.status}) catch return self.fail();
                 list.append(arena, .{ .name = ":status", .value = status }) catch return self.fail();
                 const interim = r.status < 200;
                 if (!interim) {
@@ -471,7 +471,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                     list.append(arena, .{ .name = "date", .value = self.listener.worker.dateHeader() }) catch return self.fail();
                     if (r.content_length) |cl| {
                         if (!common.statusHasNoBody(r.status)) {
-                            const v = std.fmt.allocPrint(arena, "{d}", .{cl}) catch return self.fail();
+                            const v = arena.print("{d}", .{cl}) catch return self.fail();
                             list.append(arena, .{ .name = "content-length", .value = v }) catch return self.fail();
                         }
                     }

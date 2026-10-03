@@ -23,8 +23,8 @@ pub const Ids = struct {
 pub var dropped: bool = false;
 
 const c = struct {
-    extern "c" fn setgroups(n: if (builtin.os.tag == .linux) usize else c_int, list: [*]const std.posix.gid_t) c_int;
-    extern "c" fn initgroups(user: [*:0]const u8, gid: if (builtin.os.tag == .linux) std.posix.gid_t else c_int) c_int;
+    extern "c" fn setgroups(n: if (builtin.target.os.tag == .linux) usize else c_int, list: [*]const std.posix.gid_t) c_int;
+    extern "c" fn initgroups(user: [*:0]const u8, gid: if (builtin.target.os.tag == .linux) std.posix.gid_t else c_int) c_int;
 };
 
 /// Look up `user` and `group` (names or numeric ids).
@@ -71,7 +71,7 @@ pub fn drop(ids: Ids) !void {
         return;
     }
     // macOS takes the gid as a c_int; nobody's is -2 there.
-    const gid_arg = if (builtin.os.tag == .linux) ids.gid else @as(c_int, @bitCast(ids.gid));
+    const gid_arg = if (builtin.target.os.tag == .linux) ids.gid else @as(c_int, @bitCast(ids.gid));
     const groups_rc = if (ids.name) |n| c.initgroups(n, gid_arg) else c.setgroups(1, &[_]std.posix.gid_t{ids.gid});
     if (groups_rc != 0) return error.SetGroupsFailed;
     if (std.c.setgid(ids.gid) != 0) return error.SetGidFailed;

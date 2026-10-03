@@ -237,9 +237,9 @@ pub const Crc32 = struct {
         return ~self.v;
     }
 
-    const has_clmul = builtin.cpu.arch == .x86_64 and
-        std.Target.x86.featureSetHas(builtin.cpu.features, .pclmul) and
-        std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_1);
+    const has_clmul = builtin.target.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHas(builtin.target.cpu.features, .pclmul) and
+        std.Target.x86.featureSetHas(builtin.target.cpu.features, .sse4_1);
     const V = @Vector(2, u64);
 
     /// PCLMULQDQ with `imm` choosing the halves, as `_mm_clmulepi64_si128`.
