@@ -12,7 +12,8 @@
 #
 # ROUTEZ_B and/or QUIC_ZIG_B (h3 only) build a second routez from those trees
 # and run it as server `routez-b` beside the first, round for round: an A/B of
-# two builds that one machine's drift can't tell apart run to run.
+# two builds that one machine's drift can't tell apart run to run. ZIG_B_DIR, a
+# Linux Zig directory on the host, builds the B side with that Zig instead.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -42,6 +43,7 @@ B_MOUNTS=()
 if [ -n "$AB" ]; then
     export AB ROUTEZ_B_REV="${ROUTEZ_B_REV:-$(rev "$RZB")}" QUIC_ZIG_B_REV="${QUIC_ZIG_B_REV:-$(rev "$QZB")}"
     B_MOUNTS=(-v "$RZB:/src/routez-b:ro" -v "$QZB:/src/quic-zig-b:ro")
+    [ -z "${ZIG_B_DIR:-}" ] || B_MOUNTS+=(-v "$(cd "$ZIG_B_DIR" && pwd):/opt/zig-b:ro")
 fi
 docker build -q -t "$IMAGE" --build-arg "HAPROXY_BRANCH=${HAPROXY_BRANCH:-3.2}" - < "$HERE/Dockerfile" >/dev/null
 # tw_reuse and the wide port range keep the handshake row from running out of

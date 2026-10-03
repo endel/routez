@@ -65,8 +65,10 @@ if [ -n "${AB:-}" ]; then
     mkdir -p "$RUN/b/quic-zig"
     rsync -a --exclude .git --exclude .zig-cache --exclude zig-out "$SRC_B/" "$RUN/b/routez/" || exit 1
     rsync -a "$SRC_QZ_B"/{build.zig,build.zig.zon,src} "$RUN/b/quic-zig/" || exit 1
-    echo "building routez-b"
-    (cd "$RUN/b/routez" && zig build -Doptimize=ReleaseFast -Dcpu="$ZIG_CPU") || exit 1
+    ZIG_B=zig
+    [ -x /opt/zig-b/zig ] && ZIG_B=/opt/zig-b/zig
+    echo "building routez-b (zig $("$ZIG_B" version))"
+    (cd "$RUN/b/routez" && "$ZIG_B" build -Doptimize=ReleaseFast -Dcpu="$ZIG_CPU") || exit 1
     ROUTEZ_B_BIN=$RUN/b/routez/zig-out/bin/routez
 fi
 
@@ -172,10 +174,12 @@ HDR
     [ -z "$ROUTEZ_B_BIN" ] || cat <<HDR
 routez_b: ${ROUTEZ_B_REV:-$(git_rev "$SRC_B")}
 quic-zig_b: ${QUIC_ZIG_B_REV:-$(git_rev "$SRC_QZ_B")}
+zig_b: $("$ZIG_B" version)
 HDR
     cat <<HDR
 nginx: $(nginx -v 2>&1 | sed 's|.*/||')
 haproxy: $(haproxy -v | awk 'NR == 1 {sub(/-.*/, "", $3); print $3}')
+zig: $(zig version)
 zig_cpu: $ZIG_CPU
 kernel: $(uname -r)
 cpus: $(nproc)
