@@ -315,6 +315,13 @@ pub const Exchange = struct {
 
     /// Route and hand the request to its handler.
     pub fn start(self: *Exchange) void {
+        // A connection opened before its client was banned, or a client a
+        // `real_ip_from` proxy names: closed unanswered, logged as nginx's 444.
+        if (self.worker.isBanned(self.req.client_ip)) {
+            stats.inc(&stats.requests_banned);
+            self.status = 444;
+            return self.respondAbort();
+        }
         if (self.req.path.len == 0) return self.sendError(400);
         // HTTP-01 validation comes over plain HTTP, ahead of any location.
         if (std.mem.eql(u8, self.req.scheme, "http")) {

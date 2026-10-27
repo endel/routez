@@ -13,10 +13,20 @@ const timers = @import("../timers.zig");
 const tls = @import("../net/tls.zig");
 const wt_relay = @import("wt_relay.zig");
 const steering = @import("../steering.zig");
+const stats = @import("../stats.zig");
 
 fn onForeign(ctx: ?*anyopaque, dg: *const event_loop.ForeignDatagram) void {
     const w: *Worker = @ptrCast(@alignCast(ctx.?));
     steering.registry.route(w.io, dg);
+}
+
+/// quic-zig asks before an Initial opens a connection.
+fn admitSource(ctx: ?*anyopaque, peer: *const std.posix.sockaddr.storage) bool {
+    const w: *Worker = @ptrCast(@alignCast(ctx.?));
+    const ip = socket.ipKey(peer) orelse return true;
+    if (!w.isBanned(ip)) return true;
+    stats.inc(&stats.refused_banned);
+    return false;
 }
 const worker_mod = @import("../worker.zig");
 const Worker = worker_mod.Worker;
@@ -115,6 +125,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 // our packets after a client's address changes can pass them on.
                 .quic_lb = steering.lbConfig(w.id),
                 .foreign_datagram = .{ .ctx = w, .func = onForeign },
+                .source_filter = .{ .ctx = w, .func = admitSource },
                 .retry_token_key = w.shared.quic_keys.retry,
                 .static_reset_key = w.shared.quic_keys.reset,
                 .send_buffer_size = 4 * 1024 * 1024,

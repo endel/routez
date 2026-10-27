@@ -503,6 +503,42 @@ SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 700 ] && [ 
 [ $waited -lt 12000 ] || { echo "  quic-idle client:"; tail -3 "$WORK/idle_client.log"; echo "  server:"; tail -3 "$WORK/idle.log"; }
 kill $IDLE; wait $IDLE 2>/dev/null
 
+# Bans through the control socket, at accept, QUIC Initial and request start,
+# for addresses and networks; limit_req counting a /24 as one client. Clients
+# behind the trusted 127.0.0.1 are named by X-Forwarded-For.
+cat > "$WORK/bans.zon" <<EOF2
+.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .real_ip_from = .{"127.0.0.1"}, .servers = .{.{
+    .listen = .{ .{ .address = "127.0.0.1", .port = 18448 }, .{ .address = "127.0.0.1", .port = 18449, .tls = true, .quic = true } },
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{
+        .{ .prefix = "/", .@"return" = .{ .body = "ok" } },
+        .{ .prefix = "/net", .@"return" = .{ .body = "ok" }, .limit_req = .{ .rate = 1, .burst = 1, .ipv4_prefix = 24 } },
+        .{ .prefix = "/metrics", .metrics = true },
+    },
+}} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/bans.zon" 2> "$WORK/bans.log" & BANS=$!; PIDS+=($BANS)
+wait_port 18448
+ctl() { "$ROOT/zig-out/bin/routez" ctl -s "$WORK/ctl.sock" "$@"; }
+as() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 -H "X-Forwarded-For: $1" "http://127.0.0.1:18448${2:-/}"; }
+h3() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 --http3-only --cacert "$CERTS/ca.crt" https://127.0.0.1:18449/; }
+SUITE=bans check empty "$(ctl bans)" "ok"
+SUITE=bans check ban-address "$(ctl ban 10.1.2.3 60) $(as 10.1.2.3) $(as 10.1.2.4)" "ok 000 200"
+SUITE=bans check ban-network "$(ctl ban 10.9.0.0/16 600) $(as 10.9.200.1) $(as 10.10.0.1)" "ok 000 200"
+SUITE=bans check list "$(ctl bans | grep -c -E '^(10\.1\.2\.3 (59|60)|10\.9\.0\.0/16 (599|600))$') $(ctl bans | tail -1)" "2 ok"
+SUITE=bans check unban "$(ctl unban 10.1.2.3) $(as 10.1.2.3) $(ctl unban 10.1.2.3) $(ctl unban 10.1.2.3 > /dev/null; echo $?)" "ok 200 error: not banned 1"
+SUITE=bans check bad-command "$(ctl ban 10.0.0.1 > /dev/null; echo $?) $(ctl ban all 60 | cut -c1-12)" "1 error: usage"
+SUITE=bans check h3-before "$(h3)" 200
+SUITE=bans check keepalive-closed "$(python3 "$HERE/ban_keepalive.py" 18448 "$ROOT/zig-out/bin/routez" "$WORK/ctl.sock")" "200 closed"
+SUITE=bans check refused-at-accept "$(as 10.1.2.4) $(h3)" "000 000"
+SUITE=bans check unbanned "$(ctl unban 127.0.0.1) $(as 10.1.2.4) $(h3)" "ok 200 200"
+SUITE=bans check limit-req-per-network "$(as 10.5.5.1 /net) $(as 10.5.5.2 /net) $(as 10.5.5.3 /net) $(as 10.5.6.1 /net)" "200 200 429 200"
+bans_metric() { $CURL_BIN -s http://127.0.0.1:18448/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 3 ] && echo closed)" "1 refused closed"
+SUITE=bans check socket-mode "$(stat -f '%Lp' "$WORK/ctl.sock" 2>/dev/null || stat -c '%a' "$WORK/ctl.sock")" 600
+kill $BANS; wait $BANS 2>/dev/null
+SUITE=bans check socket-removed "$([ -e "$WORK/ctl.sock" ] && echo left || echo removed)" removed
+
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
 # its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").
 $OPENSSL req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/rsa8.key" -out "$WORK/rsa.crt" -days 2 \
