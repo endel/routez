@@ -177,6 +177,10 @@ pub const UdpProxy = struct {
         const key = addrKey(from);
         if (self.flows.get(key)) |flow| return flow.toUpstream(pkt);
         if (self.flows.count() >= self.cfg.max_flows) return;
+        if (socket.ipKey(from)) |ip| if (self.worker.isBanned(ip)) {
+            stats.inc(&stats.refused_banned);
+            return;
+        };
 
         const peer = self.routeByCid(pkt) orelse blk: {
             var text_buf: [64]u8 = undefined;

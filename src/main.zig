@@ -18,6 +18,7 @@ const open_file_cache = @import("open_file_cache.zig");
 const fd_budget = @import("fd_budget.zig");
 const realip = @import("realip.zig");
 const access = @import("access.zig");
+const control = @import("control.zig");
 const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
@@ -36,7 +37,13 @@ const log = std.log.scoped(.main);
 
 const usage =
     \\usage: routez [-t] [config.zon]
+    \\       routez ctl [-s socket] <command>
     \\  -t   check the configuration and exit
+    \\  ctl  send a command to a running server's control_socket
+    \\       (default /run/routez.sock):
+    \\         ban <address>[/<prefix>] <seconds>
+    \\         unban <address>[/<prefix>]
+    \\         bans
     \\
 ;
 
@@ -103,6 +110,8 @@ const Generation = struct {
         if (prev != null) if (ids) |u| if (!privileges.dropped or u.uid != std.c.getuid()) {
             log.warn("user {s}: a change of user takes effect at the next restart", .{g.cfg.user.?});
         };
+        if (prev != null and !std.mem.eql(u8, g.cfg.control_socket orelse "", control.bound))
+            log.warn("control_socket: a change takes effect at the next restart", .{});
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
@@ -134,6 +143,14 @@ const Generation = struct {
         }
         g.workers = workers;
         if (prev != null) try applyLogging(io, &g.cfg);
+        // Before `user` takes over: its directory (/run, say) may be root's.
+        var control_fd: ?std.posix.fd_t = null;
+        if (prev == null) if (g.cfg.control_socket) |p| {
+            control_fd = control.listen(io, p) catch |err| {
+                log.err("control_socket {s}: {s}", .{ p, @errorName(err) });
+                return err;
+            };
+        };
         // Listeners are bound and logs open: nothing left that needs root.
         if (prev == null) if (ids) |u| {
             privileges.prepareAcmeStorage(io, arena, &g.cfg, u) catch |err| {
@@ -149,6 +166,11 @@ const Generation = struct {
         };
         g.threads = try arena.alloc(std.Thread, workers.len);
         for (g.threads, workers) |*t, w| t.* = try std.Thread.spawn(.{}, runWorker, .{w});
+        if (control_fd) |fd| {
+            // clientTable made one for it, and keeps it for every generation.
+            try control.spawn(io, fd, g.shared.clients.?);
+            log.info("control socket {s}", .{control.bound});
+        }
         // After the listeners are up, so HTTP-01 challenges can be answered.
         manager.reloadApplied(certificates_seen);
         manager.setJobs(&g.cfg) catch |err| log.err("acme: {s}", .{@errorName(err)});
@@ -207,8 +229,9 @@ fn servesFiles(cfg: *const config.Config) bool {
 }
 
 fn clientTable(cfg: *const config.Config, auth: bool) !?*client_limits.Table {
-    // auth_basic rate-limits each client's uncached password checks.
-    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth;
+    // auth_basic rate-limits each client's uncached password checks; bans
+    // come through the control socket.
+    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth or cfg.control_socket != null;
     if (client_table) |t| {
         if (wanted and cfg.limits.max_tracked_clients != client_table_size)
             log.warn("limits.max_tracked_clients: a change takes effect at the next restart", .{});
@@ -334,6 +357,15 @@ fn loadUpstreamCas(arena: std.mem.Allocator, cfg: *const config.Config) ![]const
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "ctl")) {
+        const custom = args.len > 3 and std.mem.eql(u8, args[2], "-s");
+        const words = args[if (custom) 4 else 2..];
+        if (words.len == 0) {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return control.client(if (custom) args[3] else control.default_path, words);
+    }
 
     var path: []const u8 = "routez.zon";
     var check_only = false;
@@ -416,6 +448,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         gen.stop();
         gen.join(init.io);
+        control.unlink(init.io);
         log.info("stopped (quic steered: {d})", .{@import("stats.zig").quic_steered.load(.monotonic)});
         return 0;
     }
@@ -455,6 +488,7 @@ test {
     _ = @import("privileges.zig");
     _ = @import("stats.zig");
     _ = @import("client_limits.zig");
+    _ = @import("control.zig");
     _ = @import("access.zig");
     _ = @import("guard.zig");
     _ = @import("auth/htpasswd.zig");

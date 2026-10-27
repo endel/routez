@@ -20,6 +20,12 @@ pub var refused_max_connections: std.atomic.Value(u64) = .init(0);
 pub var refused_proxy_protocol: std.atomic.Value(u64) = .init(0);
 /// Requests answered 429 by `limit_req`.
 pub var requests_limited: std.atomic.Value(u64) = .init(0);
+/// TCP connections closed at accept, QUIC Initials and layer-4 UDP flows
+/// dropped, for a client under a `routez ctl` ban.
+pub var refused_banned: std.atomic.Value(u64) = .init(0);
+/// Requests closed unanswered for a client under a ban: on a connection
+/// opened before the ban, or from a client a `real_ip_from` proxy names.
+pub var requests_banned: std.atomic.Value(u64) = .init(0);
 /// QUIC datagrams handed to the worker owning their connection.
 pub var quic_steered: std.atomic.Value(u64) = .init(0);
 /// Finished responses by protocol (HTTP/1.x, HTTP/3) and status class.
@@ -127,6 +133,7 @@ pub fn format(buf: []u8, quic_connections: usize) []const u8 {
         \\  http/3: {d}
         \\refused per-ip: {d}
         \\refused at max_connections: {d}
+        \\refused banned: {d}
         \\quic steered: {d}
         \\
     , .{
@@ -138,6 +145,7 @@ pub fn format(buf: []u8, quic_connections: usize) []const u8 {
         requests_h3.load(.monotonic),
         refused_per_ip.load(.monotonic),
         refused_max_connections.load(.monotonic),
+        refused_banned.load(.monotonic),
         quic_steered.load(.monotonic),
     }) catch "stats unavailable\n";
 }
@@ -180,6 +188,12 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_connections_refused_proxy_protocol_total {d}\n", .{load(&refused_proxy_protocol)});
     try header(w, "routez_http_requests_limited_total", "counter", "Requests refused with 429 by limit_req.");
     try w.print("routez_http_requests_limited_total {d}\n", .{load(&requests_limited)});
+    try header(w, "routez_connections_refused_banned_total", "counter", "TCP connections, QUIC Initials and layer-4 UDP flows refused for a banned client.");
+    try w.print("routez_connections_refused_banned_total {d}\n", .{load(&refused_banned)});
+    try header(w, "routez_http_requests_banned_total", "counter", "Requests closed unanswered for a banned client.");
+    try w.print("routez_http_requests_banned_total {d}\n", .{load(&requests_banned)});
+    try header(w, "routez_bans", "gauge", "Addresses and networks banned through the control socket.");
+    try w.print("routez_bans {d}\n", .{if (clients) |t| t.bans.load(.monotonic) else 0});
     try header(w, "routez_limit_table_entries", "gauge", "Client entries held for max_connections_per_ip and limit_req.");
     try w.print("routez_limit_table_entries {d}\n", .{if (clients) |t| t.entries() else 0});
     try header(w, "routez_limit_table_capacity", "gauge", "Client entries the limit table can hold.");

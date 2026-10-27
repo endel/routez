@@ -52,6 +52,9 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   named zone shared by locations).
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
+- Bans at run time: `routez ctl ban 192.0.2.0/24 600` refuses an address
+  or network at accept and before any QUIC handshake, and closes requests
+  on connections already open; shared by every worker, kept across reloads.
 - Access control: IP allow/deny rules, Basic auth against htpasswd files
   (bcrypt checked off the event loop), and client certificates (mutual TLS)
   over TLS and HTTP/3, with the client's identity in variables.
@@ -347,6 +350,7 @@ variant the client doesn't take.
         .{ .prefix = "/login", .proxy_pass = "backend", .limit_req = .{ .rate = 2, .burst = 5 } },
         .{ .prefix = "/api/", .proxy_pass = "backend", .limit_req = .{ .zone = "api", .rate = 50, .burst = 100 } },
         .{ .prefix = "/v2/", .proxy_pass = "backend", .limit_req = .{ .zone = "api", .rate = 50 } },
+        .{ .prefix = "/search", .proxy_pass = "backend", .limit_req = .{ .rate = 20, .ipv4_prefix = 24, .ipv6_prefix = 64 } },
     } }},
 }
 ```
@@ -356,6 +360,10 @@ variant the client doesn't take.
   to HTTP/1.1, HTTPS and HTTP/3 alike. Locations naming the same `zone`
   share each client's bucket (they must agree on `rate`; each has its own
   `burst`); a location without one has its own.
+- `ipv4_prefix` and `ipv6_prefix` count a network as one client: every
+  address in the same IPv4 /24 or IPv6 /64 above shares a bucket, so
+  spreading requests over neighbouring addresses gains nothing. Locations
+  sharing a zone must agree on both.
 - `limits.max_connections_per_ip` caps the TCP connections (HTTP and TLS)
   one address holds; more are closed at accept. A `real_ip_from` proxy
   isn't counted, and on a `proxy_protocol` listener the client its header
@@ -381,6 +389,40 @@ variant the client doesn't take.
   that bites first: raise it for them. It is lowered at startup to fit
   `RLIMIT_NOFILE`, which every worker's clients and their upstream
   connections share, with a warning saying so.
+
+### Bans
+
+```zig
+.{ .control_socket = "/run/routez.sock", .servers = ... }
+```
+
+```sh
+routez ctl ban 192.0.2.7 3600          # an address, for an hour
+routez ctl ban 2001:db8:1:2::/64 600   # or a network
+routez ctl bans                        # each with its seconds left
+routez ctl unban 192.0.2.7
+```
+
+- A banned client's TCP connections are closed at accept, its QUIC Initials
+  are dropped before any reply or decryption, and its new `udp_proxies`
+  flows are refused. A request on a connection opened before the ban, or
+  from a client a `real_ip_from` proxy names, is closed unanswered and
+  logged as 444. On a `proxy_protocol` listener the client its header names
+  is checked.
+- `unban` lifts exactly what `ban` set: an address inside a banned network
+  stays banned.
+- Bans live in the client table (`limits.max_tracked_clients`), so every
+  worker sees one at once and it survives a reload, not a restart. A full
+  table refuses a new ban with an error instead of evicting anything. While
+  no ban is held a check costs one atomic load; with bans, one lookup per
+  prefix length in use.
+- The socket is created mode 0600 before `user` takes over: started as
+  root, only root can use it. `routez ctl -s path` reaches another socket.
+  Programs can speak its protocol directly: one command a line, any number
+  per connection, each answered by a line `ok` or `error: <reason>` (for
+  `bans`, after a line per ban).
+- Counted by `routez_connections_refused_banned_total`,
+  `routez_http_requests_banned_total` and the `routez_bans` gauge.
 
 ### Access control
 

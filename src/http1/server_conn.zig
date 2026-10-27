@@ -177,13 +177,10 @@ pub const Conn = struct {
             self.client_ip = src.ip;
             self.addr_len = socket.formatIpKey(src.ip, &self.addr_buf).len;
         }
-        switch (self.worker.admitIp(self.client_ip)) {
+        switch (self.worker.admitClient(self.client_ip)) {
             .counted => self.client.ip_key = self.client_ip,
             .untracked => {},
-            .refused => {
-                stats.inc(&stats.refused_per_ip);
-                return self.clientGone();
-            },
+            .refused => return self.clientGone(),
         }
         var raw = self.in;
         self.in = .empty;

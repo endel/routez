@@ -74,6 +74,10 @@ pub const Config = struct {
     /// Take the rightmost address in `real_ip_header` that isn't itself in
     /// `real_ip_from` (the leftmost when all are), for a chain of proxies.
     real_ip_recursive: bool = false,
+    /// A Unix socket taking `routez ctl` commands (bans), created mode 0600
+    /// at start, before `user` takes over: only its owner (root, when
+    /// routez starts as root) can connect. A change takes a restart.
+    control_socket: ?[]const u8 = null,
     /// Write a qlog trace per QUIC connection into this directory: the packets
     /// sent and received with their frames and timestamps, in the format the
     /// other QUIC implementations share. For working out where a connection
@@ -378,6 +382,11 @@ pub const Location = struct {
         /// must agree on `rate`, and each applies its own `burst`. Without
         /// one, the location has a bucket of its own.
         zone: ?[]const u8 = null,
+        /// Count clients by network: every address in one IPv4 /`ipv4_prefix`
+        /// or IPv6 /`ipv6_prefix` shares a bucket. Locations sharing a zone
+        /// must agree on both.
+        ipv4_prefix: u8 = 32,
+        ipv6_prefix: u8 = 128,
     };
 
     pub const Return = struct {
@@ -546,6 +555,10 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
     if (cfg.user) |u| if (u.len == 0) return fail("user is empty", .{});
     if (cfg.access_log_path) |p| if (p.len == 0) return fail("access_log_path is empty", .{});
     if (cfg.error_log) |p| if (p.len == 0) return fail("error_log is empty", .{});
+    // sun_path, its NUL included.
+    const max_socket_path = @sizeOf(@FieldType(std.posix.sockaddr.un, "path")) - 1;
+    if (cfg.control_socket) |p| if (p.len == 0 or p.len > max_socket_path)
+        return fail("control_socket must be a path of 1 to {d} bytes", .{max_socket_path});
     access_log.validate(cfg.access_log_format) catch |err| return fail("access_log_format: {s}", .{switch (err) {
         error.UnknownVariable => "unknown variable",
         error.BadVariable => "bad variable syntax",
@@ -709,12 +722,16 @@ fn checkAuthBasic(prefix: []const u8, ab: AuthBasic) error{InvalidConfig}!void {
 
 fn checkLimitReq(cfg: *const Config, prefix: []const u8, l: Location.LimitReq) error{InvalidConfig}!void {
     if (l.rate == 0) return fail("location '{s}': limit_req.rate must be > 0", .{prefix});
+    if (l.ipv4_prefix > 32) return fail("location '{s}': limit_req.ipv4_prefix must be 0 to 32", .{prefix});
+    if (l.ipv6_prefix > 128) return fail("location '{s}': limit_req.ipv6_prefix must be 0 to 128", .{prefix});
     const zone = l.zone orelse return;
     if (zone.len == 0) return fail("location '{s}': limit_req.zone is empty", .{prefix});
     for (cfg.servers) |srv| for (srv.locations) |other| {
         const o = other.limit_req orelse continue;
         const oz = o.zone orelse continue;
-        if (std.mem.eql(u8, oz, zone) and o.rate != l.rate) return fail("limit_req zone '{s}': rates differ ({d} and {d})", .{ zone, o.rate, l.rate });
+        if (!std.mem.eql(u8, oz, zone)) continue;
+        if (o.rate != l.rate) return fail("limit_req zone '{s}': rates differ ({d} and {d})", .{ zone, o.rate, l.rate });
+        if (o.ipv4_prefix != l.ipv4_prefix or o.ipv6_prefix != l.ipv6_prefix) return fail("limit_req zone '{s}': prefixes differ", .{zone});
     };
 }
 
@@ -935,6 +952,24 @@ test "limit_req zones" {
     , "test"));
     try std.testing.expectError(error.InvalidConfig, parse(a,
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .zone = "", .rate = 5 } }} }} }
+    , "test"));
+    _ = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/a", .root = "x", .limit_req = .{ .zone = "api", .rate = 5, .ipv4_prefix = 24, .ipv6_prefix = 64 } },
+        \\    .{ .prefix = "/b", .root = "x", .limit_req = .{ .zone = "api", .rate = 5, .ipv4_prefix = 24, .ipv6_prefix = 64 } },
+        \\} }} }
+    , "test");
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/a", .root = "x", .limit_req = .{ .zone = "api", .rate = 5, .ipv4_prefix = 24 } },
+        \\    .{ .prefix = "/b", .root = "x", .limit_req = .{ .zone = "api", .rate = 5 } },
+        \\} }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .rate = 5, .ipv4_prefix = 33 } }} }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .control_socket = "", .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
     , "test"));
 }
 

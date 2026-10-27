@@ -710,12 +710,19 @@ pub const Worker = struct {
         if (c.ip_key) |k| self.releaseIp(k);
     }
 
-    /// Count a connection against its client address, process-wide. A
-    /// trusted proxy isn't: it speaks for many clients.
-    pub fn admitIp(self: *Worker, key: [16]u8) client_limits.Table.Admit {
+    /// Admit a connection from `key`: refused, and counted in stats, when it
+    /// is banned or holds `limits.max_connections_per_ip` already, process-
+    /// wide. A trusted proxy isn't counted: it speaks for many clients.
+    pub fn admitClient(self: *Worker, key: [16]u8) client_limits.Table.Admit {
+        if (self.isBanned(key)) {
+            stats.inc(&stats.refused_banned);
+            return .refused;
+        }
         if (self.cfg.limits.max_connections_per_ip == 0 or self.shared.real_ip.trusted(key)) return .untracked;
         const t = self.shared.clients orelse return .untracked;
-        return t.acquireConn(self.io, key, self.cfg.limits.max_connections_per_ip, quic.sys.nanoTimestamp());
+        const admit = t.acquireConn(self.io, key, self.cfg.limits.max_connections_per_ip, quic.sys.nanoTimestamp());
+        if (admit == .refused) stats.inc(&stats.refused_per_ip);
+        return admit;
     }
 
     fn releaseIp(self: *Worker, key: [16]u8) void {
@@ -725,7 +732,20 @@ pub const Worker = struct {
     /// `limit_req` for one request, counted across all workers.
     pub fn allowRequest(self: *Worker, srv: *const config.Server, loc: *const config.Location, lim: config.Location.LimitReq, client: [16]u8) bool {
         const t = self.shared.clients orelse return true;
-        return t.allowRequest(self.io, client, client_limits.zoneId(srv, loc), lim.rate, lim.burst, quic.sys.nanoTimestamp());
+        const key = client_limits.network(client, lim.ipv4_prefix, lim.ipv6_prefix);
+        return t.allowRequest(self.io, key, client_limits.zoneId(srv, loc), lim.rate, lim.burst, quic.sys.nanoTimestamp());
+    }
+
+    pub fn anyBans(self: *const Worker) bool {
+        const t = self.shared.clients orelse return false;
+        return t.anyBans();
+    }
+
+    /// Whether `routez ctl ban` covers `ip`, by the loop's clock: a ban may
+    /// outlast its end by a tick. One atomic load while nothing is banned.
+    pub fn isBanned(self: *Worker, ip: [16]u8) bool {
+        const t = self.shared.clients orelse return false;
+        return t.anyBans() and t.banned(self.io, ip, self.timers.now_ms * std.time.ns_per_ms);
     }
 
     /// Live QUIC connections on this worker.
@@ -913,19 +933,19 @@ pub const Listener = struct {
         stats.inc(&stats.accepted);
         var ip_key: ?[16]u8 = null;
         if (self.proxy_protocol) {
-            // Counted per IP once the header names the client.
+            // Admitted once the header names the client.
             const peer = socket.peerIpKey(tcp.fd);
             if (peer == null or !w.shared.real_ip.trusted(peer.?)) {
                 stats.inc(&stats.refused_proxy_protocol);
                 _ = std.c.close(tcp.fd);
                 return;
             }
-        } else if (w.cfg.limits.max_connections_per_ip != 0) {
-            if (socket.peerIpKey(tcp.fd)) |k| switch (w.admitIp(k)) {
+        } else if (w.cfg.limits.max_connections_per_ip != 0 or w.anyBans()) {
+            // Only then: it costs a getpeername.
+            if (socket.peerIpKey(tcp.fd)) |k| switch (w.admitClient(k)) {
                 .counted => ip_key = k,
                 .untracked => {},
                 .refused => {
-                    stats.inc(&stats.refused_per_ip);
                     _ = std.c.close(tcp.fd);
                     return;
                 },

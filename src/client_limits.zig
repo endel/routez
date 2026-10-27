@@ -1,6 +1,6 @@
 //! Per-client limits shared by every worker and every generation: the
-//! connections each address holds (`limits.max_connections_per_ip`) and the
-//! `limit_req` buckets.
+//! connections each address holds (`limits.max_connections_per_ip`), the
+//! `limit_req` buckets, and bans (`routez ctl ban`).
 //!
 //! Entries are keyed by client address and zone, hashed with a random
 //! SipHash key onto shards, each a chained hash table over a node pool
@@ -8,8 +8,9 @@
 //! mutex is held for a lookup and a few stores.
 //!
 //! Buckets use GCRA, the token bucket held as one timestamp: the time
-//! the bucket would be full again. An entry past that time, or a
-//! connection count back at zero, carries no state and is dropped.
+//! the bucket would be full again. A ban holds the time it ends. An entry
+//! past its time, or a connection count back at zero, carries no state and
+//! is dropped.
 //!
 //! When a shard is full of live entries, a new client goes untracked:
 //! allowed, and counted in `untracked`. Refusing instead would let anyone
@@ -19,6 +20,7 @@
 const std = @import("std");
 const quic = @import("quic");
 const config = @import("config.zig");
+const access = @import("access.zig");
 
 const log = std.log.scoped(.limits);
 
@@ -30,6 +32,20 @@ pub const conn_zone: u32 = 0;
 /// The bucket of an address's uncached `auth_basic` password checks;
 /// `zoneId` never returns it either (its ids are odd).
 pub const auth_zone: u32 = 2;
+
+/// The zone of a ban on a network `bits` long in the 16-byte form (an IPv4
+/// /24 is 120). Even, so `zoneId` never returns one.
+pub fn banZone(bits: u8) u32 {
+    return 4 + 2 * @as(u32, bits);
+}
+
+fn banBits(zone: u32) ?u8 {
+    if (zone < banZone(0) or zone > banZone(128) or zone & 1 != 0) return null;
+    return @intCast((zone - banZone(0)) / 2);
+}
+
+/// Marks a node on the free list, so `nextBans` can scan nodes by index.
+const free_zone: u32 = 1 << 31;
 
 const default_shards = 64;
 const none: u32 = 0;
@@ -44,6 +60,14 @@ pub const Table = struct {
     untracked: std.atomic.Value(u64) = .init(0),
     sweep_cursor: std.atomic.Value(u32) = .init(0),
     last_warn_ns: std.atomic.Value(i64) = .init(std.math.minInt(i64)),
+    /// Bans held, counted by `insert` and `remove`; while zero, `banned`
+    /// reads nothing else.
+    bans: std.atomic.Value(u32) = .init(0),
+    /// A bit per prefix length ever banned, IPv4's (0 to 32) apart from
+    /// IPv6's, so `banned` looks up only those of the client's family.
+    /// Never cleared: a clear could race a ban being added at that length.
+    ban_lengths_v4: std.atomic.Value(u64) = .init(0),
+    ban_lengths_v6: [3]std.atomic.Value(u64) = @splat(.init(0)),
 
     const Node = struct {
         ip: Ip,
@@ -131,7 +155,7 @@ pub const Table = struct {
             s.mutex.unlock(io);
             return .refused;
         }
-        const ok = insert(s, ip, conn_zone, loc.bucket, 1, now_ns);
+        const ok = self.insert(s, ip, conn_zone, loc.bucket, 1, now_ns);
         s.mutex.unlock(io);
         if (ok) return .counted;
         self.noteFull(now_ns);
@@ -146,7 +170,7 @@ pub const Table = struct {
         const f = find(s, ip, conn_zone, loc.bucket) orelse return;
         const n = &s.nodes[f.index].value;
         n.* -= 1;
-        if (n.* <= 0) remove(s, f);
+        if (n.* <= 0) self.remove(s, f);
     }
 
     /// GCRA admission for one request: `rate` per second on average, and
@@ -165,7 +189,7 @@ pub const Table = struct {
             full_at.* = from + interval;
             return true;
         }
-        const ok = insert(s, ip, zone, loc.bucket, now_ns + interval, now_ns);
+        const ok = self.insert(s, ip, zone, loc.bucket, now_ns + interval, now_ns);
         s.mutex.unlock(io);
         if (!ok) self.noteFull(now_ns);
         return true;
@@ -177,7 +201,101 @@ pub const Table = struct {
         const s = &self.shards[i];
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
-        sweep(s, now_ns);
+        self.sweep(s, now_ns);
+    }
+
+    pub fn anyBans(self: *const Table) bool {
+        return self.bans.load(.monotonic) != 0;
+    }
+
+    /// Whether a live ban covers `ip`: one lookup per prefix length banned
+    /// in its family.
+    pub fn banned(self: *Table, io: std.Io, ip: Ip, now_ns: i64) bool {
+        if (access.isV4(ip)) {
+            var set = self.ban_lengths_v4.load(.monotonic);
+            while (set != 0) : (set &= set - 1) if (self.bannedAt(io, ip, 96 + @as(u8, @ctz(set)), now_ns)) return true;
+            return false;
+        }
+        for (&self.ban_lengths_v6, 0..) |*word, w| {
+            var set = word.load(.monotonic);
+            while (set != 0) : (set &= set - 1) if (self.bannedAt(io, ip, @intCast(w * 64 + @ctz(set)), now_ns)) return true;
+        }
+        return false;
+    }
+
+    fn bannedAt(self: *Table, io: std.Io, ip: Ip, bits: u8, now_ns: i64) bool {
+        var net = ip;
+        access.mask(&net, bits);
+        const zone = banZone(bits);
+        const loc = self.locate(net, zone);
+        const s = loc.shard;
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        const f = find(s, net, zone, loc.bucket) orelse return false;
+        return s.nodes[f.index].value > now_ns;
+    }
+
+    /// Ban `net`/`bits` until `until_ns`, replacing the end of a ban it
+    /// already has.
+    pub fn ban(self: *Table, io: std.Io, net: Ip, bits: u8, until_ns: i64, now_ns: i64) error{TableFull}!void {
+        var key = net;
+        access.mask(&key, bits);
+        const zone = banZone(bits);
+        const loc = self.locate(key, zone);
+        const s = loc.shard;
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        if (find(s, key, zone, loc.bucket)) |f| {
+            s.nodes[f.index].value = until_ns;
+            return;
+        }
+        if (!self.insert(s, key, zone, loc.bucket, until_ns, now_ns)) return error.TableFull;
+        // Masked, a key keeps the mapped prefix only at 96 bits or more.
+        if (access.isV4(key)) {
+            _ = self.ban_lengths_v4.fetchOr(@as(u64, 1) << @intCast(bits - 96), .monotonic);
+        } else {
+            _ = self.ban_lengths_v6[bits / 64].fetchOr(@as(u64, 1) << @intCast(bits % 64), .monotonic);
+        }
+    }
+
+    /// Lift the ban on exactly `net`/`bits`; false if there was none.
+    pub fn unban(self: *Table, io: std.Io, net: Ip, bits: u8) bool {
+        var key = net;
+        access.mask(&key, bits);
+        const zone = banZone(bits);
+        const loc = self.locate(key, zone);
+        const s = loc.shard;
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        self.remove(s, find(s, key, zone, loc.bucket) orelse return false);
+        return true;
+    }
+
+    pub const Ban = struct { net: Ip, bits: u8, until_ns: i64 };
+
+    /// Where `nextBans` carries on from.
+    pub const BanCursor = struct { shard: u32 = 0, node: u32 = 0 };
+
+    /// The next live bans, up to `out.len`, holding one shard's lock at a
+    /// time; empty once every shard has been read. Bans added or lifted
+    /// meanwhile may or may not show.
+    pub fn nextBans(self: *Table, io: std.Io, cursor: *BanCursor, now_ns: i64, out: []Ban) []Ban {
+        var n: usize = 0;
+        while (cursor.shard < self.shards.len and n < out.len) {
+            const s = &self.shards[cursor.shard];
+            s.mutex.lockUncancelable(io);
+            while (cursor.node < s.used and n < out.len) : (cursor.node += 1) {
+                const node = &s.nodes[cursor.node];
+                const bits = banBits(node.zone) orelse continue;
+                if (node.value <= now_ns) continue;
+                out[n] = .{ .net = node.ip, .bits = bits, .until_ns = node.value };
+                n += 1;
+            }
+            const done = cursor.node >= s.used;
+            s.mutex.unlock(io);
+            if (done) cursor.* = .{ .shard = cursor.shard + 1 };
+        }
+        return out[0..n];
     }
 
     const Location = struct { shard: *Shard, bucket: u32 };
@@ -214,14 +332,15 @@ pub const Table = struct {
         return null;
     }
 
-    fn insert(s: *Shard, ip: Ip, zone: u32, bucket: u32, value: i64, now_ns: i64) bool {
+    fn insert(self: *Table, s: *Shard, ip: Ip, zone: u32, bucket: u32, value: i64, now_ns: i64) bool {
         const i = allocNode(s) orelse blk: {
-            sweep(s, now_ns);
+            self.sweep(s, now_ns);
             break :blk allocNode(s) orelse return false;
         };
         s.nodes[i] = .{ .ip = ip, .zone = zone, .next = s.heads[bucket], .value = value };
         s.heads[bucket] = i + 1;
         _ = s.len.fetchAdd(1, .monotonic);
+        if (banBits(zone) != null) _ = self.bans.fetchAdd(1, .monotonic);
         return true;
     }
 
@@ -236,22 +355,24 @@ pub const Table = struct {
         return s.used - 1;
     }
 
-    fn remove(s: *Shard, f: Found) void {
+    fn remove(self: *Table, s: *Shard, f: Found) void {
         const n = &s.nodes[f.index];
+        if (banBits(n.zone) != null) _ = self.bans.fetchSub(1, .monotonic);
         f.link.* = n.next;
         n.next = s.free;
+        n.zone = free_zone;
         s.free = f.index + 1;
         _ = s.len.fetchSub(1, .monotonic);
     }
 
-    fn sweep(s: *Shard, now_ns: i64) void {
+    fn sweep(self: *Table, s: *Shard, now_ns: i64) void {
         for (s.heads) |*head| {
             var link = head;
             while (link.* != none) {
                 const i = link.* - 1;
                 const n = &s.nodes[i];
                 if (n.zone != conn_zone and n.value <= now_ns) {
-                    remove(s, .{ .index = i, .link = link });
+                    self.remove(s, .{ .index = i, .link = link });
                 } else {
                     link = &n.next;
                 }
@@ -279,6 +400,13 @@ pub fn zoneId(srv: *const config.Server, loc: *const config.Location) u32 {
         h.update(loc.pattern());
     }
     return @as(u32, @truncate(h.final())) | 1;
+}
+
+/// The network `ip` is counted under: its IPv4 /`v4` or its IPv6 /`v6`.
+pub fn network(ip: Ip, v4: u8, v6: u8) Ip {
+    var out = ip;
+    access.mask(&out, if (access.isV4(ip)) 96 + v4 else v6);
+    return out;
 }
 
 const testing = std.testing;
@@ -390,6 +518,78 @@ test "concurrent acquire and release stay consistent" {
     try testing.expectEqual(@as(u32, 10), won.load(.monotonic));
 }
 
+test "bans: addresses and networks, expiry, unban, listing" {
+    const t = try Table.createSharded(testing.allocator, 64, 4);
+    defer t.destroy(testing.allocator);
+    const io = testing.io;
+    const s = std.time.ns_per_s;
+    try testing.expect(!t.anyBans());
+    try t.ban(io, ip4(10, 0, 0, 1), 128, 20 * s, 10 * s);
+    // Host bits past the prefix don't matter.
+    try t.ban(io, ip4(192, 0, 2, 77), 120, 30 * s, 10 * s);
+    try testing.expect(t.anyBans());
+    try testing.expect(t.banned(io, ip4(10, 0, 0, 1), 10 * s));
+    try testing.expect(!t.banned(io, ip4(10, 0, 0, 2), 10 * s));
+    try testing.expect(t.banned(io, ip4(192, 0, 2, 200), 10 * s));
+    try testing.expect(!t.banned(io, ip4(192, 0, 3, 1), 10 * s));
+    // Over at its end, and gone at the next sweep.
+    try testing.expect(!t.banned(io, ip4(10, 0, 0, 1), 20 * s));
+    for (0..4) |_| t.sweepStep(io, 20 * s);
+    try testing.expectEqual(@as(u32, 1), t.bans.load(.monotonic));
+    // A second ban on the same network replaces the end.
+    try t.ban(io, ip4(192, 0, 2, 0), 120, 25 * s, 20 * s);
+    try testing.expectEqual(@as(u32, 1), t.bans.load(.monotonic));
+    try testing.expect(!t.banned(io, ip4(192, 0, 2, 1), 25 * s));
+
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ @as([8]u8, @splat(0x11));
+    try t.ban(io, v6, 64, 40 * s, 20 * s);
+    var other = v6;
+    other[15] = 0x22;
+    try testing.expect(t.banned(io, other, 20 * s));
+
+    var cursor: Table.BanCursor = .{};
+    var buf: [1]Table.Ban = undefined;
+    var listed: usize = 0;
+    while (true) {
+        const got = t.nextBans(io, &cursor, 20 * s, &buf);
+        if (got.len == 0) break;
+        listed += got.len;
+    }
+    try testing.expectEqual(@as(usize, 2), listed);
+
+    try testing.expect(t.unban(io, other, 64));
+    try testing.expect(!t.unban(io, other, 64));
+    try testing.expect(!t.banned(io, v6, 20 * s));
+    try testing.expect(t.unban(io, ip4(192, 0, 2, 9), 120));
+    try testing.expect(!t.anyBans());
+    try testing.expectEqual(@as(usize, 0), t.entries());
+    // A freed node no longer lists as a ban.
+    cursor = .{};
+    try testing.expectEqual(@as(usize, 0), t.nextBans(io, &cursor, 20 * s, &buf).len);
+}
+
+test "a full table refuses a ban" {
+    const t = try Table.createSharded(testing.allocator, 2, 1);
+    defer t.destroy(testing.allocator);
+    const io = testing.io;
+    try t.ban(io, ip4(10, 0, 0, 1), 128, 100, 0);
+    try t.ban(io, ip4(10, 0, 0, 2), 128, 100, 0);
+    try testing.expectError(error.TableFull, t.ban(io, ip4(10, 0, 0, 3), 128, 100, 0));
+    // An expired one makes room.
+    try t.ban(io, ip4(10, 0, 0, 3), 128, 200, 150);
+    try testing.expectEqual(@as(u32, 1), t.bans.load(.monotonic));
+}
+
+test "networks" {
+    try testing.expectEqual(ip4(192, 0, 2, 0), network(ip4(192, 0, 2, 77), 24, 64));
+    try testing.expectEqual(ip4(192, 0, 0, 0), network(ip4(192, 0, 2, 77), 20, 64));
+    try testing.expectEqual(ip4(192, 0, 2, 77), network(ip4(192, 0, 2, 77), 32, 128));
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ @as([8]u8, @splat(0x11));
+    try testing.expectEqual([_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ @as([8]u8, @splat(0)), network(v6, 24, 64));
+    try testing.expectEqual([_]u8{ 0x20, 0x01, 0x0c } ++ @as([13]u8, @splat(0)), network(v6, 24, 22));
+    try testing.expectEqual(v6, network(v6, 24, 128));
+}
+
 test "zone ids" {
     const loc_a: config.Location = .{ .prefix = "/a", .@"return" = .{}, .limit_req = .{ .rate = 1, .zone = "api" } };
     const loc_b: config.Location = .{ .prefix = "/b", .@"return" = .{}, .limit_req = .{ .rate = 1, .zone = "api" } };
@@ -400,4 +600,7 @@ test "zone ids" {
     try testing.expect(zoneId(&srv, &loc_c) != zoneId(&srv, &loc_d));
     try testing.expect(zoneId(&srv, &loc_a) != zoneId(&srv, &loc_c));
     try testing.expect(zoneId(&srv, &loc_c) != conn_zone);
+    try testing.expect(banBits(zoneId(&srv, &loc_a)) == null);
+    try testing.expectEqual(@as(?u8, 120), banBits(banZone(120)));
+    try testing.expect(banBits(auth_zone) == null and banBits(conn_zone) == null and banBits(free_zone) == null);
 }

@@ -72,7 +72,13 @@ pub fn hostBitsSet(action: Action, text: []const u8) bool {
     return !std.mem.eql(u8, &rule.net, &full.net);
 }
 
-fn mask(net: *[16]u8, bits: u8) void {
+/// Whether `ip` is an IPv4 address in its mapped form.
+pub fn isV4(ip: [16]u8) bool {
+    return std.mem.eql(u8, ip[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff });
+}
+
+/// Clear every bit of `net` past the first `bits`.
+pub fn mask(net: *[16]u8, bits: u8) void {
     var i: usize = 0;
     while (i < 16) : (i += 1) {
         const lo: usize = i * 8;
