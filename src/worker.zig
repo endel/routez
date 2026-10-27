@@ -65,7 +65,7 @@ pub const QuicListener = union(enum) {
     }
     fn drain(self: QuicListener) void {
         switch (self) {
-            inline else => |l| l.server.drain(),
+            inline else => |l| l.server.drain(.{}),
         }
     }
     fn isDrained(self: QuicListener) bool {
