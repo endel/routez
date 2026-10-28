@@ -152,11 +152,9 @@ pub const Board = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.advance(now_s);
-        return .{
-            .fingerprints = self.fingerprints.heaviest(fps, self),
-            .networks = self.networks.heaviest(nets, null),
-            .rate = self.rate,
-        };
+        const got = self.fingerprints.heaviest(fps);
+        for (got) |*e| e.surging = self.surges(e.rate, e.usual);
+        return .{ .fingerprints = got, .networks = self.networks.heaviest(nets), .rate = self.rate };
     }
 
     /// Close the seconds before `now_s`: their requests go into the rates.
@@ -175,17 +173,18 @@ pub const Board = struct {
         self.pressure = false;
 
         self.n_surging = 0;
-        if (self.calm_s < warm_s or self.rate <= 0) return;
         for (self.fingerprints.slots[0..self.fingerprints.len]) |*s| {
-            if (!self.surges(s) or self.n_surging == max_surging) continue;
+            if (!self.surges(s.rate, s.usual) or self.n_surging == max_surging) continue;
             self.surging[self.n_surging] = s.key;
             self.n_surging += 1;
         }
     }
 
-    fn surges(self: *const Board, s: *const Slot) bool {
-        const share = s.rate / self.rate;
-        return share >= surge_share and share >= surge_ratio * s.usual;
+    /// Nothing surges until usual shares have been learnt.
+    fn surges(self: *const Board, rate: f32, usual: f32) bool {
+        if (self.calm_s < warm_s or self.rate <= 0) return false;
+        const share = rate / self.rate;
+        return share >= surge_share and share >= surge_ratio * usual;
     }
 };
 
@@ -226,7 +225,7 @@ fn Heavy(comptime cap: usize) type {
             }
         }
 
-        fn heaviest(self: *const Self, out: []Entry, b: ?*const Board) []Entry {
+        fn heaviest(self: *const Self, out: []Entry) []Entry {
             var sorted: [cap]Slot = undefined;
             const all = sorted[0..self.len];
             @memcpy(all, self.slots[0..self.len]);
@@ -236,12 +235,7 @@ fn Heavy(comptime cap: usize) type {
                 }
             }.heavier);
             const n = @min(out.len, all.len);
-            for (all[0..n], out[0..n]) |s, *e| e.* = .{
-                .key = s.key,
-                .rate = s.rate,
-                .usual = s.usual,
-                .surging = if (b) |bb| bb.calm_s >= warm_s and bb.rate > 0 and bb.surges(&s) else false,
-            };
+            for (all[0..n], out[0..n]) |s, *e| e.* = .{ .key = s.key, .rate = s.rate, .usual = s.usual, .surging = false };
             return out[0..n];
         }
     };

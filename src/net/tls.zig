@@ -77,9 +77,6 @@ pub fn loadCertificate(arena: std.mem.Allocator, cert_path: []const u8, key_path
 pub const Transport = struct {
     conn: tls_server.Conn,
     alloc: std.mem.Allocator,
-    /// The client's fingerprint, packed once a request asks.
-    key: ?fingerprint.Key = null,
-    key_taken: bool = false,
 
     pub fn create(alloc: std.mem.Allocator, cfg: *const ServerConfig) !*Transport {
         const t = try alloc.create(Transport);
@@ -124,15 +121,6 @@ pub const Transport = struct {
 
     pub fn handshakeComplete(self: *Transport) bool {
         return self.conn.handshakeComplete();
-    }
-
-    /// The client's JA4 fingerprint, once the handshake has seen it.
-    pub fn clientFingerprint(self: *Transport) ?fingerprint.Key {
-        if (self.key_taken) return self.key;
-        const fp = self.conn.fingerprint() orelse return null;
-        self.key = fingerprint.pack(fp);
-        self.key_taken = true;
-        return self.key;
     }
 
     /// The client's verified certificate and the policy that verified it.

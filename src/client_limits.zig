@@ -35,8 +35,13 @@ pub const conn_zone: u32 = 0;
 pub const auth_zone: u32 = 2;
 
 /// A ban's length for a JA4 fingerprint, packed as `fingerprint.zig` does,
-/// in place of a network's: the whole key matches.
+/// in place of a network's: past 128 bits, masking leaves the key whole.
 pub const fingerprint_bits: u8 = 255;
+
+/// A length a ban may have: a network's, or a fingerprint's.
+pub fn isBanLength(bits: u8) bool {
+    return bits <= 128 or bits == fingerprint_bits;
+}
 
 /// The zone of a ban on a network `bits` long in the 16-byte form (an IPv4
 /// /24 is 120), or on a fingerprint. Even, so `zoneId` never returns one.
@@ -248,14 +253,15 @@ pub const Table = struct {
         return self.fingerprint_bans.load(.monotonic) != 0;
     }
 
-    /// Whether a live ban covers the fingerprint `key`.
+    /// Whether a live ban covers the fingerprint `key`; one atomic load
+    /// while none is banned.
     pub fn fingerprintBanned(self: *Table, io: std.Io, key: [16]u8, now_ns: i64) bool {
-        return self.bannedAt(io, key, fingerprint_bits, now_ns);
+        return self.anyFingerprintBans() and self.bannedAt(io, key, fingerprint_bits, now_ns);
     }
 
     fn bannedAt(self: *Table, io: std.Io, ip: Ip, bits: u8, now_ns: i64) bool {
         var net = ip;
-        if (bits != fingerprint_bits) access.mask(&net, bits);
+        access.mask(&net, bits);
         const zone = banZone(bits);
         const loc = self.locate(net, zone);
         const s = loc.shard;
@@ -269,7 +275,7 @@ pub const Table = struct {
     /// already has. `fingerprint_bits` bans the fingerprint `net`.
     pub fn ban(self: *Table, io: std.Io, net: Ip, bits: u8, until_ns: i64, now_ns: i64) error{TableFull}!void {
         var key = net;
-        if (bits != fingerprint_bits) access.mask(&key, bits);
+        access.mask(&key, bits);
         const zone = banZone(bits);
         const loc = self.locate(key, zone);
         const s = loc.shard;
@@ -301,7 +307,7 @@ pub const Table = struct {
     /// Lift the ban on exactly `net`/`bits`; false if there was none.
     pub fn unban(self: *Table, io: std.Io, net: Ip, bits: u8) bool {
         var key = net;
-        if (bits != fingerprint_bits) access.mask(&key, bits);
+        access.mask(&key, bits);
         const zone = banZone(bits);
         const loc = self.locate(key, zone);
         const s = loc.shard;

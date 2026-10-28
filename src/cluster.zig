@@ -316,7 +316,7 @@ const ItemIterator = struct {
         const b = self.rest[0..entry_len];
         self.rest = self.rest[entry_len..];
         self.left -= 1;
-        if ((b[16] > 128 and b[16] != client_limits.fingerprint_bits) or b[17] > 1) return null;
+        if (!client_limits.isBanLength(b[16]) or b[17] > 1) return null;
         return .{
             .key = .{ .net = b[0..16].*, .bits = b[16] },
             .entry = .{

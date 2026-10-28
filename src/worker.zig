@@ -173,7 +173,7 @@ pub const Client = struct {
     /// upstream's to see.
     fn ja4(self: *Client) ?fingerprint.Key {
         return switch (self.kind) {
-            .http => if (H1Conn.fromClient(self).tls) |t| t.clientFingerprint() else null,
+            .http => if (H1Conn.fromClient(self).tls) |t| fingerprint.keyOf(t.conn.fingerprint()) else null,
             .tunnel => null,
         };
     }
@@ -684,8 +684,7 @@ pub const Worker = struct {
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
-            const ip = conn.ip();
-            if ((ip != null and self.isBanned(ip.?)) or self.isFingerprintBanned(conn.ja4())) conn.closeIfIdle(true);
+            if (self.isRefused(conn.ip(), conn.ja4())) conn.closeIfIdle(true);
         }
         for (self.quic_listeners.items) |q| q.closeBanned();
         for (self.udp_proxies.items) |u| u.closeBanned();
@@ -843,12 +842,13 @@ pub const Worker = struct {
         return t.anyBans() and t.banned(self.io, ip, self.timers.now_ms * std.time.ns_per_ms);
     }
 
-    /// Whether `routez ctl ban` covers the fingerprint `key`, by the loop's
-    /// clock. One atomic load while no fingerprint is banned.
-    pub fn isFingerprintBanned(self: *Worker, key: ?fingerprint.Key) bool {
-        const k = key orelse return false;
+    /// Whether a ban covers the client at `ip` or its fingerprint `fp`, by
+    /// the loop's clock.
+    pub fn isRefused(self: *Worker, ip: ?[16]u8, fp: ?fingerprint.Key) bool {
+        if (ip) |a| if (self.isBanned(a)) return true;
+        const k = fp orelse return false;
         const t = self.shared.clients orelse return false;
-        return t.anyFingerprintBans() and t.fingerprintBanned(self.io, k, self.timers.now_ms * std.time.ns_per_ms);
+        return t.fingerprintBanned(self.io, k, self.timers.now_ms * std.time.ns_per_ms);
     }
 
     /// Live QUIC connections on this worker.

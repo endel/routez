@@ -330,7 +330,7 @@ pub const Exchange = struct {
     pub fn start(self: *Exchange) void {
         // A connection opened before its client was banned, or a client a
         // `real_ip_from` proxy names: closed unanswered, logged as nginx's 444.
-        if (self.worker.isBanned(self.req.client_ip) or self.worker.isFingerprintBanned(self.req.fingerprint)) {
+        if (self.worker.isRefused(self.req.client_ip, self.req.fingerprint)) {
             stats.inc(&stats.requests_banned);
             self.status = 444;
             return self.respondAbort();

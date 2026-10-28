@@ -143,9 +143,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
         /// fingerprints.
         pub fn closeBanned(self: *Self) void {
             for (self.server.conn_mgr.entries.items) |entry| {
-                const ip = socket.ipKey(entry.conn.peerAddress());
-                const key = if (entry.conn.fingerprint()) |fp| fingerprint.pack(fp) else null;
-                if (!(ip != null and self.worker.isBanned(ip.?)) and !self.worker.isFingerprintBanned(key)) continue;
+                if (!self.worker.isRefused(socket.ipKey(entry.conn.peerAddress()), fingerprint.keyOf(entry.conn.fingerprint()))) continue;
                 var session: event_loop.Session = .{ .entry = entry };
                 session.closeConnection();
             }
@@ -346,7 +344,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .client_ip = socket.ipKey(peer) orelse @splat(0),
                 .vhosts = &self.vhosts,
                 .client_cert = .{ .secure = true, .auth = session.clientAuth(), .der = session.peerCertificate() },
-                .fingerprint = if (session.fingerprint()) |fp| fingerprint.pack(fp) else null,
+                .fingerprint = fingerprint.keyOf(session.fingerprint()),
             }) catch {
                 s.destroy();
                 return reject(session, stream_id, 500);

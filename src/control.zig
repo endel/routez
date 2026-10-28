@@ -303,7 +303,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         table.ban(io, net.?.net, net.?.bits, now + @as(i64, secs) * std.time.ns_per_s, now) catch
             return out.print("error: the client table is full; raise limits.max_tracked_clients\n", .{});
         log.info("banned {s} for {d} s", .{ formatTarget(net.?.net, net.?.bits, &buf), secs });
-        if (sync) |s| s.noteLocal(.{ .net = net.?.net, .bits = net.?.bits }, sys.realtimeSeconds() + secs, false);
+        if (sync) |s| s.noteLocal(net.?, sys.realtimeSeconds() + secs, false);
         changed.* = true;
         return out.print("ok\n", .{});
     }
@@ -311,10 +311,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         const net = parseTarget(words.next());
         if (net == null or words.next() != null) return out.print("error: usage: unban <address>[/<prefix>]|<ja4>\n", .{});
         if (!table.unban(io, net.?.net, net.?.bits)) return out.print("error: not banned\n", .{});
-        if (sync) |s| {
-            const key: cluster.Key = .{ .net = net.?.net, .bits = net.?.bits };
-            s.noteLocal(key, s.liftEnd(key), true);
-        }
+        if (sync) |s| s.noteLocal(net.?, s.liftEnd(net.?), true);
         log.info("unbanned {s}", .{formatTarget(net.?.net, net.?.bits, &buf)});
         changed.* = true;
         return out.print("ok\n", .{});

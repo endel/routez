@@ -34,9 +34,25 @@ fn admit(_: ?*anyopaque, fp: *const Ja4) bool {
     return false;
 }
 
-const protos = "tqd";
-const versions = [_]*const [2]u8{ "13", "12", "11", "10", "s3", "s2", "d1", "d2", "d3", "00" };
+const protos = "tq";
+/// The codes JA4 gives versions, then the one for any other.
+const versions = blk: {
+    var codes: [quic.ja4.versions.len + 1]*const [2]u8 = undefined;
+    for (quic.ja4.versions, 0..) |v, i| codes[i] = v[1];
+    codes[codes.len - 1] = "00";
+    break :blk codes;
+};
 const alnum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+comptime {
+    // Every `a` part has to fit the key's first 32 bits.
+    std.debug.assert(protos.len * versions.len * 2 * 100 * 100 * alnum.len * alnum.len <= 1 << 32);
+}
+
+/// The key of a connection's fingerprint, if it has one.
+pub fn keyOf(fp: ?Ja4) ?Key {
+    return pack(fp orelse return null);
+}
 
 /// Null for an `a` part JA4 never produces.
 pub fn pack(fp: Ja4) ?Key {
@@ -102,7 +118,7 @@ test "packed and back" {
         "t13d1516h2_8daaf6152771_e5627efa2ab1",
         "q13d0312h3_55b375c5d22e_06cda9e17597",
         "t12i990000_000000000000_000000000000",
-        "d00i0099zZ_ffffffffffff_000000000001",
+        "q00i0099zZ_ffffffffffff_000000000001",
         "t10d00009z_0123456789ab_cdef01234567",
     }) |text| {
         const key = parse(text).?;
@@ -110,7 +126,9 @@ test "packed and back" {
         try testing.expectEqualStrings(text, format(key, &buf));
     }
     // The largest `a` still fits 32 bits.
-    try testing.expect(parse("d00i9999zz_000000000000_000000000000") != null);
+    try testing.expect(parse("q00i9999zz_000000000000_000000000000") != null);
+    // DTLS, which nothing routez serves speaks.
+    try testing.expect(parse("d13d1516h2_8daaf6152771_e5627efa2ab1") == null);
     for ([_][]const u8{ "x13d1516h2_8daaf6152771_e5627efa2ab1", "t14d1516h2_8daaf6152771_e5627efa2ab1", "t13x1516h2_8daaf6152771_e5627efa2ab1", "t13d1a16h2_8daaf6152771_e5627efa2ab1", "192.0.2.1" }) |bad| {
         try testing.expect(parse(bad) == null);
     }
