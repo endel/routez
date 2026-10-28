@@ -453,7 +453,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         gen.stop();
         gen.join(init.io);
-        control.unlink(init.io);
+        control.shutdown(init.io);
         log.info("stopped (quic steered: {d})", .{@import("stats.zig").quic_steered.load(.monotonic)});
         return 0;
     }

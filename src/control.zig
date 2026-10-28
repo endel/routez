@@ -27,14 +27,17 @@ pub const default_path = "/run/routez.sock";
 const max_line = 256;
 /// A client silent this long is dropped, so it can't hold the socket.
 const idle_timeout_s = 5;
-/// About ten years.
-const max_ban_s = 10 * 365 * 24 * 3600;
+const max_ban_s = @import("config.zig").max_ban_s;
 
 /// The socket `listen` bound, kept for the life of the process.
 var bound_buf: [@sizeOf(@FieldType(std.c.sockaddr.un, "path"))]u8 = undefined;
 pub var bound: []const u8 = "";
 /// Where `keepBans` keeps them, or empty.
 pub var bans_path: []const u8 = "";
+/// The table `spawn` serves, for the save at exit.
+var served: ?*client_limits.Table = null;
+/// How often the thread looks for bans workers made (`limit_req.ban`) to save.
+const save_interval_ms = 5000;
 
 fn address(path: []const u8) error{NameTooLong}!std.c.sockaddr.un {
     var addr: std.c.sockaddr.un = .{ .path = @splat(0) };
@@ -62,9 +65,10 @@ pub fn listen(io: std.Io, path: []const u8) !posix.fd_t {
     return fd;
 }
 
-/// Remove the socket at exit. May fail once `user` took over; the next
-/// start replaces it then.
-pub fn unlink(io: std.Io) void {
+/// At exit: save the bans, and remove the socket. The removal may fail
+/// once `user` took over; the next start replaces it then.
+pub fn shutdown(io: std.Io) void {
+    if (served) |t| saveBans(io, t);
     if (bound.len > 0) std.Io.Dir.cwd().deleteFile(io, bound) catch {};
 }
 
@@ -135,7 +139,7 @@ fn writeBans(io: std.Io, table: *client_limits.Table) !void {
         for (got) |b| {
             var buf: [64]u8 = undefined;
             const left = std.math.divCeil(i64, b.until_ns - now_ns, std.time.ns_per_s) catch 0;
-            try w.print("{s} {d}\n", .{ formatNet(b.net, b.bits, &buf), now_s + left });
+            try w.print("{s} {d}\n", .{ socket.formatNet(b.net, b.bits, &buf), now_s + left });
         }
         try af.file.writeStreamingAll(io, w.buffered());
     }
@@ -145,14 +149,25 @@ fn writeBans(io: std.Io, table: *client_limits.Table) !void {
 
 /// Serve `fd` for the life of the process.
 pub fn spawn(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) !void {
+    served = table;
     const t = try std.Thread.spawn(.{}, run, .{ io, fd, table });
     t.detach();
 }
 
 fn run(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) void {
     // As `user` by now: a bans_file it can't write shows at start.
+    var saved = table.ban_epoch.load(.acquire);
     saveBans(io, table);
     while (true) {
+        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        if (std.c.poll(&pfd, 1, if (bans_path.len > 0) save_interval_ms else -1) <= 0) {
+            const epoch = table.ban_epoch.load(.acquire);
+            if (epoch != saved) {
+                saved = epoch;
+                saveBans(io, table);
+            }
+            continue;
+        }
         const c = sys.accept(fd) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionAborted => continue,
             else => {
@@ -166,7 +181,10 @@ fn run(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) void {
         // Once per session, however many commands it sent.
         var changed = false;
         serve(io, c, table, &changed) catch {};
-        if (changed) saveBans(io, table);
+        if (changed) {
+            saved = table.ban_epoch.load(.acquire);
+            saveBans(io, table);
+        }
     }
 }
 
@@ -237,7 +255,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         const now = sys.nanoTimestamp();
         table.ban(io, net.?.net, net.?.bits, now + @as(i64, secs) * std.time.ns_per_s, now) catch
             return out.print("error: the client table is full; raise limits.max_tracked_clients\n", .{});
-        log.info("banned {s} for {d} s", .{ formatNet(net.?.net, net.?.bits, &buf), secs });
+        log.info("banned {s} for {d} s", .{ socket.formatNet(net.?.net, net.?.bits, &buf), secs });
         changed.* = true;
         return out.print("ok\n", .{});
     }
@@ -245,7 +263,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         const net = parseNet(words.next());
         if (net == null or words.next() != null) return out.print("error: usage: unban <address>[/<prefix>]\n", .{});
         if (!table.unban(io, net.?.net, net.?.bits)) return out.print("error: not banned\n", .{});
-        log.info("unbanned {s}", .{formatNet(net.?.net, net.?.bits, &buf)});
+        log.info("unbanned {s}", .{socket.formatNet(net.?.net, net.?.bits, &buf)});
         changed.* = true;
         return out.print("ok\n", .{});
     }
@@ -259,22 +277,12 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
             if (got.len == 0) break;
             for (got) |b| {
                 const left = std.math.divCeil(i64, b.until_ns - now, std.time.ns_per_s) catch 0;
-                try out.print("{s} {d}\n", .{ formatNet(b.net, b.bits, &buf), left });
+                try out.print("{s} {d}\n", .{ socket.formatNet(b.net, b.bits, &buf), left });
             }
         }
         return out.print("ok\n", .{});
     }
     try out.print("error: unknown command '{s}'\n", .{printable(cmd, buf[0..32])});
-}
-
-/// An address alone when the ban is on one, else in CIDR form.
-fn formatNet(net: client_limits.Ip, bits: u8, buf: *[64]u8) []const u8 {
-    const v4 = access.isV4(net);
-    const shown = if (v4) bits -| 96 else bits;
-    const ip = socket.formatIpKey(net, buf[0..48]);
-    if (shown == @as(u8, if (v4) 32 else 128)) return ip;
-    const suffix = std.fmt.bufPrint(buf[ip.len..], "/{d}", .{shown}) catch return ip;
-    return buf[0 .. ip.len + suffix.len];
 }
 
 /// `text` cut short and with control bytes replaced, for echoing back.

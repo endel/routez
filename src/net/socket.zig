@@ -694,6 +694,17 @@ pub fn formatIpKey(key: [16]u8, buf: []u8) []const u8 {
     return formatIp6(key, buf);
 }
 
+/// The network of `key`'s first `bits`: the address alone when that is all
+/// of it, else in CIDR form, an IPv4 one by its own length.
+pub fn formatNet(key: [16]u8, bits: u8, buf: *[64]u8) []const u8 {
+    const v4 = std.mem.eql(u8, key[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff });
+    const shown = if (v4) bits -| 96 else bits;
+    const ip = formatIpKey(key, buf[0..48]);
+    if (shown == @as(u8, if (v4) 32 else 128)) return ip;
+    const suffix = std.fmt.bufPrint(buf[ip.len..], "/{d}", .{shown}) catch return ip;
+    return buf[0 .. ip.len + suffix.len];
+}
+
 /// RFC 5952 text form: lowercase, longest zero run compressed.
 pub fn formatIp6(addr: [16]u8, buf: []u8) []const u8 {
     var groups: [8]u16 = undefined;

@@ -518,6 +518,7 @@ cat > "$WORK/bans.zon" <<EOF2
     .locations = .{
         .{ .prefix = "/", .@"return" = .{ .body = "ok" } },
         .{ .prefix = "/net", .@"return" = .{ .body = "ok" }, .limit_req = .{ .rate = 1, .burst = 1, .ipv4_prefix = 24 } },
+        .{ .prefix = "/auto", .@"return" = .{ .body = "ok" }, .limit_req = .{ .rate = 1, .ban = .{ .after = 2, .for_s = 120 } } },
         .{ .prefix = "/metrics", .metrics = true },
     },
 }} }
@@ -556,12 +557,16 @@ SUITE=bans check unbanned "$(ctl unban 127.0.0.1) $(as 10.1.2.4) $(h3)" "ok 200 
 SUITE=bans check limit-req-per-network "$(as 10.5.5.1 /net) $(as 10.5.5.2 /net) $(as 10.5.5.3 /net) $(as 10.5.6.1 /net)" "200 200 429 200"
 bans_metric() { $CURL_BIN -s http://127.0.0.1:18448/metrics | python3 "$HERE/check_metrics.py" "$1"; }
 SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 2 ] && echo closed)" "1 refused closed"
+# limit_req.ban: the third refusal is more than `after`, and bans the client.
+SUITE=bans check auto-ban "$(for _ in 1 2 3 4 5; do as 10.7.7.7 /auto; echo -n ' '; done) $(ctl bans | grep -c -E '^10\.7\.7\.7 (11[0-9]|120)$') $(bans_metric routez_bans_automatic_total)" "200 429 429 429 000  1 1"
 SUITE=bans check socket-mode "$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$WORK/ctl.sock")" 600
 kill $BANS; wait $BANS 2>/dev/null
 SUITE=bans check socket-removed "$([ -e "$WORK/ctl.sock" ] && echo left || echo removed)" removed
 # bans_file: what was banned at the stop is banned again after the start.
 start_bans
 SUITE=bans check kept-across-restart "$(ctl bans | grep -c -E '^10\.9\.0\.0/16 (59[0-9]|600)$') $(as 10.9.1.1)" "1 000"
+# Saved at the stop, though no control session made it.
+SUITE=bans check auto-ban-kept "$(ctl bans | grep -c -E '^10\.7\.7\.7 ')" 1
 kill $BANS; wait $BANS 2>/dev/null
 
 # Upstream admission: one place at a time on the slow upstream (3 s a

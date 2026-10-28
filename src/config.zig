@@ -397,6 +397,15 @@ pub const Location = struct {
         /// must agree on both.
         ipv4_prefix: u8 = 32,
         ipv6_prefix: u8 = 128,
+        /// Ban a client refused more than `after` times within `within_s`,
+        /// for `for_s`, by the address or network the bucket counts.
+        ban: ?Ban = null,
+
+        pub const Ban = struct {
+            after: u32,
+            within_s: u32 = 60,
+            for_s: u32 = 600,
+        };
     };
 
     pub const Return = struct {
@@ -745,10 +754,19 @@ fn checkAuthBasic(prefix: []const u8, ab: AuthBasic) error{InvalidConfig}!void {
         return fail("location '{s}': auth_basic.realm may not hold quotes, backslashes or control characters", .{prefix});
 }
 
+/// The longest ban, about ten years; `routez ctl ban` takes the same.
+pub const max_ban_s = 10 * 365 * 24 * 3600;
+
 fn checkLimitReq(cfg: *const Config, prefix: []const u8, l: Location.LimitReq) error{InvalidConfig}!void {
     if (l.rate == 0) return fail("location '{s}': limit_req.rate must be > 0", .{prefix});
     if (l.ipv4_prefix > 32) return fail("location '{s}': limit_req.ipv4_prefix must be 0 to 32", .{prefix});
     if (l.ipv6_prefix > 128) return fail("location '{s}': limit_req.ipv6_prefix must be 0 to 128", .{prefix});
+    if (l.ban) |b| {
+        if (b.after == 0 or b.within_s == 0) return fail("location '{s}': limit_req.ban.after and within_s must be > 0", .{prefix});
+        if (b.for_s == 0 or b.for_s > max_ban_s) return fail("location '{s}': limit_req.ban.for_s must be 1 to {d}", .{ prefix, max_ban_s });
+        // A bucket shared by everyone would ban everyone.
+        if (l.ipv4_prefix == 0 or l.ipv6_prefix == 0) return fail("location '{s}': limit_req.ban needs ipv4_prefix and ipv6_prefix above 0", .{prefix});
+    }
     const zone = l.zone orelse return;
     if (zone.len == 0) return fail("location '{s}': limit_req.zone is empty", .{prefix});
     for (cfg.servers) |srv| for (srv.locations) |other| {
@@ -757,6 +775,7 @@ fn checkLimitReq(cfg: *const Config, prefix: []const u8, l: Location.LimitReq) e
         if (!std.mem.eql(u8, oz, zone)) continue;
         if (o.rate != l.rate) return fail("limit_req zone '{s}': rates differ ({d} and {d})", .{ zone, o.rate, l.rate });
         if (o.ipv4_prefix != l.ipv4_prefix or o.ipv6_prefix != l.ipv6_prefix) return fail("limit_req zone '{s}': prefixes differ", .{zone});
+        if (!std.meta.eql(o.ban, l.ban)) return fail("limit_req zone '{s}': bans differ", .{zone});
     };
 }
 
@@ -996,6 +1015,22 @@ test "limit_req zones" {
     try std.testing.expectError(error.InvalidConfig, parse(a,
         \\.{ .control_socket = "", .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x" }} }} }
     , "test"));
+    _ = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .rate = 5, .ipv4_prefix = 24, .ban = .{ .after = 50 } } }} }} }
+    , "test");
+    for ([_][:0]const u8{
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .rate = 5, .ban = .{ .after = 0 } } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .rate = 5, .ban = .{ .after = 5, .for_s = 0 } } }} }} }
+        ,
+        // A bucket everyone shares would ban everyone.
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .limit_req = .{ .rate = 5, .ipv4_prefix = 0, .ban = .{ .after = 5 } } }} }} }
+        ,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{
+        \\    .{ .prefix = "/a", .root = "x", .limit_req = .{ .zone = "z", .rate = 5, .ban = .{ .after = 5 } } },
+        \\    .{ .prefix = "/b", .root = "x", .limit_req = .{ .zone = "z", .rate = 5 } },
+        \\} }} }
+    }) |text| try std.testing.expectError(error.InvalidConfig, parse(a, text, "test"));
 }
 
 test "tls upstreams" {

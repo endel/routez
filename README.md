@@ -356,6 +356,7 @@ variant the client doesn't take.
         .{ .prefix = "/api/", .proxy_pass = "backend", .limit_req = .{ .zone = "api", .rate = 50, .burst = 100 } },
         .{ .prefix = "/v2/", .proxy_pass = "backend", .limit_req = .{ .zone = "api", .rate = 50 } },
         .{ .prefix = "/search", .proxy_pass = "backend", .limit_req = .{ .rate = 20, .ipv4_prefix = 24, .ipv6_prefix = 64 } },
+        .{ .prefix = "/login", .proxy_pass = "backend", .limit_req = .{ .rate = 2, .ban = .{ .after = 50, .within_s = 60, .for_s = 600 } } },
     } }},
 }
 ```
@@ -369,6 +370,13 @@ variant the client doesn't take.
   address in the same IPv4 /24 or IPv6 /64 above shares a bucket, so
   spreading requests over neighbouring addresses gains nothing. Locations
   sharing a zone must agree on both.
+- `ban` turns a client that keeps being refused into a ban (see
+  [Bans](#bans)): refused more than `after` times within `within_s`
+  (60), it is banned for `for_s` (600), by the address or network the
+  bucket counts. A real client slowed by the limit backs off long before
+  that; a flood doesn't. It needs `ipv4_prefix` and `ipv6_prefix` above 0,
+  and locations sharing a zone must agree on it. Each ban is logged and
+  counted by `routez_bans_automatic_total`.
 - `limits.max_connections_per_ip` caps the TCP connections (HTTP and TLS)
   one address holds; more are closed at accept. A `real_ip_from` proxy
   isn't counted, and on a `proxy_protocol` listener the client its header
@@ -443,6 +451,9 @@ routez ctl bans                        # each with its seconds left
 routez ctl unban 192.0.2.7
 ```
 
+Bans come from `routez ctl`, and from `limit_req`'s `ban` (see
+[Client limits](#client-limits)).
+
 - A banned client's TCP connections are closed at accept, its QUIC Initials
   are dropped before any reply or decryption, and its new `udp_proxies`
   flows are refused. A request from a client a `real_ip_from` proxy names
@@ -463,7 +474,8 @@ routez ctl unban 192.0.2.7
   length in use.
 - `bans_file` keeps them across restarts: loaded at start, skipping those
   that ended, and replaced whole after each control-socket session that
-  changed one, a `<network> <end, Unix seconds>` line each. Its directory
+  changed one, within 5 s of a `limit_req` ban, and at the stop, a
+  `<network> <end, Unix seconds>` line each. Its directory
   must be writable by `user`; a file that can't be written is logged at
   start. Without it, bans last until the process exits.
 - The socket is created mode 0600 before `user` takes over: started as
