@@ -15,6 +15,7 @@ const router = @import("router.zig");
 const Worker = @import("worker.zig").Worker;
 const static = @import("handlers/static.zig");
 const proxy = @import("handlers/proxy.zig");
+const microcache = @import("microcache.zig");
 const Header = common.Header;
 const stats = @import("stats.zig");
 
@@ -40,6 +41,8 @@ const browser_check = @import("browser_check.zig");
 const check = @import("handlers/check.zig");
 const realip = @import("realip.zig");
 const socket = @import("net/socket.zig");
+const fingerprint = @import("fingerprint.zig");
+const senders = @import("senders.zig");
 
 pub const Response = struct {
     status: u16,
@@ -150,6 +153,8 @@ pub const Request = struct {
     hop_addr: []const u8,
     /// The TCP or QUIC peer (`$realip_remote_addr`).
     peer_addr: []const u8,
+    /// The connection's JA4 fingerprint, over TLS and QUIC.
+    fingerprint: ?fingerprint.Key,
 
     pub fn get(self: *const Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -183,6 +188,7 @@ pub const RequestInit = struct {
     vhosts: *const router.VirtualHosts,
     /// The connection's client certificate; meaningful over TLS and QUIC.
     client_cert: tls.ClientCert = .{},
+    fingerprint: ?fingerprint.Key = null,
 };
 
 pub const Exchange = struct {
@@ -199,6 +205,8 @@ pub const Exchange = struct {
         proxy: *proxy.Proxy,
         /// Waiting for a verifier thread to check a password.
         auth: *auth_pool.Job,
+        /// Serving a `microcache` entry.
+        cached: *microcache.Reader,
     } = .none,
 
     status: u16 = 0,
@@ -219,6 +227,10 @@ pub const Exchange = struct {
     flush_start: u64 = 0,
     flush_mark: u64 = 0,
     upstream_addr: ?[]const u8 = null,
+    /// `$upstream_cache_status`, under a `microcache`.
+    cache_status: ?[]const u8 = null,
+    /// The microcache entry the upstream's answer goes into, as sent.
+    fill: ?*microcache.Entry = null,
     /// Set when this response is being gzip-compressed.
     gz: ?*gzip.Encoder = null,
     /// The location's `add_headers` and `proxy_set_headers` values with
@@ -291,6 +303,7 @@ pub const Exchange = struct {
             .client_ip = client_ip,
             .hop_addr = hop_addr,
             .peer_addr = if (init.peer_addr) |p| try a.dupe(u8, p) else hop_addr,
+            .fingerprint = init.fingerprint,
         };
         // By transport: an HTTP/3 request may claim any :scheme.
         if (init.client_cert.secure) {
@@ -319,11 +332,12 @@ pub const Exchange = struct {
     pub fn start(self: *Exchange) void {
         // A connection opened before its client was banned, or a client a
         // `real_ip_from` proxy names: closed unanswered, logged as nginx's 444.
-        if (self.worker.isBanned(self.req.client_ip)) {
+        if (self.worker.isRefused(self.req.client_ip, self.req.fingerprint)) {
             stats.inc(&stats.requests_banned);
             self.status = 444;
             return self.respondAbort();
         }
+        if (self.worker.shared.track_senders) self.worker.tally.add(self.req.fingerprint, senders.network(self.req.client_ip));
         if (self.req.path.len == 0) return self.sendError(400);
         // HTTP-01 validation comes over plain HTTP, ahead of any location.
         if (std.mem.eql(u8, self.req.scheme, "http")) {
@@ -556,6 +570,7 @@ pub const Exchange = struct {
         switch (self.handler) {
             .static => static.pump(self),
             .proxy => |p| p.onDownstreamWritable(),
+            .cached => microcache.pump(self),
             .none, .auth => {},
         }
     }
@@ -583,6 +598,10 @@ pub const Exchange = struct {
                 self.handler = .none;
                 self.destroy();
             },
+            .cached => {
+                microcache.release(self);
+                self.destroy();
+            },
             .none => self.destroy(),
         }
     }
@@ -597,7 +616,10 @@ pub const Exchange = struct {
         }
         const d = self.down orelse return;
         const loc = self.location orelse return d.vtable.sendHead(d.ptr, resp_in);
-        if (!final or (loc.add_headers.len == 0 and !loc.gzip)) return d.vtable.sendHead(d.ptr, resp_in);
+        if (!final or (loc.add_headers.len == 0 and !loc.gzip)) {
+            if (final) if (self.fill) |f| f.begin(resp_in.status, resp_in.headers, resp_in.content_length);
+            return d.vtable.sendHead(d.ptr, resp_in);
+        }
 
         // Rebuild the header list: add_headers, then gzip's changes.
         var resp = resp_in.*;
@@ -622,6 +644,15 @@ pub const Exchange = struct {
             }
         }
         resp.headers = list.items;
+        if (self.fill) |f| {
+            // As sent, but for `add_headers`, which a hit adds afresh.
+            const ours = resp_in.headers.len;
+            const added = loc.add_headers.len;
+            const kept = a.alloc(Header, list.items.len - added) catch return d.vtable.sendHead(d.ptr, &resp);
+            @memcpy(kept[0..ours], list.items[0..ours]);
+            @memcpy(kept[ours..], list.items[ours + added ..]);
+            f.begin(resp.status, kept, resp.content_length);
+        }
         d.vtable.sendHead(d.ptr, &resp);
     }
 
@@ -649,11 +680,15 @@ pub const Exchange = struct {
             e.write(data) catch return self.respondAbort();
             const out = e.output();
             self.bytes_sent += out.len;
-            if (out.len > 0) d.vtable.sendBody(d.ptr, out);
+            if (out.len > 0) {
+                if (self.fill) |f| f.append(out);
+                d.vtable.sendBody(d.ptr, out);
+            }
             e.consume();
             return;
         }
         self.bytes_sent += data.len;
+        if (self.fill) |f| f.append(data);
         d.vtable.sendBody(d.ptr, data);
     }
 
@@ -668,9 +703,16 @@ pub const Exchange = struct {
                 };
                 const out = e.output();
                 self.bytes_sent += out.len;
-                if (out.len > 0) d.vtable.sendBody(d.ptr, out);
+                if (out.len > 0) {
+                    if (self.fill) |f| f.append(out);
+                    d.vtable.sendBody(d.ptr, out);
+                }
             }
             self.releaseGzip();
+        }
+        if (self.fill) |f| {
+            f.done();
+            self.fill = null;
         }
         self.done = true;
         if (self.down) |d| {
@@ -773,6 +815,7 @@ pub const Exchange = struct {
             .realip_remote_addr = self.req.peer_addr,
             .remote_user = self.remote_user,
             .client_cert = self.client_cert,
+            .fingerprint = self.req.fingerprint,
             .captures = &self.captures,
         };
     }
@@ -879,6 +922,7 @@ pub const Exchange = struct {
                     .body_bytes = self.bytes_sent,
                     .elapsed_ms = elapsed,
                     .upstream_addr = self.upstream_addr,
+                    .cache_status = self.cache_status,
                     .completed = !self.failed,
                     .now_ms = logs.realtimeMs(),
                 };

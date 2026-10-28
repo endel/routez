@@ -10,6 +10,7 @@ const stats = @import("stats.zig");
 const access_log = @import("access_log.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
+const fingerprint = @import("fingerprint.zig");
 const guard = @import("guard.zig");
 const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
@@ -120,6 +121,7 @@ const Generation = struct {
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
+        if (g.shared.clients) |t| fingerprint.watch(io, t);
         if (g.shared.guards.any_auth) g.shared.auth_pool = try authPool(io);
         if (servesFiles(&g.cfg)) {
             g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
@@ -355,7 +357,14 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
         .guards = guards,
         .routes = routes,
         .check = try loadCheck(arena, io, cfg),
+        .track_senders = cfg.control_socket != null or admits(cfg),
     };
+}
+
+/// Some upstream has `max_active`.
+fn admits(cfg: *const config.Config) bool {
+    for (cfg.upstreams) |up| if (up.max_active != 0) return true;
+    return false;
 }
 
 fn realIpTrust(arena: std.mem.Allocator, cfg: *const config.Config) !realip.Trust {
@@ -539,6 +548,9 @@ test {
     _ = @import("privileges.zig");
     _ = @import("stats.zig");
     _ = @import("client_limits.zig");
+    _ = @import("fingerprint.zig");
+    _ = @import("senders.zig");
+    _ = @import("microcache.zig");
     _ = @import("control.zig");
     _ = @import("browser_check.zig");
     _ = @import("cluster.zig");

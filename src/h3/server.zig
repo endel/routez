@@ -9,6 +9,7 @@ const common = @import("../http/common.zig");
 const exchange = @import("../exchange.zig");
 const router = @import("../router.zig");
 const socket = @import("../net/socket.zig");
+const fingerprint = @import("../fingerprint.zig");
 const timers = @import("../timers.zig");
 const tls = @import("../net/tls.zig");
 const wt_relay = @import("wt_relay.zig");
@@ -116,6 +117,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                     .certs = certs,
                     .alpn = &self.alpn,
                     .ticket_key = tc.ticket_key,
+                    .fingerprint_filter = fingerprint.filter,
                 },
                 .loop = &w.loop,
                 .reuse_port = true,
@@ -137,11 +139,11 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             return self;
         }
 
-        /// CONNECTION_CLOSE to the connections of banned clients.
+        /// CONNECTION_CLOSE to the connections of banned clients and
+        /// fingerprints.
         pub fn closeBanned(self: *Self) void {
             for (self.server.conn_mgr.entries.items) |entry| {
-                const ip = socket.ipKey(entry.conn.peerAddress()) orelse continue;
-                if (!self.worker.isBanned(ip)) continue;
+                if (!self.worker.isRefused(socket.ipKey(entry.conn.peerAddress()), fingerprint.keyOf(entry.conn.fingerprint()))) continue;
                 var session: event_loop.Session = .{ .entry = entry };
                 session.closeConnection();
             }
@@ -342,6 +344,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .client_ip = socket.ipKey(peer) orelse @splat(0),
                 .vhosts = &self.vhosts,
                 .client_cert = .{ .secure = true, .auth = session.clientAuth(), .der = session.peerCertificate() },
+                .fingerprint = fingerprint.keyOf(session.fingerprint()),
             }) catch {
                 s.destroy();
                 return reject(session, stream_id, 500);

@@ -1,6 +1,7 @@
 //! Per-client limits shared by every worker and every generation: the
 //! connections each address holds (`limits.max_connections_per_ip`), the
-//! `limit_req` buckets, and bans (`routez ctl ban`).
+//! `limit_req` buckets, and bans (`routez ctl ban`) of networks and of JA4
+//! fingerprints.
 //!
 //! Entries are keyed by client address and zone, hashed with a random
 //! SipHash key onto shards, each a chained hash table over a node pool
@@ -33,13 +34,23 @@ pub const conn_zone: u32 = 0;
 /// `zoneId` never returns it either (its ids are odd).
 pub const auth_zone: u32 = 2;
 
+/// A ban's length for a JA4 fingerprint, packed as `fingerprint.zig` does,
+/// in place of a network's: past 128 bits, masking leaves the key whole.
+pub const fingerprint_bits: u8 = 255;
+
+/// A length a ban may have: a network's, or a fingerprint's.
+pub fn isBanLength(bits: u8) bool {
+    return bits <= 128 or bits == fingerprint_bits;
+}
+
 /// The zone of a ban on a network `bits` long in the 16-byte form (an IPv4
-/// /24 is 120). Even, so `zoneId` never returns one.
+/// /24 is 120), or on a fingerprint. Even, so `zoneId` never returns one.
 pub fn banZone(bits: u8) u32 {
     return 4 + 2 * @as(u32, bits);
 }
 
 fn banBits(zone: u32) ?u8 {
+    if (zone == banZone(fingerprint_bits)) return fingerprint_bits;
     if (zone < banZone(0) or zone > banZone(128) or zone & 1 != 0) return null;
     return @intCast((zone - banZone(0)) / 2);
 }
@@ -64,9 +75,11 @@ pub const Table = struct {
     untracked: std.atomic.Value(u64) = .init(0),
     sweep_cursor: std.atomic.Value(u32) = .init(0),
     last_warn_ns: std.atomic.Value(i64) = .init(std.math.minInt(i64)),
-    /// Bans held, counted by `insert` and `remove`; while zero, `banned`
-    /// reads nothing else.
+    /// Bans of networks held, counted by `insert` and `remove`; while
+    /// zero, `banned` reads nothing else.
     bans: std.atomic.Value(u32) = .init(0),
+    /// Bans of fingerprints, the same way for `fingerprintBanned`.
+    fingerprint_bans: std.atomic.Value(u32) = .init(0),
     /// A bit per prefix length ever banned, IPv4's (0 to 32) apart from
     /// IPv6's, so `banned` looks up only those of the client's family.
     /// Never cleared: a clear could race a ban being added at that length.
@@ -236,6 +249,16 @@ pub const Table = struct {
         return false;
     }
 
+    pub fn anyFingerprintBans(self: *const Table) bool {
+        return self.fingerprint_bans.load(.monotonic) != 0;
+    }
+
+    /// Whether a live ban covers the fingerprint `key`; one atomic load
+    /// while none is banned.
+    pub fn fingerprintBanned(self: *Table, io: std.Io, key: [16]u8, now_ns: i64) bool {
+        return self.anyFingerprintBans() and self.bannedAt(io, key, fingerprint_bits, now_ns);
+    }
+
     fn bannedAt(self: *Table, io: std.Io, ip: Ip, bits: u8, now_ns: i64) bool {
         var net = ip;
         access.mask(&net, bits);
@@ -249,7 +272,7 @@ pub const Table = struct {
     }
 
     /// Ban `net`/`bits` until `until_ns`, replacing the end of a ban it
-    /// already has.
+    /// already has. `fingerprint_bits` bans the fingerprint `net`.
     pub fn ban(self: *Table, io: std.Io, net: Ip, bits: u8, until_ns: i64, now_ns: i64) error{TableFull}!void {
         var key = net;
         access.mask(&key, bits);
@@ -269,7 +292,9 @@ pub const Table = struct {
                 std.debug.assert(ok);
             }
             // Masked, a key keeps the mapped prefix only at 96 bits or more.
-            if (access.isV4(key)) {
+            if (bits == fingerprint_bits) {
+                // Counted in `fingerprint_bans`; it has one length.
+            } else if (access.isV4(key)) {
                 _ = self.ban_lengths_v4.fetchOr(@as(u64, 1) << @intCast(bits - 96), .monotonic);
             } else {
                 _ = self.ban_lengths_v6[bits / 64].fetchOr(@as(u64, 1) << @intCast(bits % 64), .monotonic);
@@ -292,6 +317,7 @@ pub const Table = struct {
         return true;
     }
 
+    /// `bits` is `fingerprint_bits` for a fingerprint.
     pub const Ban = struct { net: Ip, bits: u8, until_ns: i64 };
 
     /// Where `nextBans` carries on from.
@@ -361,7 +387,7 @@ pub const Table = struct {
         s.nodes[i] = .{ .ip = ip, .zone = zone, .next = s.heads[bucket], .value = value };
         s.heads[bucket] = i + 1;
         _ = s.len.fetchAdd(1, .monotonic);
-        if (banBits(zone) != null) _ = self.bans.fetchAdd(1, .monotonic);
+        if (self.banCount(zone)) |c| _ = c.fetchAdd(1, .monotonic);
         return true;
     }
 
@@ -394,9 +420,15 @@ pub const Table = struct {
         return s.used - 1;
     }
 
+    /// The counter of the bans `zone` holds, if it is a ban zone.
+    fn banCount(self: *Table, zone: u32) ?*std.atomic.Value(u32) {
+        const bits = banBits(zone) orelse return null;
+        return if (bits == fingerprint_bits) &self.fingerprint_bans else &self.bans;
+    }
+
     fn remove(self: *Table, s: *Shard, f: Found) void {
         const n = &s.nodes[f.index];
-        if (banBits(n.zone) != null) _ = self.bans.fetchSub(1, .monotonic);
+        if (self.banCount(n.zone)) |c| _ = c.fetchSub(1, .monotonic);
         f.link.* = n.next;
         n.next = s.free;
         n.zone = free_zone;
@@ -613,6 +645,42 @@ test "bans: addresses and networks, expiry, unban, listing" {
     try testing.expectEqual(@as(usize, 0), t.nextBans(io, &cursor, 20 * s, &buf).len);
 }
 
+test "fingerprint bans: matched whole, counted apart from networks, listed" {
+    const t = try Table.createSharded(testing.allocator, 64, 4);
+    defer t.destroy(testing.allocator);
+    const io = testing.io;
+    const s = std.time.ns_per_s;
+    var fp: [16]u8 = @splat(0xab);
+    try t.ban(io, fp, fingerprint_bits, 20 * s, 10 * s);
+    try testing.expect(t.anyFingerprintBans() and !t.anyBans());
+    try testing.expect(t.fingerprintBanned(io, fp, 10 * s));
+    // Nothing is masked: a key one bit off is another fingerprint, and no network.
+    var other = fp;
+    other[15] ^= 1;
+    try testing.expect(!t.fingerprintBanned(io, other, 10 * s));
+    try testing.expect(!t.banned(io, fp, 10 * s));
+    try t.ban(io, ip4(10, 0, 0, 1), 128, 20 * s, 10 * s);
+    try testing.expect(!t.fingerprintBanned(io, ip4(10, 0, 0, 1), 10 * s));
+
+    var cursor: Table.BanCursor = .{};
+    var buf: [4]Table.Ban = undefined;
+    var fps: usize = 0;
+    while (true) {
+        const got = t.nextBans(io, &cursor, 10 * s, &buf);
+        if (got.len == 0) break;
+        for (got) |b| if (b.bits == fingerprint_bits) {
+            try testing.expectEqual(fp, b.net);
+            fps += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 1), fps);
+    try testing.expect(!t.fingerprintBanned(io, fp, 20 * s));
+    try testing.expect(t.unban(io, fp, fingerprint_bits));
+    try testing.expect(!t.anyFingerprintBans() and t.anyBans());
+    fp[0] = 0;
+    try testing.expect(!t.unban(io, fp, fingerprint_bits));
+}
+
 test "a full table makes room for a ban from a bucket, never from connections or bans" {
     const t = try Table.createSharded(testing.allocator, 2, 1);
     defer t.destroy(testing.allocator);
@@ -669,5 +737,7 @@ test "zone ids" {
     try testing.expect(zoneId(&srv, &loc_c) != conn_zone);
     try testing.expect(banBits(zoneId(&srv, &loc_a)) == null);
     try testing.expectEqual(@as(?u8, 120), banBits(banZone(120)));
+    try testing.expectEqual(@as(?u8, fingerprint_bits), banBits(banZone(fingerprint_bits)));
+    try testing.expect(banZone(fingerprint_bits) != check_zone);
     try testing.expect(banBits(auth_zone) == null and banBits(conn_zone) == null and banBits(free_zone) == null);
 }

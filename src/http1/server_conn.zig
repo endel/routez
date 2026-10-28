@@ -10,6 +10,7 @@ const timers = @import("../timers.zig");
 const exchange = @import("../exchange.zig");
 const router = @import("../router.zig");
 const tls_transport = @import("../net/tls.zig");
+const fingerprint = @import("../fingerprint.zig");
 const proxy_protocol = @import("../net/proxy_protocol.zig");
 const stats = @import("../stats.zig");
 const build_options = @import("build_options");
@@ -452,6 +453,7 @@ pub const Conn = struct {
             .peer_addr = self.peerAddr(),
             .vhosts = &self.listener.vhosts,
             .client_cert = if (self.tls) |t| t.clientCert() else .{},
+            .fingerprint = if (self.tls) |t| fingerprint.keyOf(t.conn.fingerprint()) else null,
         }) catch {
             self.rejectRequest(500);
             return false;

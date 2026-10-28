@@ -9,6 +9,7 @@ const tls_client = quic.tls_client;
 const socket = @import("socket.zig");
 const tls13 = quic.tls13;
 const guard = @import("../guard.zig");
+const fingerprint = @import("../fingerprint.zig");
 
 /// Certificates and TLS settings for one listener, shared read-only by all
 /// workers. The certificate list is also what the QUIC listener serves.
@@ -33,7 +34,7 @@ pub const ServerConfig = struct {
         if (certs.items.len == 0) return error.NoCertificate;
         const self = try arena.create(ServerConfig);
         self.* = .{
-            .tls = .{ .certs = certs.items, .alpn = alpn, .ticket_key = ticket_key },
+            .tls = .{ .certs = certs.items, .alpn = alpn, .ticket_key = ticket_key, .fingerprint_filter = fingerprint.filter },
             .certs = certs.items,
             .ticket_key = ticket_key,
         };

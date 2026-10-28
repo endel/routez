@@ -32,6 +32,9 @@ const file_io = @import("file_io.zig");
 const ofc = @import("open_file_cache.zig");
 const regex = @import("regex.zig");
 const realip = @import("realip.zig");
+const fingerprint = @import("fingerprint.zig");
+const senders = @import("senders.zig");
+const microcache = @import("microcache.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -166,6 +169,15 @@ pub const Client = struct {
         }
     }
 
+    /// The client's JA4 fingerprint, over TLS; a tunnel's is the
+    /// upstream's to see.
+    fn ja4(self: *Client) ?fingerprint.Key {
+        return switch (self.kind) {
+            .http => if (H1Conn.fromClient(self).tls) |t| fingerprint.keyOf(t.conn.fingerprint()) else null,
+            .tunnel => null,
+        };
+    }
+
     /// The client: the PROXY protocol's, else the TCP peer.
     fn ip(self: *Client) ?[16]u8 {
         return switch (self.kind) {
@@ -236,6 +248,10 @@ pub const Worker = struct {
     conn_count: u32 = 0,
     /// The client table's `ban_epoch` as of the last look for banned clients.
     ban_epoch: u32 = 0,
+    /// This second's requests by sender, for `senders.board`.
+    tally: senders.Tally = .{},
+    /// When the once-a-second work last ran.
+    second_ms: i64 = 0,
     /// When the max_connections warning last went out, to throttle it.
     max_conn_logged_ms: i64 = std.math.minInt(i64) / 2,
     gzip: gzip.Pool,
@@ -251,6 +267,8 @@ pub const Worker = struct {
     file_inbox: file_io.Inbox,
     /// Static files looked up lately.
     files: ofc.Cache,
+    /// Upstream answers kept a moment (`microcache`).
+    microcache: microcache.Cache,
     inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
@@ -302,6 +320,9 @@ pub const Worker = struct {
         open_file_cache_max: u32 = 0,
         /// `limits.max_connections` within the descriptor budget, per worker.
         max_connections: u32 = 0,
+        /// Requests are tallied by sender: for `routez ctl top`, and for
+        /// upstream admission to know a surge.
+        track_senders: bool = false,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -355,8 +376,10 @@ pub const Worker = struct {
                 .inactive_ms = cfg.open_file_cache.inactive_ms,
             }),
             .gzip = .{ .alloc = alloc },
+            .microcache = undefined,
         };
         w.timers = try timers.Timers.init(&w.loop);
+        w.microcache = .init(alloc, &w.timers, cfg.limits.microcache_bytes);
         w.timers.on_tick = onTick;
         w.regex_scratch = try regex.Scratch.init(alloc, shared.routes.max_states);
         errdefer w.regex_scratch.deinit(alloc);
@@ -549,6 +572,7 @@ pub const Worker = struct {
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
         try self.loop.run(.until_done);
+        self.microcache.deinit();
         self.files.deinit();
         self.gzip.deinit();
         log.info("worker {d} stopped", .{self.id});
@@ -625,6 +649,11 @@ pub const Worker = struct {
                 self.closeBanned();
             }
         }
+        if (self.timers.now_ms - self.second_ms >= 1000) {
+            self.second_ms = self.timers.now_ms;
+            if (self.shared.track_senders) senders.board.fold(self.io, &self.tally, @divTrunc(quic.sys.nanoTimestamp(), std.time.ns_per_s));
+            self.microcache.sweep();
+        }
         self.files.sweep(self.timers.now_ms);
         self.gzip.trim(self.timers.now_ms);
         self.publishQuicStats();
@@ -652,7 +681,7 @@ pub const Worker = struct {
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
-            if (self.isBanned(conn.ip() orelse continue)) conn.closeIfIdle(true);
+            if (self.isRefused(conn.ip(), conn.ja4())) conn.closeIfIdle(true);
         }
         for (self.quic_listeners.items) |q| q.closeBanned();
         for (self.udp_proxies.items) |u| u.closeBanned();
@@ -808,6 +837,15 @@ pub const Worker = struct {
     pub fn isBanned(self: *Worker, ip: [16]u8) bool {
         const t = self.shared.clients orelse return false;
         return t.anyBans() and t.banned(self.io, ip, self.timers.now_ms * std.time.ns_per_ms);
+    }
+
+    /// Whether a ban covers the client at `ip` or its fingerprint `fp`, by
+    /// the loop's clock.
+    pub fn isRefused(self: *Worker, ip: ?[16]u8, fp: ?fingerprint.Key) bool {
+        if (ip) |a| if (self.isBanned(a)) return true;
+        const k = fp orelse return false;
+        const t = self.shared.clients orelse return false;
+        return t.fingerprintBanned(self.io, k, self.timers.now_ms * std.time.ns_per_ms);
     }
 
     /// Live QUIC connections on this worker.

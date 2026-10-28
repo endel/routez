@@ -1,9 +1,16 @@
 //! The control socket behind `routez ctl`. A line protocol: one command a
 //! line, each answered by a line `ok` or `error: <reason>`:
 //!
-//!     ban <address>[/<prefix>] <seconds>
-//!     unban <address>[/<prefix>]
-//!     bans        a "<network> <seconds left>" line per ban, then ok
+//!     ban <target> <seconds>
+//!     unban <target>
+//!     bans        a "<target> <seconds left>" line per ban, then ok
+//!     top         the heaviest senders lately (`senders.zig`), then ok:
+//!                 "fingerprint <ja4> <req/s> <share>% usual <share>%[ surging]"
+//!                 and "network <network> <req/s> <share>%" lines, heaviest
+//!                 first, then "total <req/s>"; plain HTTP's fingerprint is `-`
+//!
+//! A target is an address, a network (`<address>/<prefix>`), or a JA4
+//! fingerprint (`t13d1516h2_8daaf6152771_e5627efa2ab1`).
 //!
 //! Bans live in the client table (`client_limits.zig`), so every worker and
 //! generation sees one at once; they last until they end or the process
@@ -16,6 +23,8 @@ const access = @import("access.zig");
 const socket = @import("net/socket.zig");
 const logs = @import("logs.zig");
 const cluster = @import("cluster.zig");
+const fingerprint = @import("fingerprint.zig");
+const senders = @import("senders.zig");
 
 const sys = quic.sys;
 const posix = std.posix;
@@ -105,11 +114,11 @@ pub fn keepBans(io: std.Io, path: []const u8, table: *client_limits.Table) !void
     while (lines.next()) |line| {
         n += 1;
         var words = std.mem.tokenizeAny(u8, line, " \t\r");
-        const net = parseNet(words.next() orelse continue);
+        const net = parseTarget(words.next() orelse continue);
         const end_s = std.fmt.parseInt(i64, words.next() orelse "", 10) catch null;
         if (net == null or end_s == null or words.next() != null) {
             // Tests fail on any logged warning.
-            if (!@import("builtin").is_test) log.warn("bans_file {s}:{d}: not \"<address>[/<prefix>] <end, Unix seconds>\"", .{ path, n });
+            if (!@import("builtin").is_test) log.warn("bans_file {s}:{d}: not \"<target> <end, Unix seconds>\"", .{ path, n });
             continue;
         }
         if (end_s.? <= now_s) continue;
@@ -123,7 +132,7 @@ pub fn keepBans(io: std.Io, path: []const u8, table: *client_limits.Table) !void
     log.info("bans_file {s}: {d} ban(s)", .{ path, loaded });
 }
 
-/// Rewrite `bans_file` with the live bans, a "<network> <end, Unix seconds>"
+/// Rewrite `bans_file` with the live bans, a "<target> <end, Unix seconds>"
 /// line each, replacing it whole.
 fn saveBans(io: std.Io, table: *client_limits.Table) void {
     if (bans_path.len == 0) return;
@@ -145,7 +154,7 @@ fn writeBans(io: std.Io, table: *client_limits.Table) !void {
         for (got) |b| {
             var buf: [64]u8 = undefined;
             const left = std.math.divCeil(i64, b.until_ns - now_ns, std.time.ns_per_s) catch 0;
-            try w.print("{s} {d}\n", .{ socket.formatNet(b.net, b.bits, &buf), now_s + left });
+            try w.print("{s} {d}\n", .{ formatTarget(b.net, b.bits, &buf), now_s + left });
         }
         try af.file.writeStreamingAll(io, w.buffered());
     }
@@ -265,12 +274,20 @@ fn monoMs() i64 {
     return @divTrunc(sys.nanoTimestamp(), std.time.ns_per_ms);
 }
 
-fn parseNet(text: ?[]const u8) ?access.Rule {
-    const r = access.parse(.deny, text orelse return null) catch return null;
+/// A ban's target: a network, or a fingerprint as `fingerprint_bits`.
+fn parseTarget(text: ?[]const u8) ?cluster.Key {
+    const t = text orelse return null;
+    if (fingerprint.parse(t)) |key| return .{ .net = key, .bits = client_limits.fingerprint_bits };
+    const r = access.parse(.deny, t) catch return null;
     // `all` or a /0: banning everyone is a firewall's job, not a typo's.
     // An IPv4 /0 is 96 bits of the mapped form.
     if (r.bits == 0 or (r.bits == 96 and access.isV4(r.net))) return null;
-    return r;
+    return .{ .net = r.net, .bits = r.bits };
+}
+
+fn formatTarget(net: [16]u8, bits: u8, buf: *[64]u8) []const u8 {
+    if (bits == client_limits.fingerprint_bits) return fingerprint.format(net, buf[0..fingerprint.Ja4.text_len]);
+    return socket.formatNet(net, bits, buf);
 }
 
 fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out, changed: *bool) !void {
@@ -278,27 +295,24 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
     const cmd = words.next() orelse return;
     var buf: [64]u8 = undefined;
     if (std.mem.eql(u8, cmd, "ban")) {
-        const net = parseNet(words.next());
+        const net = parseTarget(words.next());
         const secs = std.fmt.parseInt(u32, words.next() orelse "", 10) catch 0;
         if (net == null or secs == 0 or secs > max_ban_s or words.next() != null)
-            return out.print("error: usage: ban <address>[/<prefix>] <seconds>, 1 to {d} seconds\n", .{max_ban_s});
+            return out.print("error: usage: ban <address>[/<prefix>]|<ja4> <seconds>, 1 to {d} seconds\n", .{max_ban_s});
         const now = sys.nanoTimestamp();
         table.ban(io, net.?.net, net.?.bits, now + @as(i64, secs) * std.time.ns_per_s, now) catch
             return out.print("error: the client table is full; raise limits.max_tracked_clients\n", .{});
-        log.info("banned {s} for {d} s", .{ socket.formatNet(net.?.net, net.?.bits, &buf), secs });
-        if (sync) |s| s.noteLocal(.{ .net = net.?.net, .bits = net.?.bits }, sys.realtimeSeconds() + secs, false);
+        log.info("banned {s} for {d} s", .{ formatTarget(net.?.net, net.?.bits, &buf), secs });
+        if (sync) |s| s.noteLocal(net.?, sys.realtimeSeconds() + secs, false);
         changed.* = true;
         return out.print("ok\n", .{});
     }
     if (std.mem.eql(u8, cmd, "unban")) {
-        const net = parseNet(words.next());
-        if (net == null or words.next() != null) return out.print("error: usage: unban <address>[/<prefix>]\n", .{});
+        const net = parseTarget(words.next());
+        if (net == null or words.next() != null) return out.print("error: usage: unban <address>[/<prefix>]|<ja4>\n", .{});
         if (!table.unban(io, net.?.net, net.?.bits)) return out.print("error: not banned\n", .{});
-        if (sync) |s| {
-            const key: cluster.Key = .{ .net = net.?.net, .bits = net.?.bits };
-            s.noteLocal(key, s.liftEnd(key), true);
-        }
-        log.info("unbanned {s}", .{socket.formatNet(net.?.net, net.?.bits, &buf)});
+        if (sync) |s| s.noteLocal(net.?, s.liftEnd(net.?), true);
+        log.info("unbanned {s}", .{formatTarget(net.?.net, net.?.bits, &buf)});
         changed.* = true;
         return out.print("ok\n", .{});
     }
@@ -312,9 +326,26 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
             if (got.len == 0) break;
             for (got) |b| {
                 const left = std.math.divCeil(i64, b.until_ns - now, std.time.ns_per_s) catch 0;
-                try out.print("{s} {d}\n", .{ socket.formatNet(b.net, b.bits, &buf), left });
+                try out.print("{s} {d}\n", .{ formatTarget(b.net, b.bits, &buf), left });
             }
         }
+        return out.print("ok\n", .{});
+    }
+    if (std.mem.eql(u8, cmd, "top")) {
+        if (words.next() != null) return out.print("error: usage: top\n", .{});
+        var fps: [10]senders.Entry = undefined;
+        var nets: [10]senders.Entry = undefined;
+        const got = senders.board.top(io, @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s), &fps, &nets);
+        const total = @max(got.rate, std.math.floatMin(f32));
+        for (got.fingerprints) |e| {
+            const name = if (std.mem.eql(u8, &e.key, &senders.no_fingerprint)) "-" else fingerprint.format(e.key, buf[0..fingerprint.Ja4.text_len]);
+            try out.print("fingerprint {s} {d:.1} {d:.1}% usual {d:.1}%{s}\n", .{ name, e.rate, e.rate / total * 100, e.usual * 100, if (e.surging) " surging" else "" });
+        }
+        for (got.networks) |e| {
+            const bits: u8 = if (access.isV4(e.key)) senders.v4_bits else senders.v6_bits;
+            try out.print("network {s} {d:.1} {d:.1}%\n", .{ socket.formatNet(e.key, bits, &buf), e.rate, e.rate / total * 100 });
+        }
+        try out.print("total {d:.1}\n", .{got.rate});
         return out.print("ok\n", .{});
     }
     try out.print("error: unknown command '{s}'\n", .{printable(cmd, buf[0..32])});
@@ -392,23 +423,30 @@ test "commands" {
     try testing.expectEqualStrings("ok\n", run1(t, "ban 192.0.2.7 60", &out));
     try testing.expectEqualStrings("ok\n", run1(t, "ban 198.51.100.9/24 3600", &out));
     try testing.expectEqualStrings("ok\n", run1(t, "ban  2001:db8::1/64\t60", &out));
+    try testing.expectEqualStrings("ok\n", run1(t, "ban t13d1516h2_8daaf6152771_e5627efa2ab1 600", &out));
+    try testing.expect(t.fingerprintBanned(testing.io, fingerprint.parse("t13d1516h2_8daaf6152771_e5627efa2ab1").?, sys.nanoTimestamp()));
     try testing.expect(t.banned(testing.io, .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, sys.nanoTimestamp()));
 
     const list = run1(t, "bans", &out);
     try testing.expect(std.mem.indexOf(u8, list, "192.0.2.7 60\n") != null);
     try testing.expect(std.mem.indexOf(u8, list, "198.51.100.0/24 3600\n") != null);
     try testing.expect(std.mem.indexOf(u8, list, "2001:db8::/64 60\n") != null);
+    try testing.expect(std.mem.indexOf(u8, list, "t13d1516h2_8daaf6152771_e5627efa2ab1 600\n") != null);
     try testing.expect(std.mem.endsWith(u8, list, "ok\n"));
 
     try testing.expectEqualStrings("ok\n", run1(t, "unban 198.51.100.0/24", &out));
     try testing.expectEqualStrings("error: not banned\n", run1(t, "unban 198.51.100.0/24", &out));
     // Lifting an address doesn't lift the network it's in, or the reverse.
     try testing.expectEqualStrings("error: not banned\n", run1(t, "unban 2001:db8::1", &out));
+    try testing.expectEqualStrings("ok\n", run1(t, "unban t13d1516h2_8daaf6152771_e5627efa2ab1", &out));
+    try testing.expect(!t.anyFingerprintBans());
 
-    for ([_][]const u8{ "ban all 60", "ban 0.0.0.0/0 60", "ban 192.0.2.1", "ban 192.0.2.1 0", "ban 192.0.2.1 x", "ban 192.0.2.1 60 more", "ban nope 60", "unban", "bans now" }) |bad| {
+    for ([_][]const u8{ "ban all 60", "ban 0.0.0.0/0 60", "ban 192.0.2.1", "ban 192.0.2.1 0", "ban 192.0.2.1 x", "ban 192.0.2.1 60 more", "ban nope 60", "ban t13d1516h2_8daaf6152771 60", "unban", "bans now" }) |bad| {
         try testing.expect(std.mem.startsWith(u8, run1(t, bad, &out), "error: usage"));
     }
     try testing.expectEqualStrings("error: unknown command 'ba?n'\n", run1(t, "ba\x1bn", &out));
+    try testing.expect(std.mem.endsWith(u8, run1(t, "top", &out), "ok\n"));
+    try testing.expect(std.mem.startsWith(u8, run1(t, "top 5", &out), "error: usage"));
     try testing.expectEqualStrings("", run1(t, "   ", &out));
 }
 
@@ -424,8 +462,9 @@ test "bans_file: loaded skipping ended and malformed lines, saved whole" {
         \\198.51.100.0/24 {d}
         \\not a ban
         \\2001:db8::/48 {d}
+        \\q13d0312h3_55b375c5d22e_06cda9e17597 {d}
         \\
-    , .{ now + 600, now - 1, now + 60 }) });
+    , .{ now + 600, now - 1, now + 60, now + 60 }) });
     const path = try tmp.dir.realPathFileAlloc(testing.io, "bans", testing.allocator);
     defer testing.allocator.free(path);
     try keepBans(testing.io, path, t);
@@ -434,6 +473,7 @@ test "bans_file: loaded skipping ended and malformed lines, saved whole" {
         bans_path = "";
     }
     try testing.expectEqual(@as(u32, 2), t.bans.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), t.fingerprint_bans.load(.monotonic));
     try testing.expect(!t.banned(testing.io, client_limits.network(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 198, 51, 100, 1 }, 32, 128), sys.nanoTimestamp()));
 
     var out: Out = .{ .file = .{ .fd = -1 } };
@@ -441,9 +481,16 @@ test "bans_file: loaded skipping ended and malformed lines, saved whole" {
     saveBans(testing.io, t);
     const saved = try tmp.dir.readFileAlloc(testing.io, "bans", testing.allocator, .limited(4096));
     defer testing.allocator.free(saved);
-    var words = std.mem.tokenizeAny(u8, saved, " \n");
-    try testing.expectEqualStrings("2001:db8::/48", words.next().?);
-    const end = try std.fmt.parseInt(i64, words.next().?, 10);
-    try testing.expect(end >= now + 59 and end <= now + 61);
-    try testing.expect(words.next() == null);
+    // One line per ban, in table order.
+    var found: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, saved, '\n');
+    while (lines.next()) |line| {
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        const target = words.next().?;
+        try testing.expect(std.mem.eql(u8, target, "2001:db8::/48") or std.mem.eql(u8, target, "q13d0312h3_55b375c5d22e_06cda9e17597"));
+        const end = try std.fmt.parseInt(i64, words.next().?, 10);
+        try testing.expect(end >= now + 59 and end <= now + 61);
+        found += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), found);
 }

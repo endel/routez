@@ -435,8 +435,48 @@ variant the client doesn't take.
   the response ends; a WebSocket gives its place back once upgraded. A
   reload counts afresh: while the old workers drain, their requests count
   only against the old configuration's share.
-- Counted by `routez_upstream_requests_queued` and
-  `routez_upstream_requests_shed_total`.
+- A request whose JA4 fingerprint surges (see [Fingerprints](#fingerprints))
+  waits in the `low` line, whatever its location says, so a flood from one
+  TLS stack queues behind everyone else's requests.
+- Counted by `routez_upstream_requests_queued`,
+  `routez_upstream_requests_shed_total` and
+  `routez_upstream_requests_deprioritized_total`.
+
+### Microcache
+
+```zig
+.{ .prefix = "/", .proxy_pass = "app", .microcache = .{ .ttl_ms = 1000 } },
+```
+
+- The upstream's answer to a GET is kept for `ttl_ms` (1 to 60000) and
+  the same request answered from it meanwhile; one that arrives while the
+  first is still at the upstream waits for that answer, up to 5 s, instead
+  of going there too. While others wait, the answer is read at the
+  upstream's pace, up to 1 MiB ahead of the first client, so a slow reader
+  can't hold them up. A flood hammering the home page reaches the app once
+  a second per worker, however many clients send it, and a page that takes
+  the app two seconds to build is built once for the burst that wants it.
+- Kept: answers with status 200, 203, 301, 302, 307, 308, 404 or 410, no
+  `Set-Cookie`, no `Cache-Control` of `private`, `no-store`, `no-cache` or
+  a zero max-age, no `Vary` other than `Accept-Encoding`, no
+  `Content-Encoding` other than gzip, and a body of at most `max_bytes`
+  (1 MiB). An answer that isn't kept lets requests for it go to the
+  upstream until `ttl_ms` ends. HTTP and HTTPS, and clients that take gzip
+  and those that don't, get separate copies.
+- Only GETs with no body, `Authorization`, `Cookie` or `Range` use it. A
+  HEAD, or a revalidation (`If-None-Match`, `If-Modified-Since`), is served
+  from a kept answer but never fetches one: its answer could be a 304.
+  Answers are shared by everyone, so put it only in front of pages that
+  are the same for every client without a cookie. A client's
+  `Cache-Control` doesn't skip it: a flood would send one.
+- Each worker keeps its own, up to `limits.microcache_bytes` (64 MiB),
+  dropping the oldest answers past it. A request answered from it skips
+  `max_active`; one waiting holds no place. If the request fetching an
+  answer is turned away, or its client leaves, a waiting one fetches it
+  instead; if the upstream fails, the waiting ones go to it themselves.
+- `$upstream_cache_status` logs `HIT`, `MISS` or `BYPASS`. Counted by
+  `routez_microcache_hits_total`, `routez_microcache_waited_total`,
+  `routez_microcache_misses_total` and the `routez_microcache_bytes` gauge.
 
 ### Browser check
 
@@ -496,6 +536,7 @@ variant the client doesn't take.
 ```sh
 routez ctl ban 192.0.2.7 3600          # an address, for an hour
 routez ctl ban 2001:db8:1:2::/64 600   # or a network
+routez ctl ban t13d1516h2_8daaf6152771_e5627efa2ab1 600   # or a TLS fingerprint
 routez ctl bans                        # each with its seconds left
 routez ctl unban 192.0.2.7
 ```
@@ -567,9 +608,57 @@ Bans come from `routez ctl`, and from `limit_req`'s `ban` (see
   root, only root can use it. `routez ctl -s path` reaches another socket.
   Programs can speak its protocol directly: one command a line, any number
   per connection, each answered by a line `ok` or `error: <reason>` (for
-  `bans`, after a line per ban).
+  `bans` and `top`, after their lines).
 - Counted by `routez_connections_refused_banned_total`,
   `routez_http_requests_banned_total` and the `routez_bans` gauge.
+
+### Fingerprints
+
+Every TLS and QUIC handshake takes the client's
+[JA4](https://github.com/FoxIO-LLC/ja4) fingerprint from its ClientHello:
+what its TLS stack offers, whatever its `User-Agent` claims. A flood tool
+built on Go, Python or curl shows as such, and one tool across thousands of
+addresses shows as one fingerprint.
+
+```sh
+routez ctl top     # the heaviest senders lately
+fingerprint t13d1516h2_8daaf6152771_806a8c22fdea 812.4 71.3% usual 69.8%
+fingerprint t13d171100_ab0a1bf427ad_8e6e362c5eac 290.1 25.5% usual 0.4% surging
+network 203.0.113.0/24 140.2 12.3%
+...
+total 1139.5
+ok
+routez ctl ban t13d171100_ab0a1bf427ad_8e6e362c5eac 3600
+```
+
+- `$ssl_ja4` holds it, for the access log or for the app
+  (`proxy_set_headers = .{.{ .name = "x-ja4", .value = "$ssl_ja4" }}`).
+  Plain HTTP has none. It is the same string Wireshark and other JA4
+  tools print, but for clients that put GREASE among their signature
+  algorithms (recent Chrome): JA4's reference implementation leaves it out,
+  as routez does, and Wireshark 4.6 keeps it.
+- A banned fingerprint is refused at the ClientHello, before any key
+  exchange, so a banned tool's handshakes cost next to nothing; connections
+  it already holds are closed within a tick. Fingerprint bans are listed,
+  kept in `bans_file` and shared over `cluster` like network bans. Ban by
+  fingerprint only what is clearly a tool: a browser's fingerprint is
+  shared by everyone running that browser version.
+- `top` lists the fingerprints and networks (IPv4 /24, IPv6 /64) sending the
+  most requests, each with its rate over the last ~10 s and its share of
+  all requests; plain HTTP shows as `-`. Requests are tallied while
+  `control_socket` is set or some upstream has `max_active`.
+- A fingerprint's usual share is learnt while no upstream queues, over
+  about ten minutes. One that has a quarter of all requests and four times
+  its usual share surges, and under load its requests wait behind everyone
+  else's (see [Upstream admission](#upstream-admission)). A browser keeps
+  its share of the traffic through a flood from someone else's tool; the
+  tool's fingerprint, rare or absent while things were calm, stands out.
+  Until two minutes without queueing have been seen nothing surges, so
+  starting in the middle of a flood falls back to plain shedding.
+- Taking the fingerprint costs about 0.5 µs a handshake, against about
+  160 µs for the handshake's own key exchange and signature.
+- Counted by `routez_handshakes_refused_fingerprint_total` and the
+  `routez_fingerprint_bans` gauge.
 
 ### Access control
 
@@ -722,8 +811,9 @@ which proxies to believe:
   reopened keeps being written where it was.
 - Access log templates take the variables above and `$status`,
   `$body_bytes_sent`, `$request_time`, `$request`, `$request_method`,
-  `$protocol`, `$upstream_addr`, `$request_completion`, `$time_iso8601`,
-  `$time_local`, `$msec` and any request header as `$http_<name>`
+  `$protocol`, `$upstream_addr`, `$upstream_cache_status`,
+  `$request_completion`, `$time_iso8601`, `$time_local`, `$msec` and any
+  request header as `$http_<name>`
   (`$http_user_agent`); see `src/access_log.zig`. Over HTTP/1.1, as in
   nginx, a request is logged once its response has been handed to the
   kernel, and `$body_bytes_sent` counts only what was: a client that drops
@@ -769,6 +859,7 @@ which proxies to believe:
 | `$ssl_client_s_dn`, `$ssl_client_i_dn` | its subject and issuer, RFC 4514 (`CN=alice,O=Example`) |
 | `$ssl_client_serial` | its serial number, hex |
 | `$ssl_client_fingerprint` | SHA-1 of the certificate, hex |
+| `$ssl_ja4` | the client's [JA4](#fingerprints) TLS fingerprint, over TLS and QUIC |
 | `$1`..`$9`, `$0` | groups of the last regex that matched (a rewrite's or the location's), and its whole match, percent-encoded |
 
 Pass certificate details upstream with `proxy_set_headers`: it replaces

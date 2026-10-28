@@ -569,6 +569,52 @@ SUITE=bans check kept-across-restart "$(ctl bans | grep -c -E '^10\.9\.0\.0/16 (
 SUITE=bans check auto-ban-kept "$(ctl bans | grep -c -E '^10\.7\.7\.7 ')" 1
 kill $BANS; wait $BANS 2>/dev/null
 
+# Fingerprints: $ssl_ja4 over TLS and QUIC; a banned JA4 refused at the
+# ClientHello, what it holds open closed, the ban kept in bans_file; the
+# heaviest senders through `top`.
+cat > "$WORK/fp.zon" <<EOF2
+.{ .access_log = false, .control_socket = "$WORK/fp.sock", .bans_file = "$WORK/fp-bans.txt",
+   .servers = .{.{
+    .listen = .{ .{ .address = "127.0.0.1", .port = 18456, .tls = true, .quic = true }, .{ .address = "127.0.0.1", .port = 18457 } },
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{
+        .{ .prefix = "/", .@"return" = .{ .body = "ok" }, .add_headers = .{.{ .name = "x-ja4", .value = "\$ssl_ja4" }} },
+        .{ .prefix = "/metrics", .metrics = true },
+    },
+}} }
+EOF2
+start_fp() {
+    "$ROOT/zig-out/bin/routez" "$WORK/fp.zon" 2>> "$WORK/fp.log" & FPS=$!; PIDS+=($FPS)
+    wait_port 18457
+    for _ in $(seq 1 50); do [ -S "$WORK/fp.sock" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+}
+start_fp
+fctl() { "$ROOT/zig-out/bin/routez" ctl -s "$WORK/fp.sock" "$@"; }
+ja4_of() { $CURL_BIN -s -D - -o /dev/null --max-time 2 --cacert "$CERTS/ca.crt" "$@" | grep -i '^x-ja4:' | cut -d' ' -f2 | tr -d '\r'; }
+code_of() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 --cacert "$CERTS/ca.crt" "$@"; }
+fp_shape() { [[ "$1" =~ ^$2[di][0-9]{4}[0-9A-Za-z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$ ]] && echo "$2" || echo "bad '$1'"; }
+# Another TLS stack: no ALPN, so never curl's fingerprint.
+py_get() { "$PY_TLS" -c 'import ssl, sys, urllib.request as u
+c = ssl.create_default_context(cafile=sys.argv[1]); c.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+print(u.urlopen("https://127.0.0.1:18456/", context=c, timeout=3).status)' "$CERTS/ca.crt" 2>/dev/null || echo 000; }
+fp_metric() { $CURL_BIN -s http://127.0.0.1:18457/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+TLS_FP=$(ja4_of https://127.0.0.1:18456/)
+H3_FP=$(ja4_of --http3-only https://127.0.0.1:18456/)
+SUITE=fingerprints check ja4-variable "$(fp_shape "$TLS_FP" t13) $(fp_shape "$H3_FP" q13) [$(ja4_of http://127.0.0.1:18457/)]" "t13 q13 []"
+SUITE=fingerprints check ban "$(fctl ban "$TLS_FP" 60) $(code_of https://127.0.0.1:18456/) $(fctl ban "$H3_FP" 600) $(code_of --http3-only https://127.0.0.1:18456/)" "ok 000 ok 000"
+SUITE=fingerprints check other-stack "$(py_get) $(code_of http://127.0.0.1:18457/)" "200 200"
+SUITE=fingerprints check list "$(fctl bans | grep -c -E "^($TLS_FP (59|60)|$H3_FP (599|600))$") $(fctl bans | tail -1)" "2 ok"
+SUITE=fingerprints check metrics "$([ "$(fp_metric routez_handshakes_refused_fingerprint_total)" -ge 2 ] && echo refused) $(fp_metric routez_fingerprint_bans)" "refused 2"
+SUITE=fingerprints check open-closed "$("$PY_TLS" "$HERE/ban_fingerprint.py" 18456 "$CERTS/ca.crt" "$ROOT/zig-out/bin/routez" "$WORK/fp.sock")" "200 closed"
+# Each worker folds its tally in once a second.
+perl -e 'select(undef,undef,undef,1.2)'
+SUITE=fingerprints check top "$(fctl top | grep -c -E "^fingerprint $TLS_FP [0-9.]+ |^network 127\.0\.0\.0/24 [0-9.]+ ") $(fctl top | tail -1)" "2 ok"
+SUITE=fingerprints check unban "$(fctl unban "$H3_FP") $(code_of --http3-only https://127.0.0.1:18456/)" "ok 200"
+kill $FPS; wait $FPS 2>/dev/null
+start_fp
+SUITE=fingerprints check kept-across-restart "$(fctl bans | grep -c -E "^$TLS_FP ") $(code_of https://127.0.0.1:18456/)" "1 000"
+kill $FPS; wait $FPS 2>/dev/null
+
 # Upstream admission: one place at a time on the slow upstream (3 s a
 # request), one waiting. A normal request bumps a low one from a full line,
 # and is itself turned away when the line holds only normal ones.
@@ -604,6 +650,50 @@ SUITE=admission check queue-timeout "$(cat "$WORK/adm5") $late $([ $waited -ge 2
 adm_metric() { $CURL_BIN -s http://127.0.0.1:18453/metrics | python3 "$HERE/check_metrics.py" "$1"; }
 SUITE=admission check metrics "$(adm_metric routez_upstream_requests_shed_total) $(adm_metric routez_upstream_requests_queued)" "3 0"
 kill $ADM; wait $ADM 2>/dev/null
+
+# microcache: answers kept for a second; requests that arrive while one
+# is at the upstream wait for its answer; what isn't to be kept, and
+# requests that mustn't share one, go by. The upstream counts its requests.
+cat > "$WORK/mc.zon" <<EOF2
+.{ .access_log = false, .workers = 1, .servers = .{.{
+  .listen = .{ .{ .address = "127.0.0.1", .port = 18458 }, .{ .address = "127.0.0.1", .port = 18459, .tls = true } },
+  .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+  .rewrite = .{.{ .regex = "^/old-small/(.*)$", .replacement = "/small/\$1" }},
+  .locations = .{
+    .{ .prefix = "/count/", .proxy_pass = "127.0.0.1:19001", .microcache = .{ .ttl_ms = 1000 } },
+    .{ .prefix = "/small/", .proxy_pass = "127.0.0.1:19001/count/", .microcache = .{ .ttl_ms = 1000, .max_bytes = 1000 } },
+    .{ .prefix = "/gzc/", .proxy_pass = "127.0.0.1:19001/count/", .gzip = true, .microcache = .{ .ttl_ms = 1000 } },
+    .{ .prefix = "/metrics", .metrics = true },
+} }} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/mc.zon" 2> "$WORK/mc.log" & MC=$!; PIDS+=($MC)
+wait_port 18458
+mc() { $CURL_BIN -s --max-time 5 "$@" | head -c 1; }
+mc_metric() { $CURL_BIN -s http://127.0.0.1:18458/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+SUITE=microcache check kept "$(mc http://127.0.0.1:18458/count/a) $(mc http://127.0.0.1:18458/count/a)" "1 1"
+perl -e 'select(undef,undef,undef,1.2)'
+SUITE=microcache check expires "$(mc http://127.0.0.1:18458/count/a)" 2
+# HEAD from the GET's answer, with its length.
+SUITE=microcache check head "$(mc http://127.0.0.1:18458/count/h) $($CURL_BIN -s -I http://127.0.0.1:18458/count/h | grep -i '^content-length:' | tr -d '\r' | tr '[:upper:]' '[:lower:]') $(mc http://127.0.0.1:18458/count/h)" "1 content-length: 1 1"
+MCS=(); for i in $(seq 1 10); do mc http://127.0.0.1:18458/count/slow-c > "$WORK/mc$i" & MCS+=($!); done; wait "${MCS[@]}"
+SUITE=microcache check coalesced "$(cat "$WORK"/mc{1..10} | tr -d '\n') $(mc_metric routez_microcache_waited_total)" "1111111111 9"
+SUITE=microcache check set-cookie-not-kept "$(mc http://127.0.0.1:18458/count/cookie-d) $(mc http://127.0.0.1:18458/count/cookie-d)" "1 2"
+SUITE=microcache check private-not-kept "$(mc http://127.0.0.1:18458/count/private-e) $(mc http://127.0.0.1:18458/count/private-e)" "1 2"
+SUITE=microcache check too-big-not-kept "$(mc http://127.0.0.1:18458/small/big-f) $(mc http://127.0.0.1:18458/small/big-f) $(mc http://127.0.0.1:18458/count/big-g) $(mc http://127.0.0.1:18458/count/big-g)" "1 2 1 1"
+# A request with a cookie neither takes a kept answer nor leaves one.
+SUITE=microcache check cookie-goes-by "$(mc -H 'Cookie: s=1' http://127.0.0.1:18458/count/i) $(mc http://127.0.0.1:18458/count/i) $(mc -H 'Cookie: s=1' http://127.0.0.1:18458/count/i) $(mc http://127.0.0.1:18458/count/i)" "1 2 3 2"
+SUITE=microcache check post-goes-by "$($CURL_BIN -s -o /dev/null -w '%{http_code}' -X POST -d x http://127.0.0.1:18458/count/j) $(mc http://127.0.0.1:18458/count/j)" "200 1"
+SUITE=microcache check schemes-apart "$(mc http://127.0.0.1:18458/count/s) $(mc --cacert "$CERTS/ca.crt" https://127.0.0.1:18459/count/s) $(mc --cacert "$CERTS/ca.crt" https://127.0.0.1:18459/count/s)" "1 2 2"
+# A revalidation may get a 304: it takes a kept answer but never fetches one.
+SUITE=microcache check conditional-reads-only "$(mc -H 'If-None-Match: "x"' http://127.0.0.1:18458/count/n) $(mc http://127.0.0.1:18458/count/n) $(mc -H 'If-None-Match: "x"' http://127.0.0.1:18458/count/n)" "1 2 2"
+# Rewritten, the request goes upstream as /small/r, not /count/r: not the same answer.
+SUITE=microcache check keyed-by-upstream-target "$(mc http://127.0.0.1:18458/small/r) $(mc http://127.0.0.1:18458/old-small/r)" "1 {"
+SUITE=microcache check br-not-kept "$(mc http://127.0.0.1:18458/count/br-t) $(mc http://127.0.0.1:18458/count/br-t)" "1 2"
+# Kept as sent, compressed: a hit isn't compressed again, nor told to Vary twice.
+mc_head() { $CURL_BIN -s -D - -o /dev/null -H 'Accept-Encoding: gzip' http://127.0.0.1:18458/gzc/big-z | tr -d '\r'; }
+SUITE=microcache check gzip-kept-encoded "$(mc --compressed http://127.0.0.1:18458/gzc/big-z) $(mc_head | grep -ci '^content-encoding: gzip') $(mc_head | grep -ci '^vary:') $(mc --compressed http://127.0.0.1:18458/gzc/big-z)" "1 1 1 1"
+SUITE=microcache check metrics "$(mc_metric routez_microcache_hits_total) $(mc_metric routez_microcache_misses_total)" "19 17"
+kill $MC; wait $MC 2>/dev/null
 
 # The browser check: `.always` on /, `.under_load` on /busy, whose slow
 # upstream (3 s a request) has one place and one seat in line.
