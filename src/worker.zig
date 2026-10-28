@@ -250,7 +250,8 @@ pub const Worker = struct {
     ban_epoch: u32 = 0,
     /// This second's requests by sender, for `senders.board`.
     tally: senders.Tally = .{},
-    tally_folded_ms: i64 = 0,
+    /// When the once-a-second work last ran.
+    second_ms: i64 = 0,
     /// When the max_connections warning last went out, to throttle it.
     max_conn_logged_ms: i64 = std.math.minInt(i64) / 2,
     gzip: gzip.Pool,
@@ -268,7 +269,6 @@ pub const Worker = struct {
     files: ofc.Cache,
     /// Upstream answers kept a moment (`microcache`).
     microcache: microcache.Cache,
-    microcache_swept_ms: i64 = 0,
     inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
@@ -649,12 +649,9 @@ pub const Worker = struct {
                 self.closeBanned();
             }
         }
-        if (self.shared.track_senders and self.timers.now_ms - self.tally_folded_ms >= 1000) {
-            self.tally_folded_ms = self.timers.now_ms;
-            senders.board.fold(self.io, &self.tally, @divTrunc(quic.sys.nanoTimestamp(), std.time.ns_per_s));
-        }
-        if (self.timers.now_ms - self.microcache_swept_ms >= 1000) {
-            self.microcache_swept_ms = self.timers.now_ms;
+        if (self.timers.now_ms - self.second_ms >= 1000) {
+            self.second_ms = self.timers.now_ms;
+            if (self.shared.track_senders) senders.board.fold(self.io, &self.tally, @divTrunc(quic.sys.nanoTimestamp(), std.time.ns_per_s));
             self.microcache.sweep();
         }
         self.files.sweep(self.timers.now_ms);

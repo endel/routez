@@ -133,7 +133,7 @@ pub const Entry = struct {
     body_bytes: u64,
     elapsed_ms: i64,
     upstream_addr: ?[]const u8,
-    cache_status: []const u8 = "",
+    cache_status: ?[]const u8 = null,
     completed: bool,
     /// Wall clock at the end of the request, ms since the Unix epoch.
     now_ms: i64,
@@ -194,7 +194,7 @@ fn logValue(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: LogVar, e: *co
         .request_method => e.method,
         .protocol => e.protocol,
         .upstream_addr => e.upstream_addr,
-        .upstream_cache_status => if (e.cache_status.len > 0) e.cache_status else null,
+        .upstream_cache_status => e.cache_status,
         .request_completion => if (e.completed) "OK" else "",
         .time_iso8601, .time_local => blk: {
             const t = civil(@divFloor(e.now_ms, 1000));

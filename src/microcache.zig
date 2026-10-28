@@ -13,6 +13,9 @@
 //! but gzip. Clients that take gzip and those that don't are kept apart, as
 //! are schemes. An answer not kept lets requests by until the TTL ends.
 //!
+//! What's kept is what the filler's client was sent, compressed if it was,
+//! so a hit costs no encoding; `add_headers` are added afresh each time.
+//!
 //! Each worker has its own: no locks, and up to one fetch per worker.
 const std = @import("std");
 const config = @import("config.zig");
@@ -23,6 +26,7 @@ const stats = @import("stats.zig");
 const gzip = @import("gzip.zig");
 const Exchange = @import("exchange.zig").Exchange;
 const Proxy = @import("handlers/proxy.zig").Proxy;
+const Line = @import("upstream.zig").Group.Line;
 const Header = common.Header;
 
 const kept_statuses = [_]u16{ 200, 203, 301, 302, 307, 308, 404, 410 };
@@ -46,7 +50,9 @@ pub const Cache = struct {
     budget: u64,
     /// Bytes the entries in `map` hold.
     bytes: u64 = 0,
-    map: std.StringHashMapUnmanaged(*Entry) = .empty,
+    /// swapRemove, not remove: entries come and go every TTL, and
+    /// `std.HashMap` keeps a tombstone per removal (see open_file_cache.zig).
+    map: std.StringArrayHashMapUnmanaged(*Entry) = .empty,
     /// The entries in `map`, oldest first.
     oldest: ?*Entry = null,
     newest: ?*Entry = null,
@@ -61,18 +67,29 @@ pub const Cache = struct {
         self.map.deinit(self.alloc);
     }
 
-    pub fn lookup(self: *Cache, ex: *Exchange, loc: *const config.Location, mc: config.Location.Microcache) Lookup {
+    pub fn lookup(self: *Cache, ex: *Exchange, loc: *const config.Location) Lookup {
+        const mc = loc.microcache orelse return .pass;
         const head = ex.req.isHead();
         if (!head and !std.mem.eql(u8, ex.req.method, "GET")) return .pass;
         if (ex.req.body != .none or ex.req.upgrade != null) return .pass;
-        for ([_][]const u8{ "authorization", "cookie", "range" }) |h| if (ex.req.get(h) != null) return .pass;
-        // Its answer may be a 304, which isn't one to keep.
-        const conditional = ex.req.get("if-none-match") != null or ex.req.get("if-modified-since") != null;
+        var conditional = false;
+        var accept_encoding: ?[]const u8 = null;
+        for (ex.req.headers) |h| {
+            const is = struct {
+                fn f(name: []const u8, want: []const u8) bool {
+                    return std.ascii.eqlIgnoreCase(name, want);
+                }
+            }.f;
+            if (is(h.name, "authorization") or is(h.name, "cookie") or is(h.name, "range")) return .pass;
+            // Its answer may be a 304, which isn't one to keep.
+            if (is(h.name, "if-none-match") or is(h.name, "if-modified-since")) conditional = true;
+            if (is(h.name, "accept-encoding")) accept_encoding = h.value;
+        }
         const reads_only = head or conditional;
         var key: std.ArrayList(u8) = .empty;
         key.print(ex.arena(), "{x}\x00{d}\x00{s}\x00{s}\x00", .{
             @intFromPtr(loc),
-            @intFromBool(gzip.clientAccepts(ex.req.get("accept-encoding"))),
+            @intFromBool(gzip.clientAccepts(accept_encoding)),
             ex.req.scheme,
             ex.req.authority,
         }) catch return .pass;
@@ -83,7 +100,8 @@ pub const Cache = struct {
             switch (e.state) {
                 .filling => return if (reads_only) .pass else .{ .wait = e },
                 .ready => if (now < e.until_ms) return .{ .hit = e },
-                .passed => if (now < e.until_ms) return .pass,
+                // A dropped one is out of the map already.
+                .passed, .dropped => if (now < e.until_ms) return .pass,
             }
             self.remove(e);
         }
@@ -111,7 +129,7 @@ pub const Cache = struct {
     /// its readers are done.
     fn remove(self: *Cache, e: *Entry) void {
         std.debug.assert(e.in_map);
-        _ = self.map.remove(e.key);
+        _ = self.map.swapRemove(e.key);
         if (e.older) |o| o.newer = e.newer else self.oldest = e.newer;
         if (e.newer) |n| n.older = e.older else self.newest = e.older;
         e.in_map = false;
@@ -131,13 +149,17 @@ pub const Cache = struct {
         return true;
     }
 
-    /// Drop what ended. Every second, from the worker's tick.
+    /// Drop what ended, oldest first, up to the first that hasn't; one
+    /// behind it with a shorter TTL goes at its next lookup, or for room.
+    /// Every second, from the worker's tick.
     pub fn sweep(self: *Cache) void {
         const now = self.timers.now_ms;
         var at = self.oldest;
         while (at) |e| {
             at = e.newer;
-            if (e.state != .filling and e.until_ms <= now) self.remove(e);
+            if (e.state == .filling) continue;
+            if (e.until_ms > now) return;
+            self.remove(e);
         }
     }
 };
@@ -147,8 +169,6 @@ pub const Entry = struct {
     /// The map's key, owned.
     key: []u8,
     state: State = .filling,
-    /// Set by `drop`: the filler went away, and waiters look again.
-    dropped: bool = false,
     /// Until when a ready entry serves and a passed one lets requests by.
     until_ms: i64 = 0,
     ttl_ms: u32,
@@ -165,12 +185,20 @@ pub const Entry = struct {
     body: std.ArrayListUnmanaged(u8) = .empty,
     /// Bytes counted in `cache.bytes`.
     counted: u64 = 0,
-    /// Requests waiting for the filler's answer, linked through
-    /// `Proxy.cache_next` and `cache_prev`.
-    waiting: ?*Proxy = null,
+    /// Requests waiting for the filler's answer, oldest first. They hold no
+    /// place at the upstream, so its line's links are free.
+    waiting: Line = .{},
     wake: timers.Deferred = .{ .callback = onWake },
 
-    pub const State = enum { filling, ready, passed };
+    pub const State = enum {
+        filling,
+        ready,
+        /// Not an answer to keep: requests go by until `until_ms`.
+        passed,
+        /// The filler went before the upstream answered: forgotten, and
+        /// waiters look again.
+        dropped,
+    };
 
     fn count(self: *Entry, n: u64) void {
         self.counted += n;
@@ -240,6 +268,10 @@ pub const Entry = struct {
     pub fn done(self: *Entry) void {
         if (self.state != .filling) return;
         if (self.status == 0) return self.pass();
+        // A body read in chunks grew past its length.
+        const cap = self.body.capacity;
+        self.body.shrinkAndFree(self.cache.alloc, self.body.items.len);
+        if (self.in_map) self.uncount(cap - self.body.capacity);
         self.state = .ready;
         self.until_ms = self.cache.timers.now_ms + self.ttl_ms;
         self.wakeWaiters();
@@ -248,8 +280,21 @@ pub const Entry = struct {
     /// Not an answer to keep: requests go by until the TTL ends, the
     /// waiters too.
     pub fn pass(self: *Entry) void {
+        self.settle(.passed);
+    }
+
+    /// The filler went before the upstream answered: forgotten, and the
+    /// waiters look again, one of them to fill it anew.
+    pub fn drop(self: *Entry) void {
         if (self.state != .filling) return;
-        self.state = .passed;
+        self.settle(.dropped);
+        if (self.in_map) self.cache.remove(self);
+    }
+
+    /// Filled no further: let the body go and the waiters know.
+    fn settle(self: *Entry, state: State) void {
+        if (self.state != .filling) return;
+        self.state = state;
         self.until_ms = self.cache.timers.now_ms + self.ttl_ms;
         const a = self.cache.alloc;
         if (self.in_map) self.uncount(self.counted - (self.key.len + @sizeOf(Entry)));
@@ -261,41 +306,18 @@ pub const Entry = struct {
         self.wakeWaiters();
     }
 
-    /// The filler went before the upstream answered: forgotten, and the
-    /// waiters look again, one of them to fill it anew.
-    pub fn drop(self: *Entry) void {
-        if (self.state != .filling) return;
-        self.dropped = true;
-        self.pass();
-        if (self.in_map) self.cache.remove(self);
-    }
-
-    pub fn follow(self: *Entry, p: *Proxy) void {
-        p.cache_prev = null;
-        p.cache_next = self.waiting;
-        if (self.waiting) |w| w.cache_prev = p;
-        self.waiting = p;
-    }
-
-    pub fn unfollow(self: *Entry, p: *Proxy) void {
-        if (p.cache_prev) |q| q.cache_next = p.cache_next else self.waiting = p.cache_next;
-        if (p.cache_next) |q| q.cache_prev = p.cache_prev;
-        p.cache_prev = null;
-        p.cache_next = null;
-    }
-
     /// Waiters hear on a later loop iteration, so none runs inside the
     /// filler's callbacks.
     fn wakeWaiters(self: *Entry) void {
-        if (self.waiting == null or self.wake.queued) return;
+        if (self.waiting.head == null or self.wake.queued) return;
         self.refs += 1;
         self.cache.timers.defer_(&self.wake);
     }
 
     fn onWake(d: *timers.Deferred) void {
         const self: *Entry = @fieldParentPtr("wake", d);
-        while (self.waiting) |p| {
-            self.unfollow(p);
+        while (self.waiting.head) |p| {
+            self.waiting.remove(p);
             p.cacheWoken(self);
         }
         self.unref();
@@ -315,11 +337,8 @@ fn keepable(status: u16, headers: []const Header) bool {
             while (it.next()) |v| if (!std.ascii.eqlIgnoreCase(v, "accept-encoding")) return false;
         }
         if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) {
-            var it = std.mem.tokenizeAny(u8, h.value, ", \t");
-            while (it.next()) |d| {
-                for ([_][]const u8{ "private", "no-store", "no-cache", "max-age=0", "s-maxage=0" }) |no| {
-                    if (std.ascii.eqlIgnoreCase(d, no)) return false;
-                }
+            for ([_][]const u8{ "private", "no-store", "no-cache", "max-age=0", "s-maxage=0" }) |no| {
+                if (common.connectionListHas(&.{h.value}, no)) return false;
             }
         }
     }
@@ -334,6 +353,7 @@ pub fn serve(ex: *Exchange, e: *Entry) void {
     ex.handler = .{ .cached = r };
     ex.cache_status = "HIT";
     stats.inc(&stats.microcache_hits);
+    // Kept as sent, so gzip leaves an encoded body alone.
     ex.respondHead(&.{ .status = e.status, .headers = e.headers, .content_length = e.body.items.len });
     if (ex.req.isHead()) r.off = e.body.items.len;
     pump(ex);

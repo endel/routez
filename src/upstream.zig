@@ -47,18 +47,18 @@ pub const Group = struct {
     wake: timers.Deferred = .{ .callback = onWake },
 
     /// Threaded through the waiting proxies, so waiting allocates nothing.
-    const Line = struct {
+    pub const Line = struct {
         head: ?*Proxy = null,
         tail: ?*Proxy = null,
 
-        fn push(l: *Line, p: *Proxy) void {
+        pub fn push(l: *Line, p: *Proxy) void {
             p.wait_prev = l.tail;
             p.wait_next = null;
             if (l.tail) |t| t.wait_next = p else l.head = p;
             l.tail = p;
         }
 
-        fn remove(l: *Line, p: *Proxy) void {
+        pub fn remove(l: *Line, p: *Proxy) void {
             if (p.wait_prev) |q| q.wait_next = p.wait_next else l.head = p.wait_next;
             if (p.wait_next) |q| q.wait_prev = p.wait_prev else l.tail = p.wait_prev;
             p.wait_prev = null;

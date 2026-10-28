@@ -228,7 +228,9 @@ pub const Exchange = struct {
     flush_mark: u64 = 0,
     upstream_addr: ?[]const u8 = null,
     /// `$upstream_cache_status`, under a `microcache`.
-    cache_status: []const u8 = "",
+    cache_status: ?[]const u8 = null,
+    /// The microcache entry the upstream's answer goes into, as sent.
+    fill: ?*microcache.Entry = null,
     /// Set when this response is being gzip-compressed.
     gz: ?*gzip.Encoder = null,
     /// The location's `add_headers` and `proxy_set_headers` values with
@@ -614,7 +616,10 @@ pub const Exchange = struct {
         }
         const d = self.down orelse return;
         const loc = self.location orelse return d.vtable.sendHead(d.ptr, resp_in);
-        if (!final or (loc.add_headers.len == 0 and !loc.gzip)) return d.vtable.sendHead(d.ptr, resp_in);
+        if (!final or (loc.add_headers.len == 0 and !loc.gzip)) {
+            if (final) if (self.fill) |f| f.begin(resp_in.status, resp_in.headers, resp_in.content_length);
+            return d.vtable.sendHead(d.ptr, resp_in);
+        }
 
         // Rebuild the header list: add_headers, then gzip's changes.
         var resp = resp_in.*;
@@ -639,6 +644,15 @@ pub const Exchange = struct {
             }
         }
         resp.headers = list.items;
+        if (self.fill) |f| {
+            // As sent, but for `add_headers`, which a hit adds afresh.
+            const ours = resp_in.headers.len;
+            const added = loc.add_headers.len;
+            const kept = a.alloc(Header, list.items.len - added) catch return d.vtable.sendHead(d.ptr, &resp);
+            @memcpy(kept[0..ours], list.items[0..ours]);
+            @memcpy(kept[ours..], list.items[ours + added ..]);
+            f.begin(resp.status, kept, resp.content_length);
+        }
         d.vtable.sendHead(d.ptr, &resp);
     }
 
@@ -666,11 +680,15 @@ pub const Exchange = struct {
             e.write(data) catch return self.respondAbort();
             const out = e.output();
             self.bytes_sent += out.len;
-            if (out.len > 0) d.vtable.sendBody(d.ptr, out);
+            if (out.len > 0) {
+                if (self.fill) |f| f.append(out);
+                d.vtable.sendBody(d.ptr, out);
+            }
             e.consume();
             return;
         }
         self.bytes_sent += data.len;
+        if (self.fill) |f| f.append(data);
         d.vtable.sendBody(d.ptr, data);
     }
 
@@ -685,9 +703,16 @@ pub const Exchange = struct {
                 };
                 const out = e.output();
                 self.bytes_sent += out.len;
-                if (out.len > 0) d.vtable.sendBody(d.ptr, out);
+                if (out.len > 0) {
+                    if (self.fill) |f| f.append(out);
+                    d.vtable.sendBody(d.ptr, out);
+                }
             }
             self.releaseGzip();
+        }
+        if (self.fill) |f| {
+            f.done();
+            self.fill = null;
         }
         self.done = true;
         if (self.down) |d| {

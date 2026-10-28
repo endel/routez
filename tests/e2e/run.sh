@@ -662,6 +662,7 @@ cat > "$WORK/mc.zon" <<EOF2
   .locations = .{
     .{ .prefix = "/count/", .proxy_pass = "127.0.0.1:19001", .microcache = .{ .ttl_ms = 1000 } },
     .{ .prefix = "/small/", .proxy_pass = "127.0.0.1:19001/count/", .microcache = .{ .ttl_ms = 1000, .max_bytes = 1000 } },
+    .{ .prefix = "/gzc/", .proxy_pass = "127.0.0.1:19001/count/", .gzip = true, .microcache = .{ .ttl_ms = 1000 } },
     .{ .prefix = "/metrics", .metrics = true },
 } }} }
 EOF2
@@ -688,7 +689,10 @@ SUITE=microcache check conditional-reads-only "$(mc -H 'If-None-Match: "x"' http
 # Rewritten, the request goes upstream as /small/r, not /count/r: not the same answer.
 SUITE=microcache check keyed-by-upstream-target "$(mc http://127.0.0.1:18458/small/r) $(mc http://127.0.0.1:18458/old-small/r)" "1 {"
 SUITE=microcache check br-not-kept "$(mc http://127.0.0.1:18458/count/br-t) $(mc http://127.0.0.1:18458/count/br-t)" "1 2"
-SUITE=microcache check metrics "$(mc_metric routez_microcache_hits_total) $(mc_metric routez_microcache_misses_total)" "16 16"
+# Kept as sent, compressed: a hit isn't compressed again, nor told to Vary twice.
+mc_head() { $CURL_BIN -s -D - -o /dev/null -H 'Accept-Encoding: gzip' http://127.0.0.1:18458/gzc/big-z | tr -d '\r'; }
+SUITE=microcache check gzip-kept-encoded "$(mc --compressed http://127.0.0.1:18458/gzc/big-z) $(mc_head | grep -ci '^content-encoding: gzip') $(mc_head | grep -ci '^vary:') $(mc --compressed http://127.0.0.1:18458/gzc/big-z)" "1 1 1 1"
+SUITE=microcache check metrics "$(mc_metric routez_microcache_hits_total) $(mc_metric routez_microcache_misses_total)" "19 17"
 kill $MC; wait $MC 2>/dev/null
 
 # The browser check: `.always` on /, `.under_load` on /busy, whose slow
