@@ -80,9 +80,10 @@ pub const Proxy = struct {
     read_paused: bool = false,
     /// Counted in the group's `max_active` (`Group.admit`).
     holds_place: bool = false,
-    /// The group's line, while `queued`.
+    /// The group's line, while `queued`, and which.
     wait_prev: ?*Proxy = null,
     wait_next: ?*Proxy = null,
+    wait_low: bool = false,
 
     const Phase = enum { queued, connecting, waiting_head, body, tunnel, done };
     const Framing = enum { none, length, chunked, pending };

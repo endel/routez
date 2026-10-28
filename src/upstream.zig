@@ -153,7 +153,8 @@ pub const Group = struct {
     }
 
     /// A place for `p` now: true. Else it waits in line or, the line being
-    /// full, it or a `low` request waiting is turned away.
+    /// full, it or a `low` request waiting is turned away. A request from
+    /// a fingerprint that surges (`senders.zig`) waits in the low line.
     pub fn admit(self: *Group, p: *Proxy) bool {
         if (self.limit == 0) return true;
         // Behind anyone waiting, even when a place has just come free.
@@ -162,17 +163,23 @@ pub const Group = struct {
             p.holds_place = true;
             return true;
         }
+        self.worker.tally.pressure = true;
         // Pass holders wait for a place; the rest get the check instead.
         if (p.loc.browser_check == .under_load) if (self.worker.shared.check) |c| if (!check.hasPass(p.ex, c)) {
             p.challenge();
             return false;
         };
-        const low = p.loc.priority == .low;
+        var low = p.loc.priority == .low;
+        if (!low and self.worker.tally.isSurging(p.ex.req.fingerprint)) {
+            low = true;
+            stats.inc(&stats.upstream_deprioritized);
+        }
         if (self.queued >= self.max_queued) {
             const bumped = if (low) null else self.waiting[1].head;
             (bumped orelse p).shed();
             if (bumped == null) return false;
         }
+        p.wait_low = low;
         self.waiting[@intFromBool(low)].push(p);
         self.queued += 1;
         stats.inc(&stats.upstream_queued);
@@ -182,7 +189,7 @@ pub const Group = struct {
 
     /// Take `p` out of line, its wait over one way or another.
     pub fn unqueue(self: *Group, p: *Proxy) void {
-        self.waiting[@intFromBool(p.loc.priority == .low)].remove(p);
+        self.waiting[@intFromBool(p.wait_low)].remove(p);
         self.queued -= 1;
         stats.dec(&stats.upstream_queued);
     }

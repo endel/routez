@@ -357,7 +357,14 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
         .guards = guards,
         .routes = routes,
         .check = try loadCheck(arena, io, cfg),
+        .track_senders = cfg.control_socket != null or admits(cfg),
     };
+}
+
+/// Some upstream has `max_active`.
+fn admits(cfg: *const config.Config) bool {
+    for (cfg.upstreams) |up| if (up.max_active != 0) return true;
+    return false;
 }
 
 fn realIpTrust(arena: std.mem.Allocator, cfg: *const config.Config) !realip.Trust {
@@ -542,6 +549,7 @@ test {
     _ = @import("stats.zig");
     _ = @import("client_limits.zig");
     _ = @import("fingerprint.zig");
+    _ = @import("senders.zig");
     _ = @import("control.zig");
     _ = @import("browser_check.zig");
     _ = @import("cluster.zig");

@@ -570,7 +570,8 @@ SUITE=bans check auto-ban-kept "$(ctl bans | grep -c -E '^10\.7\.7\.7 ')" 1
 kill $BANS; wait $BANS 2>/dev/null
 
 # Fingerprints: $ssl_ja4 over TLS and QUIC; a banned JA4 refused at the
-# ClientHello, what it holds open closed, the ban kept in bans_file.
+# ClientHello, what it holds open closed, the ban kept in bans_file; the
+# heaviest senders through `top`.
 cat > "$WORK/fp.zon" <<EOF2
 .{ .access_log = false, .control_socket = "$WORK/fp.sock", .bans_file = "$WORK/fp-bans.txt",
    .servers = .{.{
@@ -605,6 +606,9 @@ SUITE=fingerprints check other-stack "$(py_get) $(code_of http://127.0.0.1:18457
 SUITE=fingerprints check list "$(fctl bans | grep -c -E "^($TLS_FP (59|60)|$H3_FP (599|600))$") $(fctl bans | tail -1)" "2 ok"
 SUITE=fingerprints check metrics "$([ "$(fp_metric routez_handshakes_refused_fingerprint_total)" -ge 2 ] && echo refused) $(fp_metric routez_fingerprint_bans)" "refused 2"
 SUITE=fingerprints check open-closed "$("$PY_TLS" "$HERE/ban_fingerprint.py" 18456 "$CERTS/ca.crt" "$ROOT/zig-out/bin/routez" "$WORK/fp.sock")" "200 closed"
+# Each worker folds its tally in once a second.
+perl -e 'select(undef,undef,undef,1.2)'
+SUITE=fingerprints check top "$(fctl top | grep -c -E "^fingerprint $TLS_FP [0-9.]+ |^network 127\.0\.0\.0/24 [0-9.]+ ") $(fctl top | tail -1)" "2 ok"
 SUITE=fingerprints check unban "$(fctl unban "$H3_FP") $(code_of --http3-only https://127.0.0.1:18456/)" "ok 200"
 kill $FPS; wait $FPS 2>/dev/null
 start_fp

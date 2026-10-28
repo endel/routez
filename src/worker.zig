@@ -33,6 +33,7 @@ const ofc = @import("open_file_cache.zig");
 const regex = @import("regex.zig");
 const realip = @import("realip.zig");
 const fingerprint = @import("fingerprint.zig");
+const senders = @import("senders.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -246,6 +247,9 @@ pub const Worker = struct {
     conn_count: u32 = 0,
     /// The client table's `ban_epoch` as of the last look for banned clients.
     ban_epoch: u32 = 0,
+    /// This second's requests by sender, for `senders.board`.
+    tally: senders.Tally = .{},
+    tally_folded_ms: i64 = 0,
     /// When the max_connections warning last went out, to throttle it.
     max_conn_logged_ms: i64 = std.math.minInt(i64) / 2,
     gzip: gzip.Pool,
@@ -312,6 +316,9 @@ pub const Worker = struct {
         open_file_cache_max: u32 = 0,
         /// `limits.max_connections` within the descriptor budget, per worker.
         max_connections: u32 = 0,
+        /// Requests are tallied by sender: for `routez ctl top`, and for
+        /// upstream admission to know a surge.
+        track_senders: bool = false,
 
         pub const QuicKeys = struct { retry: [16]u8, reset: [16]u8 };
 
@@ -634,6 +641,10 @@ pub const Worker = struct {
                 self.ban_epoch = epoch;
                 self.closeBanned();
             }
+        }
+        if (self.shared.track_senders and self.timers.now_ms - self.tally_folded_ms >= 1000) {
+            self.tally_folded_ms = self.timers.now_ms;
+            senders.board.fold(self.io, &self.tally, @divTrunc(quic.sys.nanoTimestamp(), std.time.ns_per_s));
         }
         self.files.sweep(self.timers.now_ms);
         self.gzip.trim(self.timers.now_ms);

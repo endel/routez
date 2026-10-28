@@ -41,6 +41,7 @@ const check = @import("handlers/check.zig");
 const realip = @import("realip.zig");
 const socket = @import("net/socket.zig");
 const fingerprint = @import("fingerprint.zig");
+const senders = @import("senders.zig");
 
 pub const Response = struct {
     status: u16,
@@ -329,6 +330,7 @@ pub const Exchange = struct {
             self.status = 444;
             return self.respondAbort();
         }
+        if (self.worker.shared.track_senders) self.worker.tally.add(self.req.fingerprint, senders.network(self.req.client_ip));
         if (self.req.path.len == 0) return self.sendError(400);
         // HTTP-01 validation comes over plain HTTP, ahead of any location.
         if (std.mem.eql(u8, self.req.scheme, "http")) {

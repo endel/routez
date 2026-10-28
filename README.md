@@ -435,8 +435,12 @@ variant the client doesn't take.
   the response ends; a WebSocket gives its place back once upgraded. A
   reload counts afresh: while the old workers drain, their requests count
   only against the old configuration's share.
-- Counted by `routez_upstream_requests_queued` and
-  `routez_upstream_requests_shed_total`.
+- A request whose JA4 fingerprint surges (see [Fingerprints](#fingerprints))
+  waits in the `low` line, whatever its location says, so a flood from one
+  TLS stack queues behind everyone else's requests.
+- Counted by `routez_upstream_requests_queued`,
+  `routez_upstream_requests_shed_total` and
+  `routez_upstream_requests_deprioritized_total`.
 
 ### Browser check
 
@@ -568,7 +572,7 @@ Bans come from `routez ctl`, and from `limit_req`'s `ban` (see
   root, only root can use it. `routez ctl -s path` reaches another socket.
   Programs can speak its protocol directly: one command a line, any number
   per connection, each answered by a line `ok` or `error: <reason>` (for
-  `bans`, after a line per ban).
+  `bans` and `top`, after their lines).
 - Counted by `routez_connections_refused_banned_total`,
   `routez_http_requests_banned_total` and the `routez_bans` gauge.
 
@@ -581,6 +585,13 @@ built on Go, Python or curl shows as such, and one tool across thousands of
 addresses shows as one fingerprint.
 
 ```sh
+routez ctl top     # the heaviest senders lately
+fingerprint t13d1516h2_8daaf6152771_806a8c22fdea 812.4 71.3% usual 69.8%
+fingerprint t13d171100_ab0a1bf427ad_8e6e362c5eac 290.1 25.5% usual 0.4% surging
+network 203.0.113.0/24 140.2 12.3%
+...
+total 1139.5
+ok
 routez ctl ban t13d171100_ab0a1bf427ad_8e6e362c5eac 3600
 ```
 
@@ -596,6 +607,18 @@ routez ctl ban t13d171100_ab0a1bf427ad_8e6e362c5eac 3600
   kept in `bans_file` and shared over `cluster` like network bans. Ban by
   fingerprint only what is clearly a tool: a browser's fingerprint is
   shared by everyone running that browser version.
+- `top` lists the fingerprints and networks (IPv4 /24, IPv6 /64) sending the
+  most requests, each with its rate over the last ~10 s and its share of
+  all requests; plain HTTP shows as `-`. Requests are tallied while
+  `control_socket` is set or some upstream has `max_active`.
+- A fingerprint's usual share is learnt while no upstream queues, over
+  about ten minutes. One that has a quarter of all requests and four times
+  its usual share surges, and under load its requests wait behind everyone
+  else's (see [Upstream admission](#upstream-admission)). A browser keeps
+  its share of the traffic through a flood from someone else's tool; the
+  tool's fingerprint, rare or absent while things were calm, stands out.
+  Until two minutes without queueing have been seen nothing surges, so
+  starting in the middle of a flood falls back to plain shedding.
 - Taking the fingerprint costs about 0.5 µs a handshake, against about
   160 µs for the handshake's own key exchange and signature.
 - Counted by `routez_handshakes_refused_fingerprint_total` and the

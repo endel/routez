@@ -4,6 +4,10 @@
 //!     ban <target> <seconds>
 //!     unban <target>
 //!     bans        a "<target> <seconds left>" line per ban, then ok
+//!     top         the heaviest senders lately (`senders.zig`), then ok:
+//!                 "fingerprint <ja4> <req/s> <share>% usual <share>%[ surging]"
+//!                 and "network <network> <req/s> <share>%" lines, heaviest
+//!                 first, then "total <req/s>"; plain HTTP's fingerprint is `-`
 //!
 //! A target is an address, a network (`<address>/<prefix>`), or a JA4
 //! fingerprint (`t13d1516h2_8daaf6152771_e5627efa2ab1`).
@@ -20,6 +24,7 @@ const socket = @import("net/socket.zig");
 const logs = @import("logs.zig");
 const cluster = @import("cluster.zig");
 const fingerprint = @import("fingerprint.zig");
+const senders = @import("senders.zig");
 
 const sys = quic.sys;
 const posix = std.posix;
@@ -329,6 +334,23 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         }
         return out.print("ok\n", .{});
     }
+    if (std.mem.eql(u8, cmd, "top")) {
+        if (words.next() != null) return out.print("error: usage: top\n", .{});
+        var fps: [10]senders.Entry = undefined;
+        var nets: [10]senders.Entry = undefined;
+        const got = senders.board.top(io, @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s), &fps, &nets);
+        const total = @max(got.rate, std.math.floatMin(f32));
+        for (got.fingerprints) |e| {
+            const name = if (std.mem.eql(u8, &e.key, &senders.no_fingerprint)) "-" else fingerprint.format(e.key, buf[0..fingerprint.Ja4.text_len]);
+            try out.print("fingerprint {s} {d:.1} {d:.1}% usual {d:.1}%{s}\n", .{ name, e.rate, e.rate / total * 100, e.usual * 100, if (e.surging) " surging" else "" });
+        }
+        for (got.networks) |e| {
+            const bits: u8 = if (access.isV4(e.key)) senders.v4_bits else senders.v6_bits;
+            try out.print("network {s} {d:.1} {d:.1}%\n", .{ socket.formatNet(e.key, bits, &buf), e.rate, e.rate / total * 100 });
+        }
+        try out.print("total {d:.1}\n", .{got.rate});
+        return out.print("ok\n", .{});
+    }
     try out.print("error: unknown command '{s}'\n", .{printable(cmd, buf[0..32])});
 }
 
@@ -426,6 +448,8 @@ test "commands" {
         try testing.expect(std.mem.startsWith(u8, run1(t, bad, &out), "error: usage"));
     }
     try testing.expectEqualStrings("error: unknown command 'ba?n'\n", run1(t, "ba\x1bn", &out));
+    try testing.expect(std.mem.endsWith(u8, run1(t, "top", &out), "ok\n"));
+    try testing.expect(std.mem.startsWith(u8, run1(t, "top 5", &out), "error: usage"));
     try testing.expectEqualStrings("", run1(t, "   ", &out));
 }
 
