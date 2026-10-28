@@ -550,6 +550,7 @@ test {
     _ = @import("client_limits.zig");
     _ = @import("fingerprint.zig");
     _ = @import("senders.zig");
+    _ = @import("microcache.zig");
     _ = @import("control.zig");
     _ = @import("browser_check.zig");
     _ = @import("cluster.zig");

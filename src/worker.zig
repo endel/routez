@@ -34,6 +34,7 @@ const regex = @import("regex.zig");
 const realip = @import("realip.zig");
 const fingerprint = @import("fingerprint.zig");
 const senders = @import("senders.zig");
+const microcache = @import("microcache.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -265,6 +266,9 @@ pub const Worker = struct {
     file_inbox: file_io.Inbox,
     /// Static files looked up lately.
     files: ofc.Cache,
+    /// Upstream answers kept a moment (`microcache`).
+    microcache: microcache.Cache,
+    microcache_swept_ms: i64 = 0,
     inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
@@ -372,8 +376,10 @@ pub const Worker = struct {
                 .inactive_ms = cfg.open_file_cache.inactive_ms,
             }),
             .gzip = .{ .alloc = alloc },
+            .microcache = undefined,
         };
         w.timers = try timers.Timers.init(&w.loop);
+        w.microcache = .init(alloc, &w.timers, cfg.limits.microcache_bytes);
         w.timers.on_tick = onTick;
         w.regex_scratch = try regex.Scratch.init(alloc, shared.routes.max_states);
         errdefer w.regex_scratch.deinit(alloc);
@@ -566,6 +572,7 @@ pub const Worker = struct {
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
         try self.loop.run(.until_done);
+        self.microcache.deinit();
         self.files.deinit();
         self.gzip.deinit();
         log.info("worker {d} stopped", .{self.id});
@@ -645,6 +652,10 @@ pub const Worker = struct {
         if (self.shared.track_senders and self.timers.now_ms - self.tally_folded_ms >= 1000) {
             self.tally_folded_ms = self.timers.now_ms;
             senders.board.fold(self.io, &self.tally, @divTrunc(quic.sys.nanoTimestamp(), std.time.ns_per_s));
+        }
+        if (self.timers.now_ms - self.microcache_swept_ms >= 1000) {
+            self.microcache_swept_ms = self.timers.now_ms;
+            self.microcache.sweep();
         }
         self.files.sweep(self.timers.now_ms);
         self.gzip.trim(self.timers.now_ms);

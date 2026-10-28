@@ -41,6 +41,13 @@ pub var bans_automatic: std.atomic.Value(u64) = .init(0);
 pub var upstream_queued: std.atomic.Value(u64) = .init(0);
 /// Proxied requests answered 503 for want of a place.
 pub var upstream_shed: std.atomic.Value(u64) = .init(0);
+/// `microcache`: requests answered from a kept answer, those of them that
+/// waited for another request's, requests that went to the upstream to
+/// fill one, and the bytes kept, over all workers.
+pub var microcache_hits: Counter = .{};
+pub var microcache_waited: std.atomic.Value(u64) = .init(0);
+pub var microcache_misses: std.atomic.Value(u64) = .init(0);
+pub var microcache_bytes: std.atomic.Value(u64) = .init(0);
 /// Proxied requests put in the low line for a fingerprint that surged.
 pub var upstream_deprioritized: std.atomic.Value(u64) = .init(0);
 /// Requests closed unanswered for a client under a ban: on a connection
@@ -220,6 +227,14 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_upstream_requests_shed_total {d}\n", .{load(&upstream_shed)});
     try header(w, "routez_upstream_requests_deprioritized_total", "counter", "Proxied requests that waited in the low line for a fingerprint that surged.");
     try w.print("routez_upstream_requests_deprioritized_total {d}\n", .{load(&upstream_deprioritized)});
+    try header(w, "routez_microcache_hits_total", "counter", "Requests answered from a microcache, without the upstream.");
+    try w.print("routez_microcache_hits_total {d}\n", .{load(&microcache_hits)});
+    try header(w, "routez_microcache_waited_total", "counter", "Microcache hits that waited for another request's answer.");
+    try w.print("routez_microcache_waited_total {d}\n", .{load(&microcache_waited)});
+    try header(w, "routez_microcache_misses_total", "counter", "Requests that went to the upstream to fill a microcache.");
+    try w.print("routez_microcache_misses_total {d}\n", .{load(&microcache_misses)});
+    try header(w, "routez_microcache_bytes", "gauge", "Bytes the microcaches hold, kept or being filled.");
+    try w.print("routez_microcache_bytes {d}\n", .{load(&microcache_bytes)});
     try header(w, "routez_bans", "gauge", "Addresses and networks banned, through the control socket or by limit_req.");
     try w.print("routez_bans {d}\n", .{if (clients) |t| t.bans.load(.monotonic) else 0});
     try header(w, "routez_fingerprint_bans", "gauge", "JA4 fingerprints banned through the control socket.");

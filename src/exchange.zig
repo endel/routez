@@ -15,6 +15,7 @@ const router = @import("router.zig");
 const Worker = @import("worker.zig").Worker;
 const static = @import("handlers/static.zig");
 const proxy = @import("handlers/proxy.zig");
+const microcache = @import("microcache.zig");
 const Header = common.Header;
 const stats = @import("stats.zig");
 
@@ -204,6 +205,8 @@ pub const Exchange = struct {
         proxy: *proxy.Proxy,
         /// Waiting for a verifier thread to check a password.
         auth: *auth_pool.Job,
+        /// Serving a `microcache` entry.
+        cached: *microcache.Reader,
     } = .none,
 
     status: u16 = 0,
@@ -224,6 +227,8 @@ pub const Exchange = struct {
     flush_start: u64 = 0,
     flush_mark: u64 = 0,
     upstream_addr: ?[]const u8 = null,
+    /// `$upstream_cache_status`, under a `microcache`.
+    cache_status: []const u8 = "",
     /// Set when this response is being gzip-compressed.
     gz: ?*gzip.Encoder = null,
     /// The location's `add_headers` and `proxy_set_headers` values with
@@ -563,6 +568,7 @@ pub const Exchange = struct {
         switch (self.handler) {
             .static => static.pump(self),
             .proxy => |p| p.onDownstreamWritable(),
+            .cached => microcache.pump(self),
             .none, .auth => {},
         }
     }
@@ -588,6 +594,10 @@ pub const Exchange = struct {
                 // The verdict still arrives; nobody is there for it.
                 job.ctx = null;
                 self.handler = .none;
+                self.destroy();
+            },
+            .cached => {
+                microcache.release(self);
                 self.destroy();
             },
             .none => self.destroy(),
@@ -887,6 +897,7 @@ pub const Exchange = struct {
                     .body_bytes = self.bytes_sent,
                     .elapsed_ms = elapsed,
                     .upstream_addr = self.upstream_addr,
+                    .cache_status = self.cache_status,
                     .completed = !self.failed,
                     .now_ms = logs.realtimeMs(),
                 };

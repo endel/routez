@@ -20,6 +20,7 @@ const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
 const stats = @import("../stats.zig");
 const check = @import("check.zig");
+const microcache = @import("../microcache.zig");
 const exchange = @import("../exchange.zig");
 const Exchange = exchange.Exchange;
 const Header = common.Header;
@@ -28,25 +29,27 @@ const log = std.log.scoped(.proxy);
 
 /// Request bytes kept for a retry; larger requests are not retried.
 const replay_limit = 64 * 1024;
+/// Longest a request waits on another's microcache fetch before going to
+/// the upstream itself (nginx's `proxy_cache_lock_timeout`).
+const follow_timeout_ms = 5000;
+/// How far a fill others wait on may run ahead of its own slow client.
+const fill_lead = 1024 * 1024;
 const max_attempts = 4;
 
 pub fn start(ex: *Exchange, loc: *const config.Location, target: []const u8) void {
     const group = ex.worker.findGroup(target) orelse return ex.sendError(502);
-    const p = ex.worker.alloc.create(Proxy) catch return ex.sendError(500);
+    const looked: microcache.Lookup = if (loc.microcache) |mc| ex.worker.microcache.lookup(ex, loc, mc) else .pass;
+    if (looked == .hit) return microcache.serve(ex, looked.hit);
+    const p = ex.worker.alloc.create(Proxy) catch {
+        if (looked == .fill) {
+            looked.fill.drop();
+            looked.fill.unref();
+        }
+        return ex.sendError(500);
+    };
     p.* = .{ .ex = ex, .loc = loc, .group = group };
     ex.handler = .{ .proxy = p };
-
-    p.framing = switch (ex.req.body) {
-        .none => .none,
-        .sized => .length,
-        .streamed => .chunked,
-        .unknown => .pending,
-    };
-    if (ex.req.upgrade != null) p.framing = .none;
-    if (p.framing != .pending) {
-        p.writeHead() catch return p.fail(500);
-    }
-    if (group.admit(p)) p.connectNext(false);
+    p.cached(looked);
 }
 
 pub const Proxy = struct {
@@ -84,12 +87,89 @@ pub const Proxy = struct {
     wait_prev: ?*Proxy = null,
     wait_next: ?*Proxy = null,
     wait_low: bool = false,
+    /// The `microcache` entry this request's answer fills.
+    fill: ?*microcache.Entry = null,
+    /// The entry whose filler this request waits on, while `following`,
+    /// and its line of waiters.
+    following: ?*microcache.Entry = null,
+    cache_prev: ?*Proxy = null,
+    cache_next: ?*Proxy = null,
+    /// When waiting on fills stops, across every entry it waits on.
+    follow_until_ms: i64 = 0,
 
-    const Phase = enum { queued, connecting, waiting_head, body, tunnel, done };
+    const Phase = enum { following, queued, connecting, waiting_head, body, tunnel, done };
     const Framing = enum { none, length, chunked, pending };
 
     fn alloc(self: *Proxy) std.mem.Allocator {
         return self.ex.worker.alloc;
+    }
+
+    /// Off to the upstream: the request head, then a place and a connection.
+    fn begin(self: *Proxy) void {
+        const ex = self.ex;
+        self.phase = .connecting;
+        self.framing = switch (ex.req.body) {
+            .none => .none,
+            .sized => .length,
+            .streamed => .chunked,
+            .unknown => .pending,
+        };
+        if (ex.req.upgrade != null) self.framing = .none;
+        if (self.framing != .pending) {
+            self.writeHead() catch return self.fail(500);
+        }
+        if (self.group.admit(self)) self.connectNext(false);
+    }
+
+    // ---- microcache ----
+
+    /// Act on what the location's microcache said, `hit` aside.
+    fn cached(self: *Proxy, looked: microcache.Lookup) void {
+        switch (looked) {
+            .hit => unreachable,
+            .wait => |e| {
+                const now = self.t().now_ms;
+                if (self.follow_until_ms == 0) self.follow_until_ms = now + follow_timeout_ms;
+                if (now < self.follow_until_ms) {
+                    self.phase = .following;
+                    self.following = e;
+                    self.t().set(&self.deadline, @intCast(self.follow_until_ms - now));
+                    return e.follow(self);
+                }
+                self.ex.cache_status = "BYPASS";
+            },
+            .fill => |e| {
+                self.fill = e;
+                self.ex.cache_status = "MISS";
+            },
+            .pass => if (self.loc.microcache != null) {
+                self.ex.cache_status = "BYPASS";
+            },
+        }
+        self.begin();
+    }
+
+    /// The entry this request waited on has its filler's outcome: its
+    /// answer, one not kept, or none.
+    pub fn cacheWoken(self: *Proxy, e: *microcache.Entry) void {
+        self.following = null;
+        self.t().clear(&self.deadline);
+        const ex = self.ex;
+        if (e.state == .ready) {
+            stats.inc(&stats.microcache_waited);
+            self.phase = .done;
+            self.finish(false);
+            return microcache.serve(ex, e);
+        }
+        if (!e.dropped) return self.cached(.pass);
+        // The filler went first: look again, perhaps to fill it ourselves.
+        const looked = ex.worker.microcache.lookup(ex, self.loc, self.loc.microcache.?);
+        if (looked == .hit) {
+            self.phase = .done;
+            self.finish(false);
+            return microcache.serve(ex, looked.hit);
+        }
+        self.cached(looked);
     }
 
     fn t(self: *Proxy) *timers.Timers {
@@ -106,7 +186,7 @@ pub const Proxy = struct {
 
         try head.appendSlice(a, ex.req.method);
         try head.append(a, ' ');
-        try self.appendTarget(&head);
+        try appendTarget(ex, self.loc, &head, a);
         try head.appendSlice(a, " HTTP/1.1\r\n");
         const set = self.loc.proxy_set_headers;
         const host = if (findSet(set, "host")) |i| ex.setHeaderValue(i) else ex.req.authority;
@@ -165,13 +245,11 @@ pub const Proxy = struct {
     /// The request target sent upstream: what `proxy_pass`'s URI or
     /// `strip_prefix` make of the path, else the client's. After a rewrite,
     /// the new path in full, as nginx sends it.
-    fn appendTarget(self: *Proxy, head: *std.ArrayList(u8)) !void {
-        const ex = self.ex;
-        const a = self.alloc();
+    pub fn appendTarget(ex: *Exchange, loc: *const config.Location, head: *std.ArrayList(u8), a: std.mem.Allocator) !void {
         const path = ex.req.path;
         // The part of the path the location matched, to replace or strip.
-        const matched: ?[]const u8 = self.loc.prefix orelse self.loc.exact;
-        if (config.splitProxyPass(self.loc.proxy_pass.?).uri) |uri| {
+        const matched: ?[]const u8 = loc.prefix orelse loc.exact;
+        if (config.splitProxyPass(loc.proxy_pass.?).uri) |uri| {
             if (vars.has(uri)) {
                 const target = try ex.expand(uri);
                 if (std.mem.indexOfAny(u8, target, " \t") != null) return error.BadTarget;
@@ -183,7 +261,7 @@ pub const Proxy = struct {
                 try head.appendSlice(a, uri);
                 try router.encodePath(path[matched.?.len..], head, a);
             }
-        } else if (self.loc.strip_prefix and std.mem.startsWith(u8, path, matched.?)) {
+        } else if (loc.strip_prefix and std.mem.startsWith(u8, path, matched.?)) {
             const rest = path[matched.?.len..];
             if (rest.len == 0 or rest[0] != '/') try head.append(a, '/');
             try router.encodePath(rest, head, a);
@@ -236,7 +314,8 @@ pub const Proxy = struct {
     }
 
     pub fn onRequestBody(self: *Proxy, data: []const u8) void {
-        if (self.phase == .done) return;
+        // A cached request has no body to send.
+        if (self.phase == .done or self.phase == .following) return;
         if (self.phase == .tunnel) {
             if (self.conn) |c| c.send(data);
             return self.checkRequestBackpressure();
@@ -380,7 +459,7 @@ pub const Proxy = struct {
     fn armDeadline(self: *Proxy) void {
         const c = self.conn orelse return;
         const waiting_on_us = switch (self.phase) {
-            .queued, .connecting, .tunnel, .done => return,
+            .following, .queued, .connecting, .tunnel, .done => return,
             .waiting_head => self.read_paused or (!self.request_done and c.sock.buffered() == 0),
             .body => self.read_paused,
         };
@@ -414,7 +493,7 @@ pub const Proxy = struct {
         if (down) |d| d.setCork(true);
         defer if (down) |d| d.setCork(false);
         switch (self.phase) {
-            .queued, .connecting, .done => return,
+            .following, .queued, .connecting, .done => return,
             .tunnel => {
                 self.ex.respondBody(data);
                 return self.checkResponseBackpressure();
@@ -466,6 +545,7 @@ pub const Proxy = struct {
                 else => null,
             };
             self.phase = .body;
+            if (self.fill) |e| e.begin(head.status, headers, content_length);
             ex.respondHead(&.{ .status = head.status, .headers = headers, .content_length = content_length });
 
             // The head slices point into `in`; they are dead from here on.
@@ -503,7 +583,10 @@ pub const Proxy = struct {
                 log.warn("bad chunked body from {s}", .{self.peer.?.label});
                 return self.abortResponse();
             };
-            if (step.data.len > 0) self.ex.respondBody(step.data);
+            if (step.data.len > 0) {
+                if (self.fill) |e| e.append(step.data);
+                self.ex.respondBody(step.data);
+            }
             data = data[step.consumed..];
             if (step.consumed == 0) break;
         }
@@ -513,7 +596,11 @@ pub const Proxy = struct {
 
     fn checkResponseBackpressure(self: *Proxy) void {
         const c = self.conn orelse return;
-        if (self.read_paused or self.ex.downstreamBuffered() <= socket.high_water) return;
+        const buffered = self.ex.downstreamBuffered();
+        // Others wait on this fill: read at the upstream's pace, not this
+        // client's, for a while; past that their wait runs out instead.
+        if (self.fill) |e| if (e.state == .filling and e.waiting != null and buffered < fill_lead) return;
+        if (self.read_paused or buffered <= socket.high_water) return;
         self.read_paused = true;
         c.sock.pauseRead();
         self.armDeadline();
@@ -556,7 +643,7 @@ pub const Proxy = struct {
     /// that ends a body read until the close.
     pub fn onUpstreamEof(self: *Proxy, clean: bool) void {
         switch (self.phase) {
-            .queued, .done => {},
+            .following, .queued, .done => {},
             .connecting, .waiting_head => {
                 const c = self.conn.?;
                 if (c.reused and self.in.items.len == 0) {
@@ -592,6 +679,12 @@ pub const Proxy = struct {
                 self.fail(504);
             },
             .body => self.abortResponse(),
+            .following => {
+                // The fetch it waits on is slow: fetch it alongside.
+                self.following.?.unfollow(self);
+                self.following = null;
+                self.cached(.pass);
+            },
             .tunnel, .done => {},
         }
     }
@@ -605,6 +698,7 @@ pub const Proxy = struct {
         // Pool the connection first: finishing may start the client's next
         // pipelined request, which can then reuse it.
         self.detachConn(reusable);
+        if (self.fill) |e| e.done();
         self.ex.respondEnd();
         self.finish(false);
     }
@@ -613,6 +707,8 @@ pub const Proxy = struct {
     fn fail(self: *Proxy, status: u16) void {
         if (self.phase == .done) return;
         self.phase = .done;
+        // The upstream failed: waiters try it themselves rather than in turn.
+        if (self.fill) |e| e.pass();
         self.ex.sendError(status);
         self.finish(false);
     }
@@ -621,6 +717,7 @@ pub const Proxy = struct {
     fn abortResponse(self: *Proxy) void {
         if (self.phase == .done) return;
         self.phase = .done;
+        if (self.fill) |e| e.pass();
         self.ex.respondAbort();
         self.finish(false);
     }
@@ -634,6 +731,13 @@ pub const Proxy = struct {
     /// Release everything and free the proxy and, through it, the exchange.
     fn finish(self: *Proxy, reusable: bool) void {
         self.t().clear(&self.deadline);
+        // Still filling: no answer came (turned away, or the client left),
+        // so a waiter fills it instead.
+        if (self.fill) |e| {
+            e.drop();
+            e.unref();
+        }
+        if (self.following) |e| e.unfollow(self);
         self.detachConn(reusable);
         if (self.holds_place) self.group.release();
         const a = self.alloc();

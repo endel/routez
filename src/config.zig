@@ -162,6 +162,9 @@ pub const Limits = struct {
     /// When full, new clients go unlimited (and a warning is logged). Sized
     /// at start; a change takes effect at the next restart.
     max_tracked_clients: u32 = 100_000,
+    /// Memory each worker's `microcache` may hold: answers kept and being
+    /// filled. Past it the oldest are dropped, or a new one isn't kept.
+    microcache_bytes: u64 = 64 * 1024 * 1024,
 };
 
 pub const Listen = struct {
@@ -381,6 +384,10 @@ pub const Location = struct {
     /// When its upstream is at `max_active`: `low` requests wait behind
     /// `normal` ones and are the first turned away.
     priority: Priority = .normal,
+    /// With `proxy_pass`: keep the upstream's answers to GETs a moment and
+    /// answer the same requests from them; one arriving while the first is
+    /// still at the upstream waits for its answer. See `microcache.zig`.
+    microcache: ?Microcache = null,
     /// Ask visitors without a pass for the browser check: `.always`, or
     /// `.under_load`, only while the `proxy_pass` upstream is at
     /// `max_active` (then pass holders wait for a place and the rest get
@@ -416,6 +423,14 @@ pub const Location = struct {
     }
 
     pub const Priority = enum { normal, low };
+
+    pub const Microcache = struct {
+        /// How long an answer is kept, in ms: 1 to 60000.
+        ttl_ms: u32 = 1000,
+        /// Largest body kept; a larger answer goes to every client from the
+        /// upstream.
+        max_bytes: u32 = 1024 * 1024,
+    };
 
     pub const BrowserCheckMode = enum { always, under_load };
 
@@ -707,6 +722,12 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
             }
             if (loc.limit_req) |l| try checkLimitReq(cfg, loc.pattern(), l);
+            if (loc.microcache) |mc| {
+                if (loc.proxy_pass == null) return fail("location '{s}': microcache needs proxy_pass", .{loc.pattern()});
+                if (mc.ttl_ms == 0 or mc.ttl_ms > 60_000) return fail("location '{s}': microcache.ttl_ms must be 1 to 60000", .{loc.pattern()});
+                if (mc.max_bytes == 0 or mc.max_bytes > cfg.limits.microcache_bytes)
+                    return fail("location '{s}': microcache.max_bytes must be 1 to limits.microcache_bytes", .{loc.pattern()});
+            }
             if (loc.browser_check == .under_load) {
                 const up = if (loc.proxy_pass) |p| findUpstream(cfg, splitProxyPass(p).target) else null;
                 if (up == null or up.?.max_active == 0)

@@ -651,6 +651,46 @@ adm_metric() { $CURL_BIN -s http://127.0.0.1:18453/metrics | python3 "$HERE/chec
 SUITE=admission check metrics "$(adm_metric routez_upstream_requests_shed_total) $(adm_metric routez_upstream_requests_queued)" "3 0"
 kill $ADM; wait $ADM 2>/dev/null
 
+# microcache: answers kept for a second; requests that arrive while one
+# is at the upstream wait for its answer; what isn't to be kept, and
+# requests that mustn't share one, go by. The upstream counts its requests.
+cat > "$WORK/mc.zon" <<EOF2
+.{ .access_log = false, .workers = 1, .servers = .{.{
+  .listen = .{ .{ .address = "127.0.0.1", .port = 18458 }, .{ .address = "127.0.0.1", .port = 18459, .tls = true } },
+  .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+  .rewrite = .{.{ .regex = "^/old-small/(.*)$", .replacement = "/small/\$1" }},
+  .locations = .{
+    .{ .prefix = "/count/", .proxy_pass = "127.0.0.1:19001", .microcache = .{ .ttl_ms = 1000 } },
+    .{ .prefix = "/small/", .proxy_pass = "127.0.0.1:19001/count/", .microcache = .{ .ttl_ms = 1000, .max_bytes = 1000 } },
+    .{ .prefix = "/metrics", .metrics = true },
+} }} }
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/mc.zon" 2> "$WORK/mc.log" & MC=$!; PIDS+=($MC)
+wait_port 18458
+mc() { $CURL_BIN -s --max-time 5 "$@" | head -c 1; }
+mc_metric() { $CURL_BIN -s http://127.0.0.1:18458/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+SUITE=microcache check kept "$(mc http://127.0.0.1:18458/count/a) $(mc http://127.0.0.1:18458/count/a)" "1 1"
+perl -e 'select(undef,undef,undef,1.2)'
+SUITE=microcache check expires "$(mc http://127.0.0.1:18458/count/a)" 2
+# HEAD from the GET's answer, with its length.
+SUITE=microcache check head "$(mc http://127.0.0.1:18458/count/h) $($CURL_BIN -s -I http://127.0.0.1:18458/count/h | grep -i '^content-length:' | tr -d '\r' | tr '[:upper:]' '[:lower:]') $(mc http://127.0.0.1:18458/count/h)" "1 content-length: 1 1"
+MCS=(); for i in $(seq 1 10); do mc http://127.0.0.1:18458/count/slow-c > "$WORK/mc$i" & MCS+=($!); done; wait "${MCS[@]}"
+SUITE=microcache check coalesced "$(cat "$WORK"/mc{1..10} | tr -d '\n') $(mc_metric routez_microcache_waited_total)" "1111111111 9"
+SUITE=microcache check set-cookie-not-kept "$(mc http://127.0.0.1:18458/count/cookie-d) $(mc http://127.0.0.1:18458/count/cookie-d)" "1 2"
+SUITE=microcache check private-not-kept "$(mc http://127.0.0.1:18458/count/private-e) $(mc http://127.0.0.1:18458/count/private-e)" "1 2"
+SUITE=microcache check too-big-not-kept "$(mc http://127.0.0.1:18458/small/big-f) $(mc http://127.0.0.1:18458/small/big-f) $(mc http://127.0.0.1:18458/count/big-g) $(mc http://127.0.0.1:18458/count/big-g)" "1 2 1 1"
+# A request with a cookie neither takes a kept answer nor leaves one.
+SUITE=microcache check cookie-goes-by "$(mc -H 'Cookie: s=1' http://127.0.0.1:18458/count/i) $(mc http://127.0.0.1:18458/count/i) $(mc -H 'Cookie: s=1' http://127.0.0.1:18458/count/i) $(mc http://127.0.0.1:18458/count/i)" "1 2 3 2"
+SUITE=microcache check post-goes-by "$($CURL_BIN -s -o /dev/null -w '%{http_code}' -X POST -d x http://127.0.0.1:18458/count/j) $(mc http://127.0.0.1:18458/count/j)" "200 1"
+SUITE=microcache check schemes-apart "$(mc http://127.0.0.1:18458/count/s) $(mc --cacert "$CERTS/ca.crt" https://127.0.0.1:18459/count/s) $(mc --cacert "$CERTS/ca.crt" https://127.0.0.1:18459/count/s)" "1 2 2"
+# A revalidation may get a 304: it takes a kept answer but never fetches one.
+SUITE=microcache check conditional-reads-only "$(mc -H 'If-None-Match: "x"' http://127.0.0.1:18458/count/n) $(mc http://127.0.0.1:18458/count/n) $(mc -H 'If-None-Match: "x"' http://127.0.0.1:18458/count/n)" "1 2 2"
+# Rewritten, the request goes upstream as /small/r, not /count/r: not the same answer.
+SUITE=microcache check keyed-by-upstream-target "$(mc http://127.0.0.1:18458/small/r) $(mc http://127.0.0.1:18458/old-small/r)" "1 {"
+SUITE=microcache check br-not-kept "$(mc http://127.0.0.1:18458/count/br-t) $(mc http://127.0.0.1:18458/count/br-t)" "1 2"
+SUITE=microcache check metrics "$(mc_metric routez_microcache_hits_total) $(mc_metric routez_microcache_misses_total)" "16 16"
+kill $MC; wait $MC 2>/dev/null
+
 # The browser check: `.always` on /, `.under_load` on /busy, whose slow
 # upstream (3 s a request) has one place and one seat in line.
 head -c 48 /dev/urandom | base64 > "$WORK/check.secret"

@@ -1,6 +1,9 @@
-import http.server, sys, json, ssl, gzip, random, time, socket, struct
+import http.server, sys, json, ssl, gzip, random, time, socket, struct, threading
 # Text that doesn't shrink much: gzipped, still past routez's 1 KiB minimum.
 NOISE = "".join(random.Random(1).choice("0123456789abcdef") for _ in range(8000)).encode()
+# /count/<name>: how many times each name was asked for.
+COUNTS = {}
+COUNTS_LOCK = threading.Lock()
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _reply(self, code, body, ctype="application/json", chunked=False, headers=()):
@@ -44,6 +47,18 @@ class H(http.server.BaseHTTPRequestHandler):
         # Closed before the server's shutdown(SHUT_WR) can send a FIN.
         if getattr(self, "reset", False): self.connection.close()
     def do_GET(self):
+        if self.path.startswith("/count/"):
+            # The count, after half a second for a `slow` name; a `cookie`,
+            # `private` or `br` name isn't to be kept, a `big` one is 5000 bytes.
+            name = self.path[len("/count/"):]
+            with COUNTS_LOCK:
+                COUNTS[name] = n = COUNTS.get(name, 0) + 1
+            if name.startswith("slow"): time.sleep(0.5)
+            headers = [("Set-Cookie", "a=1")] if "cookie" in name else []
+            if "private" in name: headers.append(("Cache-Control", "private"))
+            if "br" in name: headers.append(("Content-Encoding", "br"))
+            body = str(n).encode() + (b"\n" + b"x" * 5000 if "big" in name else b"")
+            return self._reply(200, body, "text/plain", headers=headers)
         if self.path in ("/cut/chunked", "/cut/close-reset", "/cut/close", "/cut/close-notify"):
             return self._cut(self.path[len("/cut/"):])
         if self.path.startswith("/chunked"):

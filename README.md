@@ -442,6 +442,42 @@ variant the client doesn't take.
   `routez_upstream_requests_shed_total` and
   `routez_upstream_requests_deprioritized_total`.
 
+### Microcache
+
+```zig
+.{ .prefix = "/", .proxy_pass = "app", .microcache = .{ .ttl_ms = 1000 } },
+```
+
+- The upstream's answer to a GET is kept for `ttl_ms` (1 to 60000) and
+  the same request answered from it meanwhile; one that arrives while the
+  first is still at the upstream waits for that answer, up to 5 s, instead
+  of going there too. While others wait, the answer is read at the
+  upstream's pace, up to 1 MiB ahead of the first client, so a slow reader
+  can't hold them up. A flood hammering the home page reaches the app once
+  a second per worker, however many clients send it, and a page that takes
+  the app two seconds to build is built once for the burst that wants it.
+- Kept: answers with status 200, 203, 301, 302, 307, 308, 404 or 410, no
+  `Set-Cookie`, no `Cache-Control` of `private`, `no-store`, `no-cache` or
+  a zero max-age, no `Vary` other than `Accept-Encoding`, no
+  `Content-Encoding` other than gzip, and a body of at most `max_bytes`
+  (1 MiB). An answer that isn't kept lets requests for it go to the
+  upstream until `ttl_ms` ends. HTTP and HTTPS, and clients that take gzip
+  and those that don't, get separate copies.
+- Only GETs with no body, `Authorization`, `Cookie` or `Range` use it. A
+  HEAD, or a revalidation (`If-None-Match`, `If-Modified-Since`), is served
+  from a kept answer but never fetches one: its answer could be a 304.
+  Answers are shared by everyone, so put it only in front of pages that
+  are the same for every client without a cookie. A client's
+  `Cache-Control` doesn't skip it: a flood would send one.
+- Each worker keeps its own, up to `limits.microcache_bytes` (64 MiB),
+  dropping the oldest answers past it. A request answered from it skips
+  `max_active`; one waiting holds no place. If the request fetching an
+  answer is turned away, or its client leaves, a waiting one fetches it
+  instead; if the upstream fails, the waiting ones go to it themselves.
+- `$upstream_cache_status` logs `HIT`, `MISS` or `BYPASS`. Counted by
+  `routez_microcache_hits_total`, `routez_microcache_waited_total`,
+  `routez_microcache_misses_total` and the `routez_microcache_bytes` gauge.
+
 ### Browser check
 
 ```zig
@@ -775,8 +811,9 @@ which proxies to believe:
   reopened keeps being written where it was.
 - Access log templates take the variables above and `$status`,
   `$body_bytes_sent`, `$request_time`, `$request`, `$request_method`,
-  `$protocol`, `$upstream_addr`, `$request_completion`, `$time_iso8601`,
-  `$time_local`, `$msec` and any request header as `$http_<name>`
+  `$protocol`, `$upstream_addr`, `$upstream_cache_status`,
+  `$request_completion`, `$time_iso8601`, `$time_local`, `$msec` and any
+  request header as `$http_<name>`
   (`$http_user_agent`); see `src/access_log.zig`. Over HTTP/1.1, as in
   nginx, a request is logged once its response has been handed to the
   kernel, and `$body_bytes_sent` counts only what was: a client that drops

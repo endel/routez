@@ -10,6 +10,7 @@
 //!   $request_method       GET, POST, ...
 //!   $protocol             HTTP/1.0, HTTP/1.1 or HTTP/3
 //!   $upstream_addr        the upstream server that answered
+//!   $upstream_cache_status  HIT, MISS or BYPASS under a `microcache`
 //!   $request_completion   OK when the response was sent in full, else empty
 //!   $time_iso8601         2026-09-18T20:00:32+00:00 (UTC)
 //!   $time_local           18/Sep/2026:20:00:32 +0000 (UTC)
@@ -34,6 +35,7 @@ pub const LogVar = enum {
     request_method,
     protocol,
     upstream_addr,
+    upstream_cache_status,
     request_completion,
     time_iso8601,
     time_local,
@@ -131,6 +133,7 @@ pub const Entry = struct {
     body_bytes: u64,
     elapsed_ms: i64,
     upstream_addr: ?[]const u8,
+    cache_status: []const u8 = "",
     completed: bool,
     /// Wall clock at the end of the request, ms since the Unix epoch.
     now_ms: i64,
@@ -191,6 +194,7 @@ fn logValue(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: LogVar, e: *co
         .request_method => e.method,
         .protocol => e.protocol,
         .upstream_addr => e.upstream_addr,
+        .upstream_cache_status => if (e.cache_status.len > 0) e.cache_status else null,
         .request_completion => if (e.completed) "OK" else "",
         .time_iso8601, .time_local => blk: {
             const t = civil(@divFloor(e.now_ms, 1000));
