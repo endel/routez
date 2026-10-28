@@ -54,7 +54,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   variables (`$host`, `$request_uri`, ...).
 - Bans at run time: `routez ctl ban 192.0.2.0/24 600` refuses an address
   or network at accept and before any QUIC handshake, and closes requests
-  on connections already open; shared by every worker, kept across reloads.
+  on connections already open; shared by every worker, kept across reloads,
+  and optionally across restarts (`bans_file`).
 - Access control: IP allow/deny rules, Basic auth against htpasswd files
   (bcrypt checked off the event loop), and client certificates (mutual TLS)
   over TLS and HTTP/3, with the client's identity in variables.
@@ -393,7 +394,11 @@ variant the client doesn't take.
 ### Bans
 
 ```zig
-.{ .control_socket = "/run/routez.sock", .servers = ... }
+.{
+    .control_socket = "/run/routez.sock",
+    .bans_file = "/var/lib/routez/bans",   // optional: keep them across restarts
+    .servers = ...,
+}
 ```
 
 ```sh
@@ -412,12 +417,17 @@ routez ctl unban 192.0.2.7
 - `unban` lifts exactly what `ban` set: an address inside a banned network
   stays banned.
 - Bans live in the client table (`limits.max_tracked_clients`), so every
-  worker sees one at once and it survives a reload, not a restart. A flood
-  can fill the table with `limit_req` buckets just when bans are needed, so
-  a ban that finds no room drops a bucket (that client's count starts
-  afresh); only room full of connection counts and other bans refuses it.
-  While no ban is held a check costs one atomic load; with bans, one lookup
-  per prefix length in use.
+  worker sees one at once and it survives a reload. A flood can fill the
+  table with `limit_req` buckets just when bans are needed, so a ban that
+  finds no room drops a bucket (that client's count starts afresh); only
+  room full of connection counts and other bans refuses it. While no ban
+  is held a check costs one atomic load; with bans, one lookup per prefix
+  length in use.
+- `bans_file` keeps them across restarts: loaded at start, skipping those
+  that ended, and replaced whole after each control-socket session that
+  changed one, a `<network> <end, Unix seconds>` line each. Its directory
+  must be writable by `user`; a file that can't be written is logged at
+  start. Without it, bans last until the process exits.
 - The socket is created mode 0600 before `user` takes over: started as
   root, only root can use it. `routez ctl -s path` reaches another socket.
   Programs can speak its protocol directly: one command a line, any number

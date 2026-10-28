@@ -33,6 +33,8 @@ const max_ban_s = 10 * 365 * 24 * 3600;
 /// The socket `listen` bound, kept for the life of the process.
 var bound_buf: [@sizeOf(@FieldType(std.c.sockaddr.un, "path"))]u8 = undefined;
 pub var bound: []const u8 = "";
+/// Where `keepBans` keeps them, or empty.
+pub var bans_path: []const u8 = "";
 
 fn address(path: []const u8) error{NameTooLong}!std.c.sockaddr.un {
     var addr: std.c.sockaddr.un = .{ .path = @splat(0) };
@@ -75,6 +77,72 @@ fn stale(io: std.Io, path: []const u8, addr: *const std.c.sockaddr.un) bool {
     return std.c.connect(fd, @ptrCast(addr), @sizeOf(std.c.sockaddr.un)) != 0;
 }
 
+/// Load the bans `path` holds, skipping those that ended, and keep them
+/// there from now on (`bans_file`). A missing file is a first start.
+pub fn keepBans(io: std.Io, path: []const u8, table: *client_limits.Table) !void {
+    const gpa = std.heap.smp_allocator;
+    bans_path = try gpa.dupe(u8, path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer gpa.free(text);
+    const now_ns = sys.nanoTimestamp();
+    const now_s = sys.realtimeSeconds();
+    var loaded: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        n += 1;
+        var words = std.mem.tokenizeAny(u8, line, " \t\r");
+        const net = parseNet(words.next() orelse continue);
+        const end_s = std.fmt.parseInt(i64, words.next() orelse "", 10) catch null;
+        if (net == null or end_s == null or words.next() != null) {
+            // Tests fail on any logged warning.
+            if (!@import("builtin").is_test) log.warn("bans_file {s}:{d}: not \"<address>[/<prefix>] <end, Unix seconds>\"", .{ path, n });
+            continue;
+        }
+        if (end_s.? <= now_s) continue;
+        const left = @min(end_s.? - now_s, max_ban_s);
+        table.ban(io, net.?.net, net.?.bits, now_ns + left * std.time.ns_per_s, now_ns) catch {
+            log.err("bans_file {s}:{d}: the client table is full; raise limits.max_tracked_clients", .{ path, n });
+            break;
+        };
+        loaded += 1;
+    }
+    log.info("bans_file {s}: {d} ban(s)", .{ path, loaded });
+}
+
+/// Rewrite `bans_file` with the live bans, a "<network> <end, Unix seconds>"
+/// line each, replacing it whole.
+fn saveBans(io: std.Io, table: *client_limits.Table) void {
+    if (bans_path.len == 0) return;
+    writeBans(io, table) catch |err| log.err("bans_file {s}: {s}", .{ bans_path, @errorName(err) });
+}
+
+fn writeBans(io: std.Io, table: *client_limits.Table) !void {
+    var af = try std.Io.Dir.cwd().createFileAtomic(io, bans_path, .{ .permissions = .fromMode(0o600), .replace = true });
+    defer af.deinit(io);
+    const now_ns = sys.nanoTimestamp();
+    const now_s = sys.realtimeSeconds();
+    var cursor: client_limits.Table.BanCursor = .{};
+    var batch: [64]client_limits.Table.Ban = undefined;
+    var lines: [batch.len * Out.max_reply]u8 = undefined;
+    while (true) {
+        const got = table.nextBans(io, &cursor, now_ns, &batch);
+        if (got.len == 0) break;
+        var w: std.Io.Writer = .fixed(&lines);
+        for (got) |b| {
+            var buf: [64]u8 = undefined;
+            const left = std.math.divCeil(i64, b.until_ns - now_ns, std.time.ns_per_s) catch 0;
+            try w.print("{s} {d}\n", .{ formatNet(b.net, b.bits, &buf), now_s + left });
+        }
+        try af.file.writeStreamingAll(io, w.buffered());
+    }
+    try af.file.sync(io);
+    try af.replace(io);
+}
+
 /// Serve `fd` for the life of the process.
 pub fn spawn(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) !void {
     const t = try std.Thread.spawn(.{}, run, .{ io, fd, table });
@@ -82,6 +150,8 @@ pub fn spawn(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) !void {
 }
 
 fn run(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) void {
+    // As `user` by now: a bans_file it can't write shows at start.
+    saveBans(io, table);
     while (true) {
         const c = sys.accept(fd) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionAborted => continue,
@@ -93,11 +163,14 @@ fn run(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) void {
             },
         };
         defer sys.close(c);
-        serve(io, c, table) catch {};
+        // Once per session, however many commands it sent.
+        var changed = false;
+        serve(io, c, table, &changed) catch {};
+        if (changed) saveBans(io, table);
     }
 }
 
-fn serve(io: std.Io, c: posix.fd_t, table: *client_limits.Table) !void {
+fn serve(io: std.Io, c: posix.fd_t, table: *client_limits.Table, changed: *bool) !void {
     const tv: posix.timeval = .{ .sec = idle_timeout_s, .usec = 0 };
     _ = std.c.setsockopt(c, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval));
     var in: [max_line]u8 = undefined;
@@ -110,7 +183,7 @@ fn serve(io: std.Io, c: posix.fd_t, table: *client_limits.Table) !void {
         len += n;
         var start: usize = 0;
         while (std.mem.indexOfScalarPos(u8, in[0..len], start, '\n')) |nl| {
-            try execute(io, table, std.mem.trimEnd(u8, in[start..nl], "\r"), &out);
+            try execute(io, table, std.mem.trimEnd(u8, in[start..nl], "\r"), &out, changed);
             start = nl + 1;
         }
         try out.flush();
@@ -152,7 +225,7 @@ fn parseNet(text: ?[]const u8) ?access.Rule {
     return r;
 }
 
-fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out) !void {
+fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out, changed: *bool) !void {
     var words = std.mem.tokenizeAny(u8, line, " \t");
     const cmd = words.next() orelse return;
     var buf: [64]u8 = undefined;
@@ -165,6 +238,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out)
         table.ban(io, net.?.net, net.?.bits, now + @as(i64, secs) * std.time.ns_per_s, now) catch
             return out.print("error: the client table is full; raise limits.max_tracked_clients\n", .{});
         log.info("banned {s} for {d} s", .{ formatNet(net.?.net, net.?.bits, &buf), secs });
+        changed.* = true;
         return out.print("ok\n", .{});
     }
     if (std.mem.eql(u8, cmd, "unban")) {
@@ -172,6 +246,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out)
         if (net == null or words.next() != null) return out.print("error: usage: unban <address>[/<prefix>]\n", .{});
         if (!table.unban(io, net.?.net, net.?.bits)) return out.print("error: not banned\n", .{});
         log.info("unbanned {s}", .{formatNet(net.?.net, net.?.bits, &buf)});
+        changed.* = true;
         return out.print("ok\n", .{});
     }
     if (std.mem.eql(u8, cmd, "bans")) {
@@ -262,7 +337,8 @@ const testing = std.testing;
 
 fn run1(table: *client_limits.Table, line: []const u8, out: *Out) []const u8 {
     out.len = 0;
-    execute(testing.io, table, line, out) catch unreachable;
+    var changed = false;
+    execute(testing.io, table, line, out, &changed) catch unreachable;
     return out.buf[0..out.len];
 }
 
@@ -291,4 +367,40 @@ test "commands" {
     }
     try testing.expectEqualStrings("error: unknown command 'ba?n'\n", run1(t, "ba\x1bn", &out));
     try testing.expectEqualStrings("", run1(t, "   ", &out));
+}
+
+test "bans_file: loaded skipping ended and malformed lines, saved whole" {
+    const t = try client_limits.Table.createSharded(testing.allocator, 64, 4);
+    defer t.destroy(testing.allocator);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const now = sys.realtimeSeconds();
+    var text: [256]u8 = undefined;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "bans", .data = try std.fmt.bufPrint(&text,
+        \\192.0.2.7 {d}
+        \\198.51.100.0/24 {d}
+        \\not a ban
+        \\2001:db8::/48 {d}
+        \\
+    , .{ now + 600, now - 1, now + 60 }) });
+    const path = try tmp.dir.realPathFileAlloc(testing.io, "bans", testing.allocator);
+    defer testing.allocator.free(path);
+    try keepBans(testing.io, path, t);
+    defer {
+        std.heap.smp_allocator.free(bans_path);
+        bans_path = "";
+    }
+    try testing.expectEqual(@as(u32, 2), t.bans.load(.monotonic));
+    try testing.expect(!t.banned(testing.io, client_limits.network(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 198, 51, 100, 1 }, 32, 128), sys.nanoTimestamp()));
+
+    var out: Out = .{ .file = .{ .fd = -1 } };
+    try testing.expectEqualStrings("ok\n", run1(t, "unban 192.0.2.7", &out));
+    saveBans(testing.io, t);
+    const saved = try tmp.dir.readFileAlloc(testing.io, "bans", testing.allocator, .limited(4096));
+    defer testing.allocator.free(saved);
+    var words = std.mem.tokenizeAny(u8, saved, " \n");
+    try testing.expectEqualStrings("2001:db8::/48", words.next().?);
+    const end = try std.fmt.parseInt(i64, words.next().?, 10);
+    try testing.expect(end >= now + 59 and end <= now + 61);
+    try testing.expect(words.next() == null);
 }

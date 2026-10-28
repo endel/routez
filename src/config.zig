@@ -78,6 +78,11 @@ pub const Config = struct {
     /// at start, before `user` takes over: only its owner (root, when
     /// routez starts as root) can connect. A change takes a restart.
     control_socket: ?[]const u8 = null,
+    /// Keep bans across restarts in this file: loaded at start, rewritten
+    /// after each control_socket session that changed one. Its directory
+    /// must be writable by `user`. Needs control_socket; a change takes a
+    /// restart.
+    bans_file: ?[]const u8 = null,
     /// Write a qlog trace per QUIC connection into this directory: the packets
     /// sent and received with their frames and timestamps, in the format the
     /// other QUIC implementations share. For working out where a connection
@@ -559,6 +564,10 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
     const max_socket_path = @sizeOf(@FieldType(std.posix.sockaddr.un, "path")) - 1;
     if (cfg.control_socket) |p| if (p.len == 0 or p.len > max_socket_path)
         return fail("control_socket must be a path of 1 to {d} bytes", .{max_socket_path});
+    if (cfg.bans_file) |p| {
+        if (p.len == 0) return fail("bans_file is empty", .{});
+        if (cfg.control_socket == null) return fail("bans_file needs control_socket", .{});
+    }
     access_log.validate(cfg.access_log_format) catch |err| return fail("access_log_format: {s}", .{switch (err) {
         error.UnknownVariable => "unknown variable",
         error.BadVariable => "bad variable syntax",

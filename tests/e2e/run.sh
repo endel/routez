@@ -507,7 +507,7 @@ kill $IDLE; wait $IDLE 2>/dev/null
 # for addresses and networks; limit_req counting a /24 as one client. Clients
 # behind the trusted 127.0.0.1 are named by X-Forwarded-For.
 cat > "$WORK/bans.zon" <<EOF2
-.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .real_ip_from = .{"127.0.0.1"}, .servers = .{.{
+.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .bans_file = "$WORK/bans.txt", .real_ip_from = .{"127.0.0.1"}, .servers = .{.{
     .listen = .{ .{ .address = "127.0.0.1", .port = 18448 }, .{ .address = "127.0.0.1", .port = 18449, .tls = true, .quic = true } },
     .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
     .locations = .{
@@ -517,8 +517,12 @@ cat > "$WORK/bans.zon" <<EOF2
     },
 }} }
 EOF2
-"$ROOT/zig-out/bin/routez" "$WORK/bans.zon" 2> "$WORK/bans.log" & BANS=$!; PIDS+=($BANS)
-wait_port 18448
+start_bans() {
+    "$ROOT/zig-out/bin/routez" "$WORK/bans.zon" 2>> "$WORK/bans.log" & BANS=$!; PIDS+=($BANS)
+    wait_port 18448
+    for _ in $(seq 1 50); do [ -S "$WORK/ctl.sock" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+}
+start_bans
 ctl() { "$ROOT/zig-out/bin/routez" ctl -s "$WORK/ctl.sock" "$@"; }
 as() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 -H "X-Forwarded-For: $1" "http://127.0.0.1:18448${2:-/}"; }
 h3() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 --http3-only --cacert "$CERTS/ca.crt" https://127.0.0.1:18449/; }
@@ -538,6 +542,10 @@ SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_c
 SUITE=bans check socket-mode "$(stat -f '%Lp' "$WORK/ctl.sock" 2>/dev/null || stat -c '%a' "$WORK/ctl.sock")" 600
 kill $BANS; wait $BANS 2>/dev/null
 SUITE=bans check socket-removed "$([ -e "$WORK/ctl.sock" ] && echo left || echo removed)" removed
+# bans_file: what was banned at the stop is banned again after the start.
+start_bans
+SUITE=bans check kept-across-restart "$(ctl bans | grep -c -E '^10\.9\.0\.0/16 (59[0-9]|600)$') $(as 10.9.1.1)" "1 000"
+kill $BANS; wait $BANS 2>/dev/null
 
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
 # its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").
