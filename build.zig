@@ -74,7 +74,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "fuzz_options", .module = fuzz_options.createModule() }},
+        .imports = &.{
+            .{ .name = "fuzz_options", .module = fuzz_options.createModule() },
+            .{ .name = "quic", .module = quic_mod },
+        },
     }) });
     b.step("fuzz", "Run fuzz targets under a mutation loop").dependOn(&b.addRunArtifact(fuzz).step);
 
