@@ -15,6 +15,7 @@ const parser = @import("http1/parser.zig");
 const Worker = @import("worker.zig").Worker;
 const Proxy = @import("handlers/proxy.zig").Proxy;
 const stats = @import("stats.zig");
+const check = @import("handlers/check.zig");
 
 const log = std.log.scoped(.upstream);
 
@@ -161,6 +162,11 @@ pub const Group = struct {
             p.holds_place = true;
             return true;
         }
+        // Pass holders wait for a place; the rest get the check instead.
+        if (p.loc.browser_check == .under_load) if (self.worker.shared.check) |c| if (!check.hasPass(p.ex, c)) {
+            p.challenge();
+            return false;
+        };
         const low = p.loc.priority == .low;
         if (self.queued >= self.max_queued) {
             const bumped = if (low) null else self.waiting[1].head;

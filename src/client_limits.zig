@@ -44,6 +44,10 @@ fn banBits(zone: u32) ?u8 {
     return @intCast((zone - banZone(0)) / 2);
 }
 
+/// The bucket of an address's browser check puzzles and verifies; past
+/// the ban zones, even like them.
+pub const check_zone: u32 = banZone(128) + 2;
+
 /// Marks a node on the free list, so `nextBans` can scan nodes by index.
 const free_zone: u32 = 1 << 31;
 

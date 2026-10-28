@@ -56,6 +56,10 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   a bounded, timed line behind it where low-priority locations wait last
   and are turned away first, so an overload is shed at the edge, not by the
   app.
+- Browser check: a page that has the browser solve a small proof of work
+  for a pass cookie, on every visit without a pass or only while the
+  upstream is saturated; flood tools that don't run JavaScript never get
+  past it.
 - Bans at run time: `routez ctl ban 192.0.2.0/24 600` refuses an address
   or network at accept and before any QUIC handshake, and closes what it
   already has open; shared by every worker, kept across reloads, and
@@ -433,6 +437,51 @@ variant the client doesn't take.
   only against the old configuration's share.
 - Counted by `routez_upstream_requests_queued` and
   `routez_upstream_requests_shed_total`.
+
+### Browser check
+
+```zig
+.{
+    .browser_check = .{ .secret_file = "/etc/routez/check.secret" },   // optional, see below
+    .upstreams = .{.{ .name = "app", .servers = .{"10.0.0.1:8080"}, .max_active = 200 }},
+    .servers = .{.{ .listen = ..., .locations = .{
+        .{ .prefix = "/", .proxy_pass = "app", .browser_check = .under_load },
+        .{ .prefix = "/signup", .proxy_pass = "app", .browser_check = .always },
+        .{ .prefix = "/api/", .proxy_pass = "app" },   // API clients can't run a browser
+    } }},
+}
+```
+
+- A visitor without a pass gets a page, in place of what it asked for, that
+  spends about half a second on a small SHA-256 proof of work, collects a
+  pass cookie and loads the URL again. Flood tools that don't run
+  JavaScript never get past it, and serving it costs what serving a page
+  from memory costs.
+- `.always` asks every visitor without a pass. `.under_load` asks only
+  while the location's upstream is at `max_active`: a request with a pass
+  waits for a place as usual, one without gets the page (with 503) instead
+  of a place in line. Nobody is asked until the app is saturated.
+- A pass is an HMAC over the client's network (its IPv4 address, or its
+  IPv6 /64) and an expiry, so nothing is stored, every worker takes it, and
+  it is worthless from another network. It lasts `pass_ttl_s` (a week). A
+  forged, ended or foreign one costs one HMAC and gets the page.
+- `secret_file` (32 bytes or more) lets routez instances take each other's
+  passes; without it each start draws a random secret, so passes outlive
+  reloads but not restarts. `difficulty` (16) is the leading zero bits to
+  find: each one more doubles the work. `cookie` names the pass
+  (`routez_pass`).
+- The page's scripts and its puzzle and verify endpoints live under
+  `/.routez/check/`, ahead of every location; puzzles and verifies take 30
+  at once and one a second per address, then 429. Browsers give the solver
+  its crypto only in a secure context, so serve checked locations over
+  HTTPS (or from localhost); over plain HTTP the cookie isn't `Secure`.
+- Keep anything that can't run a browser out of checked locations: API
+  clients, webhooks, uptime checks. Visitors with JavaScript off can't pass;
+  a real headless browser pays the work and gets through, as with any check
+  of this kind, which is what bans and `limit_req` are for.
+- Counted by `routez_browser_check_pages_total`,
+  `routez_browser_check_passes_total` and
+  `routez_browser_check_invalid_passes_total`.
 
 ### Bans
 

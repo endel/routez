@@ -19,6 +19,7 @@ const fd_budget = @import("fd_budget.zig");
 const realip = @import("realip.zig");
 const access = @import("access.zig");
 const control = @import("control.zig");
+const browser_check = @import("browser_check.zig");
 const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
@@ -234,9 +235,9 @@ fn servesFiles(cfg: *const config.Config) bool {
 }
 
 fn clientTable(cfg: *const config.Config, auth: bool) !?*client_limits.Table {
-    // auth_basic rate-limits each client's uncached password checks; bans
-    // come through the control socket.
-    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth or cfg.control_socket != null;
+    // auth_basic rate-limits each client's uncached password checks, the
+    // browser check its puzzles; bans come through the control socket.
+    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth or cfg.control_socket != null or checksBrowsers(cfg);
     if (client_table) |t| {
         if (wanted and cfg.limits.max_tracked_clients != client_table_size)
             log.warn("limits.max_tracked_clients: a change takes effect at the next restart", .{});
@@ -246,6 +247,35 @@ fn clientTable(cfg: *const config.Config, auth: bool) !?*client_limits.Table {
     client_table = try client_limits.Table.create(std.heap.smp_allocator, cfg.limits.max_tracked_clients);
     client_table_size = cfg.limits.max_tracked_clients;
     return client_table;
+}
+
+fn checksBrowsers(cfg: *const config.Config) bool {
+    for (cfg.servers) |srv| for (srv.locations) |loc| if (loc.browser_check != null) return true;
+    return false;
+}
+
+/// The browser check's secret without `secret_file`: one per process, so
+/// passes outlive reloads, not restarts.
+var check_secret: [32]u8 = undefined;
+
+fn loadCheck(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !?*const browser_check.Check {
+    if (!checksBrowsers(cfg)) return null;
+    const bcfg = cfg.browser_check;
+    const secret = if (bcfg.secret_file) |path| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096)) catch |err| {
+            log.err("browser_check.secret_file {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        const s = std.mem.trimEnd(u8, text, "\r\n");
+        if (s.len < 32) {
+            log.err("browser_check.secret_file {s}: needs 32 bytes or more, has {d}", .{ path, s.len });
+            return error.InvalidConfig;
+        }
+        break :blk s;
+    } else &check_secret;
+    const c = try arena.create(browser_check.Check);
+    c.* = .{ .secret = secret, .difficulty = bcfg.difficulty, .pass_ttl_s = bcfg.pass_ttl_s, .cookie = bcfg.cookie };
+    return c;
 }
 
 fn limitsRequests(cfg: *const config.Config) bool {
@@ -310,6 +340,7 @@ fn loadShared(arena: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !
         .real_ip = try realIpTrust(arena, cfg),
         .guards = guards,
         .routes = routes,
+        .check = try loadCheck(arena, io, cfg),
     };
 }
 
@@ -398,6 +429,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
+    quic.sys.randomBytes(&check_secret);
     quic.sys.randomBytes(&quic_keys.retry);
     quic.sys.randomBytes(&quic_keys.reset);
     if (std.c.pipe(&signal_pipe) != 0) return error.PipeFailed;
@@ -494,6 +526,8 @@ test {
     _ = @import("stats.zig");
     _ = @import("client_limits.zig");
     _ = @import("control.zig");
+    _ = @import("browser_check.zig");
+    _ = @import("handlers/check.zig");
     _ = @import("access.zig");
     _ = @import("guard.zig");
     _ = @import("auth/htpasswd.zig");

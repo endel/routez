@@ -36,6 +36,8 @@ const htpasswd = @import("auth/htpasswd.zig");
 const auth_pool = @import("auth/pool.zig");
 const basic = @import("auth/basic.zig");
 const regex = @import("regex.zig");
+const browser_check = @import("browser_check.zig");
+const check = @import("handlers/check.zig");
 const realip = @import("realip.zig");
 const socket = @import("net/socket.zig");
 
@@ -331,6 +333,7 @@ pub const Exchange = struct {
                 }
             }
         }
+        if (self.worker.shared.check) |c| if (std.mem.startsWith(u8, self.req.path, browser_check.prefix)) return check.serve(self, c);
         const loc = self.route() orelse return;
         self.add_values = self.expandAll(loc.add_headers) catch return self.sendError(400);
         self.location = loc;
@@ -345,6 +348,8 @@ pub const Exchange = struct {
         if (access.check(pol.rules, self.req.client_ip) == .deny) return self.sendError(403);
         if (self.cert_misdirected) return self.sendError(421);
         if (pol.require_client_cert and self.client_cert == null) return self.sendError(403);
+        // Ahead of auth_basic: a flood never reaches bcrypt.
+        if (loc.browser_check == .always) if (self.worker.shared.check) |c| if (!check.hasPass(self, c)) return check.sendPage(self, 200);
         if (pol.auth) |auth| switch (self.checkPassword(auth)) {
             .ok => {},
             .denied => return self.sendUnauthorized(auth),

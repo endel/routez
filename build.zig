@@ -23,6 +23,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The browser check's page shows it.
+    root_mod.addAnonymousImport("routez.svg", .{ .root_source_file = b.path("routez.svg") });
+
     const exe = b.addExecutable(.{ .name = "routez", .root_module = root_mod });
     b.installArtifact(exe);
 

@@ -19,6 +19,7 @@ const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
 const stats = @import("../stats.zig");
+const check = @import("check.zig");
 const exchange = @import("../exchange.zig");
 const Exchange = exchange.Exchange;
 const Header = common.Header;
@@ -303,6 +304,13 @@ pub const Proxy = struct {
         self.phase = .done;
         stats.inc(&stats.upstream_shed);
         self.ex.sendRetryLater(503);
+        self.finish(false);
+    }
+
+    /// No place, and no pass (`browser_check = .under_load`): the check.
+    pub fn challenge(self: *Proxy) void {
+        self.phase = .done;
+        check.sendPage(self.ex, 503);
         self.finish(false);
     }
 
