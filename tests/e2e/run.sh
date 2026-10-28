@@ -564,6 +564,42 @@ start_bans
 SUITE=bans check kept-across-restart "$(ctl bans | grep -c -E '^10\.9\.0\.0/16 (59[0-9]|600)$') $(as 10.9.1.1)" "1 000"
 kill $BANS; wait $BANS 2>/dev/null
 
+# Upstream admission: one place at a time on the slow upstream (3 s a
+# request), one waiting. A normal request bumps a low one from a full line,
+# and is itself turned away when the line holds only normal ones.
+cat > "$WORK/adm.zon" <<EOF2
+.{ .access_log = false, .workers = 1,
+   .upstreams = .{
+       .{ .name = "slow", .servers = .{"127.0.0.1:19004"}, .max_active = 1, .max_queued = 1, .queue_timeout_ms = 10000 },
+       .{ .name = "brief", .servers = .{"127.0.0.1:19004"}, .max_active = 1, .queue_timeout_ms = 300 },
+   },
+   .servers = .{.{ .listen = .{.{ .address = "127.0.0.1", .port = 18453 }}, .locations = .{
+       .{ .prefix = "/n", .proxy_pass = "slow" },
+       .{ .prefix = "/low", .proxy_pass = "slow", .priority = .low },
+       .{ .prefix = "/t", .proxy_pass = "brief" },
+       .{ .prefix = "/metrics", .metrics = true },
+   } }},
+}
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/adm.zon" 2> "$WORK/adm.log" & ADM=$!; PIDS+=($ADM)
+wait_port 18453
+adm() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+nap() { perl -e 'select(undef,undef,undef,0.2)'; }
+adm http://127.0.0.1:18453/n > "$WORK/adm1" & A1=$!; nap
+adm http://127.0.0.1:18453/low > "$WORK/adm2" & A2=$!; nap
+adm http://127.0.0.1:18453/n > "$WORK/adm3" & A3=$!; nap
+adm -D "$WORK/adm4.h" http://127.0.0.1:18453/n > "$WORK/adm4" & A4=$!
+wait $A1 $A2 $A3 $A4
+SUITE=admission check queue-and-priority "$(cat "$WORK/adm1") $(cat "$WORK/adm2") $(cat "$WORK/adm3") $(cat "$WORK/adm4")" "200 503 200 503"
+SUITE=admission check retry-after "$(grep -i '^retry-after:' "$WORK/adm4.h" | tr -d '\r')" "retry-after: 1"
+adm http://127.0.0.1:18453/t > "$WORK/adm5" & A5=$!; nap
+t0=$(now_ms); late=$(adm http://127.0.0.1:18453/t); waited=$(($(now_ms) - t0))
+wait $A5
+SUITE=admission check queue-timeout "$(cat "$WORK/adm5") $late $([ $waited -ge 250 ] && [ $waited -lt 2500 ] && echo in-time || echo "after ${waited}ms")" "200 503 in-time"
+adm_metric() { $CURL_BIN -s http://127.0.0.1:18453/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+SUITE=admission check metrics "$(adm_metric routez_upstream_requests_shed_total) $(adm_metric routez_upstream_requests_queued)" "3 0"
+kill $ADM; wait $ADM 2>/dev/null
+
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
 # its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").
 $OPENSSL req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/rsa8.key" -out "$WORK/rsa.crt" -days 2 \

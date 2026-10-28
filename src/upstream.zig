@@ -35,10 +35,47 @@ pub const Group = struct {
     rr: usize = 0,
     health_tick: timers.Deadline = .{ .callback = onHealthTick },
 
+    /// This worker's share of `max_active` (0: no limit) and `max_queued`.
+    limit: u32 = 0,
+    max_queued: u32 = 0,
+    /// Requests holding a place.
+    active: u32 = 0,
+    /// Requests waiting for one, `normal` then `low`, each oldest first.
+    waiting: [2]Line = .{ .{}, .{} },
+    queued: u32 = 0,
+    wake: timers.Deferred = .{ .callback = onWake },
+
+    /// Threaded through the waiting proxies, so waiting allocates nothing.
+    const Line = struct {
+        head: ?*Proxy = null,
+        tail: ?*Proxy = null,
+
+        fn push(l: *Line, p: *Proxy) void {
+            p.wait_prev = l.tail;
+            p.wait_next = null;
+            if (l.tail) |t| t.wait_next = p else l.head = p;
+            l.tail = p;
+        }
+
+        fn remove(l: *Line, p: *Proxy) void {
+            if (p.wait_prev) |q| q.wait_next = p.wait_next else l.head = p.wait_next;
+            if (p.wait_next) |q| q.wait_prev = p.wait_prev else l.tail = p.wait_prev;
+            p.wait_prev = null;
+            p.wait_next = null;
+        }
+    };
+
     pub fn init(worker: *Worker, cfg: config.Upstream) !*Group {
         const g = try worker.alloc.create(Group);
         errdefer worker.alloc.destroy(g);
-        g.* = .{ .worker = worker, .cfg = cfg, .peers = try worker.alloc.alloc(Peer, cfg.servers.len) };
+        const workers = worker.cfg.workers;
+        g.* = .{
+            .worker = worker,
+            .cfg = cfg,
+            .peers = try worker.alloc.alloc(Peer, cfg.servers.len),
+            .limit = std.math.divCeil(u32, cfg.max_active, workers) catch unreachable,
+            .max_queued = std.math.divCeil(u32, cfg.max_queued orelse cfg.max_active, workers) catch unreachable,
+        };
         for (cfg.servers, g.peers) |text, *p| {
             const hp = config.parseHostPort(text) catch unreachable; // validated at load
             const ip = addr.resolve(hp.host, hp.port) catch |err| {
@@ -112,6 +149,54 @@ pub const Group = struct {
             },
         }
         return null;
+    }
+
+    /// A place for `p` now: true. Else it waits in line or, the line being
+    /// full, it or a `low` request waiting is turned away.
+    pub fn admit(self: *Group, p: *Proxy) bool {
+        if (self.limit == 0) return true;
+        // Behind anyone waiting, even when a place has just come free.
+        if (self.active < self.limit and self.queued == 0) {
+            self.active += 1;
+            p.holds_place = true;
+            return true;
+        }
+        const low = p.loc.priority == .low;
+        if (self.queued >= self.max_queued) {
+            const bumped = if (low) null else self.waiting[1].head;
+            (bumped orelse p).shed();
+            if (bumped == null) return false;
+        }
+        self.waiting[@intFromBool(low)].push(p);
+        self.queued += 1;
+        stats.inc(&stats.upstream_queued);
+        p.wait();
+        return false;
+    }
+
+    /// Take `p` out of line, its wait over one way or another.
+    pub fn unqueue(self: *Group, p: *Proxy) void {
+        self.waiting[@intFromBool(p.loc.priority == .low)].remove(p);
+        self.queued -= 1;
+        stats.dec(&stats.upstream_queued);
+    }
+
+    /// A request let its place go: the next one waiting gets it, on a later
+    /// loop iteration, so a run of failures doesn't recurse.
+    pub fn release(self: *Group) void {
+        self.active -= 1;
+        if (self.queued > 0) self.worker.timers.defer_(&self.wake);
+    }
+
+    fn onWake(d: *timers.Deferred) void {
+        const self: *Group = @fieldParentPtr("wake", d);
+        while (self.active < self.limit) {
+            const p = self.waiting[0].head orelse self.waiting[1].head orelse return;
+            self.unqueue(p);
+            self.active += 1;
+            p.holds_place = true;
+            p.proceed();
+        }
     }
 
     fn onHealthTick(d: *timers.Deadline) void {

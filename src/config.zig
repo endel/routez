@@ -349,6 +349,9 @@ pub const Location = struct {
     precompressed: []const encoding.Coding = &.{},
     /// Per-client request rate limit, shared by all workers.
     limit_req: ?LimitReq = null,
+    /// When its upstream is at `max_active`: `low` requests wait behind
+    /// `normal` ones and are the first turned away.
+    priority: Priority = .normal,
     /// IP allow/deny rules, nginx-style: the first rule matching the client
     /// decides, and a client no rule matches is allowed; denied ones get 403.
     /// Replaces the server's `access` when not empty. The client is the TCP
@@ -377,6 +380,8 @@ pub const Location = struct {
     pub fn pattern(self: *const Location) []const u8 {
         return self.prefix orelse self.exact orelse self.regex orelse "";
     }
+
+    pub const Priority = enum { normal, low };
 
     pub const LimitReq = struct {
         /// Sustained requests per second.
@@ -430,6 +435,16 @@ pub const Upstream = struct {
     connect_timeout_ms: u32 = 5_000,
     /// Time allowed between upstream reads while waiting for a response.
     read_timeout_ms: u32 = 60_000,
+    /// Requests the upstream works on at once, across all workers (each
+    /// takes an even share, rounded up); 0 is no limit. Past it, requests
+    /// wait for a place. WebSocket tunnels give theirs back once upgraded.
+    max_active: u32 = 0,
+    /// Requests that may wait, across all workers; `max_active` when null.
+    /// When the line is full, a `normal` request takes the place of the
+    /// `low` one waiting longest, else it is answered 503.
+    max_queued: ?u32 = null,
+    /// Longest a request waits for a place before a 503.
+    queue_timeout_ms: u32 = 1_000,
     /// Upstream speaks HTTP/3 (QUIC) instead of HTTP/1.1. Used for WebTransport relays.
     h3: bool = false,
     /// Upstream speaks HTTPS: HTTP/1.1 over TLS 1.3.
@@ -593,6 +608,7 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
 
     for (cfg.upstreams, 0..) |up, i| {
         if (up.servers.len == 0) return fail("upstream '{s}' has no servers", .{up.name});
+        if (up.max_active != 0 and up.queue_timeout_ms == 0) return fail("upstream '{s}': queue_timeout_ms must be > 0", .{up.name});
         if (up.tls and up.h3) return fail("upstream '{s}': tls and h3 are exclusive (h3 is always encrypted)", .{up.name});
         if (up.tls_server_name) |n| if (n.len == 0 or n.len > 255) return fail("upstream '{s}': bad tls_server_name", .{up.name});
         if ((up.tls_client_cert == null) != (up.tls_client_key == null)) return fail("upstream '{s}': tls_client_cert and tls_client_key go together", .{up.name});
