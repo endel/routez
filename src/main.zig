@@ -19,6 +19,7 @@ const fd_budget = @import("fd_budget.zig");
 const realip = @import("realip.zig");
 const access = @import("access.zig");
 const control = @import("control.zig");
+const cluster = @import("cluster.zig");
 const browser_check = @import("browser_check.zig");
 const build_options = @import("build_options");
 
@@ -114,6 +115,8 @@ const Generation = struct {
         if (prev != null and (!std.mem.eql(u8, g.cfg.control_socket orelse "", control.bound) or
             !std.mem.eql(u8, g.cfg.bans_file orelse "", control.bans_path)))
             log.warn("control_socket, bans_file: a change takes effect at the next restart", .{});
+        if (prev != null and (g.cfg.cluster != null) != (ban_sync != null))
+            log.warn("cluster: a change takes effect at the next restart", .{});
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
@@ -157,6 +160,13 @@ const Generation = struct {
                 return err;
             };
         };
+        // Its key file is root's, like the TLS keys.
+        if (prev == null) if (g.cfg.cluster) |c| {
+            ban_sync = cluster.Cluster.open(std.heap.smp_allocator, io, c) catch |err| {
+                log.err("cluster: {s}", .{@errorName(err)});
+                return err;
+            };
+        };
         // Listeners are bound and logs open: nothing left that needs root.
         if (prev == null) if (ids) |u| {
             privileges.prepareAcmeStorage(io, arena, &g.cfg, u) catch |err| {
@@ -172,10 +182,11 @@ const Generation = struct {
         };
         g.threads = try arena.alloc(std.Thread, workers.len);
         for (g.threads, workers) |*t, w| t.* = try std.Thread.spawn(.{}, runWorker, .{w});
-        if (control_fd) |fd| {
-            // clientTable made one for it, and keeps it for every generation.
-            try control.spawn(io, fd, g.shared.clients.?);
-            log.info("control socket {s}", .{control.bound});
+        if (prev == null and (control_fd != null or ban_sync != null)) {
+            // clientTable made one for these, and keeps it for every generation.
+            try control.spawn(io, control_fd, ban_sync, g.shared.clients.?);
+            if (control_fd != null) log.info("control socket {s}", .{control.bound});
+            if (ban_sync) |s| log.info("cluster: sharing bans with {d} peer(s)", .{s.peers.len});
         }
         // After the listeners are up, so HTTP-01 challenges can be answered.
         manager.reloadApplied(certificates_seen);
@@ -204,6 +215,9 @@ const Generation = struct {
 /// carry over a reload.
 var client_table: ?*client_limits.Table = null;
 var client_table_size: u32 = 0;
+
+/// Ban sync with other instances, opened for the first config's `cluster`.
+var ban_sync: ?*cluster.Cluster = null;
 
 /// Verifier threads for bcrypt, started for the first config with
 /// `auth_basic` and kept, cache included, for the life of the process.
@@ -237,7 +251,7 @@ fn servesFiles(cfg: *const config.Config) bool {
 fn clientTable(cfg: *const config.Config, auth: bool) !?*client_limits.Table {
     // auth_basic rate-limits each client's uncached password checks, the
     // browser check its puzzles; bans come through the control socket.
-    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth or cfg.control_socket != null or checksBrowsers(cfg);
+    const wanted = cfg.limits.max_connections_per_ip != 0 or limitsRequests(cfg) or auth or cfg.control_socket != null or cfg.cluster != null or checksBrowsers(cfg);
     if (client_table) |t| {
         if (wanted and cfg.limits.max_tracked_clients != client_table_size)
             log.warn("limits.max_tracked_clients: a change takes effect at the next restart", .{});
@@ -527,6 +541,7 @@ test {
     _ = @import("client_limits.zig");
     _ = @import("control.zig");
     _ = @import("browser_check.zig");
+    _ = @import("cluster.zig");
     _ = @import("handlers/check.zig");
     _ = @import("access.zig");
     _ = @import("guard.zig");

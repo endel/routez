@@ -15,6 +15,7 @@ const quic_lb = quic.quic_lb;
 const config = @import("config.zig");
 const timers = @import("timers.zig");
 const socket = @import("net/socket.zig");
+const addr = @import("net/addr.zig");
 const stats = @import("stats.zig");
 const upstream = @import("upstream.zig");
 const worker_mod = @import("worker.zig");
@@ -48,26 +49,6 @@ fn addrKey(sa: *const posix.sockaddr.storage) AddrKey {
         else => {},
     }
     return k;
-}
-
-fn sockaddrLen(sa: *const posix.sockaddr.storage) posix.socklen_t {
-    const base: *const posix.sockaddr = @ptrCast(sa);
-    return if (base.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
-}
-
-fn ipToStorage(ip: std.Io.net.IpAddress) posix.sockaddr.storage {
-    var s = std.mem.zeroes(posix.sockaddr.storage);
-    switch (ip) {
-        .ip4 => |a| {
-            const in: *posix.sockaddr.in = @ptrCast(@alignCast(&s));
-            in.* = .{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) };
-        },
-        .ip6 => |a| {
-            const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&s));
-            in6.* = .{ .port = std.mem.nativeToBig(u16, a.port), .flowinfo = a.flow, .addr = a.bytes, .scope_id = a.interface.index };
-        },
-    }
-    return s;
 }
 
 pub const UdpProxy = struct {
@@ -118,7 +99,7 @@ pub const UdpProxy = struct {
 
     fn openSocket(cfg: *const config.UdpProxy) !posix.socket_t {
         const ip = try std.Io.net.IpAddress.parse(cfg.address, cfg.port);
-        const storage = ipToStorage(ip);
+        const storage = addr.toStorage(ip);
         const family: u32 = if (ip == .ip6) posix.AF.INET6 else posix.AF.INET;
         const fd = try sys.socket(family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer sys.close(fd);
@@ -129,7 +110,7 @@ pub const UdpProxy = struct {
         const bufsz: c_int = 4 * 1024 * 1024;
         _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bufsz), @sizeOf(c_int));
         _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&bufsz), @sizeOf(c_int));
-        try sys.bind(fd, @ptrCast(&storage), sockaddrLen(&storage));
+        try sys.bind(fd, @ptrCast(&storage), addr.storageLen(&storage));
         return fd;
     }
 
@@ -275,18 +256,18 @@ const Flow = struct {
 
     fn create(proxy: *UdpProxy, key: AddrKey, client: *const posix.sockaddr.storage, peer: *upstream.Peer) !*Flow {
         const w = proxy.worker;
-        const storage = ipToStorage(peer.addr);
+        const storage = addr.toStorage(peer.addr);
         const family: u32 = if (peer.addr == .ip6) posix.AF.INET6 else posix.AF.INET;
         const fd = try sys.socket(family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer sys.close(fd);
-        if (std.c.connect(fd, @ptrCast(&storage), sockaddrLen(&storage)) != 0) return error.ConnectFailed;
+        if (std.c.connect(fd, @ptrCast(&storage), addr.storageLen(&storage)) != 0) return error.ConnectFailed;
 
         const self = try w.alloc.create(Flow);
         self.* = .{
             .proxy = proxy,
             .key = key,
             .client = client.*,
-            .client_len = sockaddrLen(client),
+            .client_len = addr.storageLen(client),
             .peer = peer,
             .fd = fd,
             .file = xev.File.initFd(fd),

@@ -527,6 +527,42 @@ Bans come from `routez ctl`, and from `limit_req`'s `ban` (see
   `<network> <end, Unix seconds>` line each. Its directory
   must be writable by `user`; a file that can't be written is logged at
   start. Without it, bans last until the process exits.
+- `cluster` shares bans between routez instances, whoever made them:
+
+  ```zig
+  .cluster = .{ .listen = "10.0.0.1:7900", .peers = .{ "10.0.0.2:7900", "10.0.0.3:7900" },
+                .key_file = "/etc/routez/cluster.key" },
+  ```
+
+  A ban or unban goes to every peer at once in a UDP datagram signed with
+  the key (32 bytes or more, the same everywhere); a `limit_req` ban goes
+  within a second. Every 30 s each instance sends its peers a digest of
+  what it holds, and one whose own differs pulls the whole list, so a lost
+  datagram is made up and a restarted instance catches up. Copies merge by
+  version, the later one winning, and an unban is kept until the ban would
+  have ended, so a late copy can't bring it back; bans an instance only
+  reloaded from its `bans_file` count as oldest. Datagrams from anything
+  not in `peers`, or not signed with the key, are dropped and counted by
+  `routez_cluster_datagrams_rejected_total`; bans taken from peers by
+  `routez_cluster_bans_received_total`. Rate-limit buckets aren't shared:
+  size `limit_req` per instance.
+
+  Across machines:
+
+  - Every instance lists every other (up to 64), and a change to `cluster`
+    takes a restart; host names in it are resolved once, at start.
+  - A peer is known by the address its datagrams come from, its `listen`:
+    bind that to the machine's own address, not one a NAT rewrites (a
+    published container port, a cloud NAT between regions). Link sites
+    over a VPN such as WireGuard.
+  - Datagrams are signed, not encrypted: anyone on the path can read the
+    ban list. Keep `listen` on a private network, its port open only
+    between the instances.
+  - Bans end at a Unix time, and the later of two changes wins by the
+    clock of the machine that made it: run NTP, or a skewed clock shortens
+    or lengthens shared bans by its skew.
+  - A pull sends the whole list, so a large one (tens of thousands of bans
+    and more) costs a few MB each time digests differ.
 - The socket is created mode 0600 before `user` takes over: started as
   root, only root can use it. `routez ctl -s path` reaches another socket.
   Programs can speak its protocol directly: one command a line, any number

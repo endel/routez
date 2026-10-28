@@ -10,6 +10,26 @@ pub fn resolve(host: []const u8, port: u16) !IpAddress {
     return fromStorage(&storage) orelse error.UnknownHostName;
 }
 
+pub fn storageLen(sa: *const std.posix.sockaddr.storage) std.posix.socklen_t {
+    const base: *const std.posix.sockaddr = @ptrCast(sa);
+    return if (base.family == std.posix.AF.INET6) @sizeOf(std.posix.sockaddr.in6) else @sizeOf(std.posix.sockaddr.in);
+}
+
+pub fn toStorage(ip: std.Io.net.IpAddress) std.posix.sockaddr.storage {
+    var s = std.mem.zeroes(std.posix.sockaddr.storage);
+    switch (ip) {
+        .ip4 => |a| {
+            const in: *std.posix.sockaddr.in = @ptrCast(@alignCast(&s));
+            in.* = .{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) };
+        },
+        .ip6 => |a| {
+            const in6: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(&s));
+            in6.* = .{ .port = std.mem.nativeToBig(u16, a.port), .flowinfo = a.flow, .addr = a.bytes, .scope_id = a.interface.index };
+        },
+    }
+    return s;
+}
+
 pub fn fromStorage(storage: *const std.posix.sockaddr.storage) ?IpAddress {
     const sa: *const std.posix.sockaddr = @ptrCast(storage);
     switch (sa.family) {

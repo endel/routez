@@ -649,6 +649,50 @@ chk_metric() { $CURL_BIN -s --cacert "$CERTS/ca.crt" $CB/metrics | python3 "$HER
 SUITE=check check metrics "$([ "$(chk_metric routez_browser_check_pages_total)" -ge 3 ] && echo pages) $(chk_metric routez_browser_check_passes_total) $([ "$(chk_metric routez_browser_check_invalid_passes_total)" -ge 1 ] && echo invalid)" "pages 2 invalid"
 kill $CHK; wait $CHK 2>/dev/null
 
+# Ban sync: two instances share bans over `cluster`, whoever makes them.
+head -c 48 /dev/urandom | base64 > "$WORK/cluster.key"
+cluster_conf() {  # name, HTTP port, own cluster port, peer's cluster port
+cat > "$WORK/cl-$1.zon" <<EOF2
+.{ .access_log = false, .control_socket = "$WORK/ctl-$1.sock", .real_ip_from = .{"127.0.0.1"},
+   .cluster = .{ .listen = "127.0.0.1:$3", .peers = .{"127.0.0.1:$4"}, .key_file = "$WORK/cluster.key" },
+   .servers = .{.{ .listen = .{.{ .address = "127.0.0.1", .port = $2 }}, .locations = .{
+       .{ .prefix = "/", .@"return" = .{ .body = "ok" } },
+       .{ .prefix = "/auto", .@"return" = .{ .body = "ok" }, .limit_req = .{ .rate = 1, .ban = .{ .after = 2, .for_s = 300 } } },
+       .{ .prefix = "/metrics", .metrics = true },
+   } }},
+}
+EOF2
+}
+cluster_conf a 18462 18911 18912
+cluster_conf b 18463 18912 18911
+start_cl() {  # name, HTTP port
+    "$ROOT/zig-out/bin/routez" "$WORK/cl-$1.zon" 2>> "$WORK/cl-$1.log" & CL_PID=$!; PIDS+=($CL_PID)
+    wait_port $2
+    for _ in $(seq 1 50); do [ -S "$WORK/ctl-$1.sock" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+}
+start_cl a 18462; CLA=$CL_PID
+start_cl b 18463; CLB=$CL_PID
+ctlx() { "$ROOT/zig-out/bin/routez" ctl -s "$WORK/ctl-$1.sock" "${@:2}"; }
+# Whether instance $1 lists a ban matching $2 within 4 s (or, with $3 = gone, stops listing it).
+listed() {
+    for _ in $(seq 1 40); do
+        if ctlx $1 bans | grep -q -E "$2"; then [ "${3:-}" = gone ] || { echo yes; return; }
+        else [ "${3:-}" = gone ] && { echo yes; return; }; fi
+        perl -e 'select(undef,undef,undef,0.1)'
+    done
+    echo no
+}
+SUITE=cluster check ctl-ban-shared "$(ctlx a ban 10.20.0.0/16 600) $(listed b '^10\.20\.0\.0/16 ')" "ok yes"
+SUITE=cluster check ctl-unban-shared "$(ctlx a unban 10.20.0.0/16) $(listed b '^10\.20\.0\.0/16 ' gone)" "ok yes"
+SUITE=cluster check auto-ban-shared "$(for _ in 1 2 3 4; do $CURL_BIN -s -o /dev/null -w '%{http_code} ' -H 'X-Forwarded-For: 10.30.3.3' http://127.0.0.1:18463/auto; done)$(listed a '^10\.30\.3\.3 ')" "200 429 429 429 yes"
+kill $CLB; wait $CLB 2>/dev/null
+start_cl b 18463; CLB=$CL_PID
+SUITE=cluster check restart-catches-up "$(listed b '^10\.30\.3\.3 ')" yes
+python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"rzb1\x01" + b"\0" * 40, ("127.0.0.1", 18911))'
+cl_metric() { $CURL_BIN -s http://127.0.0.1:$1/metrics | python3 "$HERE/check_metrics.py" "$2"; }
+SUITE=cluster check metrics "$([ "$(cl_metric 18462 routez_cluster_bans_received_total)" -ge 1 ] && echo received) $(cl_metric 18462 routez_cluster_datagrams_rejected_total)" "received 1"
+kill $CLA $CLB; wait $CLA $CLB 2>/dev/null
+
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
 # its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").
 $OPENSSL req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/rsa8.key" -out "$WORK/rsa.crt" -days 2 \
