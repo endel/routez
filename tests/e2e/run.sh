@@ -504,10 +504,15 @@ SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 700 ] && [ 
 kill $IDLE; wait $IDLE 2>/dev/null
 
 # Bans through the control socket, at accept, QUIC Initial and request start,
-# for addresses and networks; limit_req counting a /24 as one client. Clients
-# behind the trusted 127.0.0.1 are named by X-Forwarded-For.
+# for addresses and networks, closing what a client already has open;
+# limit_req counting a /24 as one client. Clients behind the trusted
+# 127.0.0.1 are named by X-Forwarded-For.
 cat > "$WORK/bans.zon" <<EOF2
-.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .real_ip_from = .{"127.0.0.1"}, .servers = .{.{
+.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .bans_file = "$WORK/bans.txt", .real_ip_from = .{"127.0.0.1"},
+   .upstreams = .{ .{ .name = "tunnel", .servers = .{"127.0.0.1:18080"} }, .{ .name = "echo", .servers = .{"127.0.0.1:19011"} } },
+   .tcp_proxies = .{.{ .address = "127.0.0.1", .port = 18451, .proxy_pass = "tunnel" }},
+   .udp_proxies = .{.{ .address = "127.0.0.1", .port = 18452, .proxy_pass = "echo" }},
+   .servers = .{.{
     .listen = .{ .{ .address = "127.0.0.1", .port = 18448 }, .{ .address = "127.0.0.1", .port = 18449, .tls = true, .quic = true } },
     .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
     .locations = .{
@@ -517,8 +522,12 @@ cat > "$WORK/bans.zon" <<EOF2
     },
 }} }
 EOF2
-"$ROOT/zig-out/bin/routez" "$WORK/bans.zon" 2> "$WORK/bans.log" & BANS=$!; PIDS+=($BANS)
-wait_port 18448
+start_bans() {
+    "$ROOT/zig-out/bin/routez" "$WORK/bans.zon" 2>> "$WORK/bans.log" & BANS=$!; PIDS+=($BANS)
+    wait_port 18448
+    for _ in $(seq 1 50); do [ -S "$WORK/ctl.sock" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+}
+start_bans
 ctl() { "$ROOT/zig-out/bin/routez" ctl -s "$WORK/ctl.sock" "$@"; }
 as() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 -H "X-Forwarded-For: $1" "http://127.0.0.1:18448${2:-/}"; }
 h3() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 --http3-only --cacert "$CERTS/ca.crt" https://127.0.0.1:18449/; }
@@ -529,15 +538,67 @@ SUITE=bans check list "$(ctl bans | grep -c -E '^(10\.1\.2\.3 (59|60)|10\.9\.0\.
 SUITE=bans check unban "$(ctl unban 10.1.2.3) $(as 10.1.2.3) $(ctl unban 10.1.2.3) $(ctl unban 10.1.2.3 > /dev/null; echo $?)" "ok 200 error: not banned 1"
 SUITE=bans check bad-command "$(ctl ban 10.0.0.1 > /dev/null; echo $?) $(ctl ban all 60 | cut -c1-12)" "1 error: usage"
 SUITE=bans check h3-before "$(h3)" 200
-SUITE=bans check keepalive-closed "$(python3 "$HERE/ban_keepalive.py" 18448 "$ROOT/zig-out/bin/routez" "$WORK/ctl.sock")" "200 closed"
+# Each bans 127.0.0.1 once its connection is open, then lifts the ban.
+open_then_ban() { python3 "$HERE/ban_open.py" "$2" "$ROOT/zig-out/bin/routez" "$WORK/ctl.sock" "$1"; ctl unban 127.0.0.1 > /dev/null; }
+SUITE=bans check open-request-closed "$(open_then_ban request 18448)" "200 closed"
+SUITE=bans check open-idle-closed "$(open_then_ban idle 18448)" "200 closed"
+SUITE=bans check open-tunnel-closed "$(open_then_ban tunnel 18451)" "HTTP/1.1 200 closed"
+SUITE=bans check open-udp-flow-closed "$(open_then_ban udp 18452)" "echoed dropped"
+"$ROOT/zig-out/bin/h3-test-client" 18449 "$CERTS/ca.crt" 1 idle > "$WORK/ban_h3.log" 2>&1 & H3C=$!
+for _ in $(seq 1 50); do grep -q h3-idle "$WORK/ban_h3.log" && break; perl -e 'select(undef,undef,undef,0.05)'; done
+ctl ban 127.0.0.1 60 > /dev/null
+# The server's CONNECTION_CLOSE ends the client cleanly; else its 15 s watchdog fails it.
+for _ in $(seq 1 40); do kill -0 $H3C 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.05)'; done
+SUITE=bans check open-h3-closed "$(grep -o 'h3-ok 1' "$WORK/ban_h3.log")" "h3-ok 1"
+kill $H3C 2>/dev/null; wait $H3C 2>/dev/null
 SUITE=bans check refused-at-accept "$(as 10.1.2.4) $(h3)" "000 000"
 SUITE=bans check unbanned "$(ctl unban 127.0.0.1) $(as 10.1.2.4) $(h3)" "ok 200 200"
 SUITE=bans check limit-req-per-network "$(as 10.5.5.1 /net) $(as 10.5.5.2 /net) $(as 10.5.5.3 /net) $(as 10.5.6.1 /net)" "200 200 429 200"
 bans_metric() { $CURL_BIN -s http://127.0.0.1:18448/metrics | python3 "$HERE/check_metrics.py" "$1"; }
-SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 3 ] && echo closed)" "1 refused closed"
-SUITE=bans check socket-mode "$(stat -f '%Lp' "$WORK/ctl.sock" 2>/dev/null || stat -c '%a' "$WORK/ctl.sock")" 600
+SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 2 ] && echo closed)" "1 refused closed"
+SUITE=bans check socket-mode "$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$WORK/ctl.sock")" 600
 kill $BANS; wait $BANS 2>/dev/null
 SUITE=bans check socket-removed "$([ -e "$WORK/ctl.sock" ] && echo left || echo removed)" removed
+# bans_file: what was banned at the stop is banned again after the start.
+start_bans
+SUITE=bans check kept-across-restart "$(ctl bans | grep -c -E '^10\.9\.0\.0/16 (59[0-9]|600)$') $(as 10.9.1.1)" "1 000"
+kill $BANS; wait $BANS 2>/dev/null
+
+# Upstream admission: one place at a time on the slow upstream (3 s a
+# request), one waiting. A normal request bumps a low one from a full line,
+# and is itself turned away when the line holds only normal ones.
+cat > "$WORK/adm.zon" <<EOF2
+.{ .access_log = false, .workers = 1,
+   .upstreams = .{
+       .{ .name = "slow", .servers = .{"127.0.0.1:19004"}, .max_active = 1, .max_queued = 1, .queue_timeout_ms = 10000 },
+       .{ .name = "brief", .servers = .{"127.0.0.1:19004"}, .max_active = 1, .queue_timeout_ms = 300 },
+   },
+   .servers = .{.{ .listen = .{.{ .address = "127.0.0.1", .port = 18453 }}, .locations = .{
+       .{ .prefix = "/n", .proxy_pass = "slow" },
+       .{ .prefix = "/low", .proxy_pass = "slow", .priority = .low },
+       .{ .prefix = "/t", .proxy_pass = "brief" },
+       .{ .prefix = "/metrics", .metrics = true },
+   } }},
+}
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/adm.zon" 2> "$WORK/adm.log" & ADM=$!; PIDS+=($ADM)
+wait_port 18453
+adm() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+nap() { perl -e 'select(undef,undef,undef,0.2)'; }
+adm http://127.0.0.1:18453/n > "$WORK/adm1" & A1=$!; nap
+adm http://127.0.0.1:18453/low > "$WORK/adm2" & A2=$!; nap
+adm http://127.0.0.1:18453/n > "$WORK/adm3" & A3=$!; nap
+adm -D "$WORK/adm4.h" http://127.0.0.1:18453/n > "$WORK/adm4" & A4=$!
+wait $A1 $A2 $A3 $A4
+SUITE=admission check queue-and-priority "$(cat "$WORK/adm1") $(cat "$WORK/adm2") $(cat "$WORK/adm3") $(cat "$WORK/adm4")" "200 503 200 503"
+SUITE=admission check retry-after "$(grep -i '^retry-after:' "$WORK/adm4.h" | tr -d '\r')" "retry-after: 1"
+adm http://127.0.0.1:18453/t > "$WORK/adm5" & A5=$!; nap
+t0=$(now_ms); late=$(adm http://127.0.0.1:18453/t); waited=$(($(now_ms) - t0))
+wait $A5
+SUITE=admission check queue-timeout "$(cat "$WORK/adm5") $late $([ $waited -ge 250 ] && [ $waited -lt 2500 ] && echo in-time || echo "after ${waited}ms")" "200 503 in-time"
+adm_metric() { $CURL_BIN -s http://127.0.0.1:18453/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+SUITE=admission check metrics "$(adm_metric routez_upstream_requests_shed_total) $(adm_metric routez_upstream_requests_queued)" "3 0"
+kill $ADM; wait $ADM 2>/dev/null
 
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
 # its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").

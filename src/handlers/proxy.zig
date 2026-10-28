@@ -18,6 +18,7 @@ const vars = @import("../http/vars.zig");
 const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const upstream = @import("../upstream.zig");
+const stats = @import("../stats.zig");
 const exchange = @import("../exchange.zig");
 const Exchange = exchange.Exchange;
 const Header = common.Header;
@@ -44,7 +45,7 @@ pub fn start(ex: *Exchange, loc: *const config.Location, target: []const u8) voi
     if (p.framing != .pending) {
         p.writeHead() catch return p.fail(500);
     }
-    p.connectNext(false);
+    if (group.admit(p)) p.connectNext(false);
 }
 
 pub const Proxy = struct {
@@ -76,8 +77,13 @@ pub const Proxy = struct {
     deadline: timers.Deadline = .{ .callback = onDeadline },
     /// Upstream reads paused because the client is behind.
     read_paused: bool = false,
+    /// Counted in the group's `max_active` (`Group.admit`).
+    holds_place: bool = false,
+    /// The group's line, while `queued`.
+    wait_prev: ?*Proxy = null,
+    wait_next: ?*Proxy = null,
 
-    const Phase = enum { connecting, waiting_head, body, tunnel, done };
+    const Phase = enum { queued, connecting, waiting_head, body, tunnel, done };
     const Framing = enum { none, length, chunked, pending };
 
     fn alloc(self: *Proxy) std.mem.Allocator {
@@ -274,6 +280,32 @@ pub const Proxy = struct {
         }
     }
 
+    // ---- admission (`Group.admit`) ----
+
+    /// No place yet: hold the request body back and wait for one.
+    pub fn wait(self: *Proxy) void {
+        self.phase = .queued;
+        self.ex.pauseRequestBody(true);
+        self.t().set(&self.deadline, self.group.cfg.queue_timeout_ms);
+    }
+
+    /// A place came free.
+    pub fn proceed(self: *Proxy) void {
+        self.t().clear(&self.deadline);
+        self.phase = .connecting;
+        self.ex.pauseRequestBody(false);
+        self.connectNext(false);
+    }
+
+    /// Turned away for want of a place: 503, to try again shortly.
+    pub fn shed(self: *Proxy) void {
+        if (self.phase == .queued) self.group.unqueue(self);
+        self.phase = .done;
+        stats.inc(&stats.upstream_shed);
+        self.ex.sendRetryLater(503);
+        self.finish(false);
+    }
+
     // ---- connection management ----
 
     /// Attach a connection to the next peer. `same_peer` retries the current
@@ -339,7 +371,7 @@ pub const Proxy = struct {
     fn armDeadline(self: *Proxy) void {
         const c = self.conn orelse return;
         const waiting_on_us = switch (self.phase) {
-            .connecting, .tunnel, .done => return,
+            .queued, .connecting, .tunnel, .done => return,
             .waiting_head => self.read_paused or (!self.request_done and c.sock.buffered() == 0),
             .body => self.read_paused,
         };
@@ -373,7 +405,7 @@ pub const Proxy = struct {
         if (down) |d| d.setCork(true);
         defer if (down) |d| d.setCork(false);
         switch (self.phase) {
-            .connecting, .done => return,
+            .queued, .connecting, .done => return,
             .tunnel => {
                 self.ex.respondBody(data);
                 return self.checkResponseBackpressure();
@@ -494,6 +526,11 @@ pub const Proxy = struct {
             n += 1;
         }
         self.phase = .tunnel;
+        // A tunnel can stay open for hours; max_active counts requests.
+        if (self.holds_place) {
+            self.holds_place = false;
+            self.group.release();
+        }
         self.t().clear(&self.deadline);
         ex.respondHead(&.{ .status = 101, .headers = out[0..n] });
         ex.startTunnel();
@@ -510,7 +547,7 @@ pub const Proxy = struct {
     /// that ends a body read until the close.
     pub fn onUpstreamEof(self: *Proxy, clean: bool) void {
         switch (self.phase) {
-            .done => {},
+            .queued, .done => {},
             .connecting, .waiting_head => {
                 const c = self.conn.?;
                 if (c.reused and self.in.items.len == 0) {
@@ -535,6 +572,7 @@ pub const Proxy = struct {
     fn onDeadline(d: *timers.Deadline) void {
         const self: *Proxy = @fieldParentPtr("deadline", d);
         switch (self.phase) {
+            .queued => self.shed(),
             .connecting => {
                 log.warn("connect to {s} timed out", .{self.peer.?.label});
                 self.peer.?.recordFailure();
@@ -579,6 +617,7 @@ pub const Proxy = struct {
     }
 
     pub fn onDownstreamGone(self: *Proxy) void {
+        if (self.phase == .queued) self.group.unqueue(self);
         self.phase = .done;
         self.finish(false);
     }
@@ -587,6 +626,7 @@ pub const Proxy = struct {
     fn finish(self: *Proxy, reusable: bool) void {
         self.t().clear(&self.deadline);
         self.detachConn(reusable);
+        if (self.holds_place) self.group.release();
         const a = self.alloc();
         self.replay.deinit(a);
         self.unsent.deinit(a);

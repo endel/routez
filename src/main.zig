@@ -110,8 +110,9 @@ const Generation = struct {
         if (prev != null) if (ids) |u| if (!privileges.dropped or u.uid != std.c.getuid()) {
             log.warn("user {s}: a change of user takes effect at the next restart", .{g.cfg.user.?});
         };
-        if (prev != null and !std.mem.eql(u8, g.cfg.control_socket orelse "", control.bound))
-            log.warn("control_socket: a change takes effect at the next restart", .{});
+        if (prev != null and (!std.mem.eql(u8, g.cfg.control_socket orelse "", control.bound) or
+            !std.mem.eql(u8, g.cfg.bans_file orelse "", control.bans_path)))
+            log.warn("control_socket, bans_file: a change takes effect at the next restart", .{});
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
@@ -148,6 +149,10 @@ const Generation = struct {
         if (prev == null) if (g.cfg.control_socket) |p| {
             control_fd = control.listen(io, p) catch |err| {
                 log.err("control_socket {s}: {s}", .{ p, @errorName(err) });
+                return err;
+            };
+            if (g.cfg.bans_file) |f| control.keepBans(io, f, g.shared.clients.?) catch |err| {
+                log.err("bans_file {s}: {s}", .{ f, @errorName(err) });
                 return err;
             };
         };

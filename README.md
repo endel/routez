@@ -52,9 +52,14 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   named zone shared by locations).
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
+- Upstream admission: a cap on requests an upstream works on at once, with
+  a bounded, timed line behind it where low-priority locations wait last
+  and are turned away first, so an overload is shed at the edge, not by the
+  app.
 - Bans at run time: `routez ctl ban 192.0.2.0/24 600` refuses an address
-  or network at accept and before any QUIC handshake, and closes requests
-  on connections already open; shared by every worker, kept across reloads.
+  or network at accept and before any QUIC handshake, and closes what it
+  already has open; shared by every worker, kept across reloads, and
+  optionally across restarts (`bans_file`).
 - Access control: IP allow/deny rules, Basic auth against htpasswd files
   (bcrypt checked off the event loop), and client certificates (mutual TLS)
   over TLS and HTTP/3, with the client's identity in variables.
@@ -390,10 +395,45 @@ variant the client doesn't take.
   `RLIMIT_NOFILE`, which every worker's clients and their upstream
   connections share, with a warning saying so.
 
+### Upstream admission
+
+```zig
+.upstreams = .{.{
+    .name = "app", .servers = .{ "10.0.0.1:8080", "10.0.0.2:8080" },
+    .max_active = 200,          // requests at once, across all workers
+    .max_queued = 400,          // waiting for a place (default: max_active)
+    .queue_timeout_ms = 1000,   // longest wait before a 503
+}},
+.servers = .{.{ .listen = ..., .locations = .{
+    .{ .prefix = "/", .proxy_pass = "app" },
+    .{ .prefix = "/search", .proxy_pass = "app", .priority = .low },
+} }},
+```
+
+- An app that is handed more than it can work on slows down for everyone.
+  `max_active` caps the proxied requests an upstream has at once; the rest
+  wait, oldest first, `normal` ones ahead of `low`. When the line is full, a
+  `normal` request takes the place of the `low` one waiting longest, else
+  it is turned away; so is one still waiting after `queue_timeout_ms`. Both
+  get 503 with `Retry-After: 1`. A waiting request's body is held back.
+- Each worker takes an even share of `max_active` and `max_queued`, rounded
+  up, and keeps its own line, so the count costs no locks: with 4 workers,
+  `max_active = 10` is 3 a worker. Unset (0), nothing is counted.
+- A place is held from the first connect attempt, retries included, until
+  the response ends; a WebSocket gives its place back once upgraded. A
+  reload counts afresh: while the old workers drain, their requests count
+  only against the old configuration's share.
+- Counted by `routez_upstream_requests_queued` and
+  `routez_upstream_requests_shed_total`.
+
 ### Bans
 
 ```zig
-.{ .control_socket = "/run/routez.sock", .servers = ... }
+.{
+    .control_socket = "/run/routez.sock",
+    .bans_file = "/var/lib/routez/bans",   // optional: keep them across restarts
+    .servers = ...,
+}
 ```
 
 ```sh
@@ -405,17 +445,27 @@ routez ctl unban 192.0.2.7
 
 - A banned client's TCP connections are closed at accept, its QUIC Initials
   are dropped before any reply or decryption, and its new `udp_proxies`
-  flows are refused. A request on a connection opened before the ban, or
-  from a client a `real_ip_from` proxy names, is closed unanswered and
-  logged as 444. On a `proxy_protocol` listener the client its header names
-  is checked.
+  flows are refused. A request from a client a `real_ip_from` proxy names
+  is closed unanswered and logged as 444. On a `proxy_protocol` listener
+  the client its header names is checked.
+- What the client already holds goes within a worker tick (100 ms) of the
+  ban: keep-alive connections and requests in flight, WebSocket and
+  `tcp_proxies` tunnels, QUIC connections (with CONNECTION_CLOSE) and UDP
+  flows.
 - `unban` lifts exactly what `ban` set: an address inside a banned network
   stays banned.
 - Bans live in the client table (`limits.max_tracked_clients`), so every
-  worker sees one at once and it survives a reload, not a restart. A full
-  table refuses a new ban with an error instead of evicting anything. While
-  no ban is held a check costs one atomic load; with bans, one lookup per
-  prefix length in use.
+  worker sees one at once and it survives a reload. A flood can fill the
+  table with `limit_req` buckets just when bans are needed, so a ban that
+  finds no room drops a bucket (that client's count starts afresh); only
+  room full of connection counts and other bans refuses it. While no ban
+  is held a check costs one atomic load; with bans, one lookup per prefix
+  length in use.
+- `bans_file` keeps them across restarts: loaded at start, skipping those
+  that ended, and replaced whole after each control-socket session that
+  changed one, a `<network> <end, Unix seconds>` line each. Its directory
+  must be writable by `user`; a file that can't be written is logged at
+  start. Without it, bans last until the process exits.
 - The socket is created mode 0600 before `user` takes over: started as
   root, only root can use it. `routez ctl -s path` reaches another socket.
   Programs can speak its protocol directly: one command a line, any number
