@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Checking your browser</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f8fa;
+    --fg: #1d2129;
+    --muted: #5d6573;
+    --accent: #27a844;
+    --danger: #c9302c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16181d; --fg: #eceef2; --muted: #a3aab6; --danger: #f0716c; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid;
+    place-items: center;
+    padding: 24px 16px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { width: 100%; max-width: 420px; text-align: center; }
+  .logo svg { width: 180px; height: auto; margin-bottom: 28px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 8px; }
+  #status { color: var(--muted); min-height: 1.5em; margin: 0; }
+  .failed #status { color: var(--danger); }
+  .bar { height: 3px; margin: 20px auto 0; width: 160px; border-radius: 3px; background: var(--accent); opacity: .25; animation: pulse 1.2s ease-in-out infinite; }
+  .failed .bar { display: none; }
+  @keyframes pulse { 50% { opacity: .9; } }
+  @media (prefers-reduced-motion: reduce) { .bar { animation: none; } }
+  button.retry { display: none; margin-top: 20px; padding: 8px 18px; font: inherit; color: #fff; background: var(--accent); border: 0; border-radius: 6px; cursor: pointer; }
+  .failed button.retry { display: inline-block; }
+</style>
+<noscript><style>#status, .bar { display: none; }</style></noscript>
+</head>
+<body>
+<main>
+  <div class="logo" aria-hidden="true"><!--logo--></div>
+  <h1>Checking your browser</h1>
+  <p id="status">This takes a second.</p>
+  <div class="bar"></div>
+  <button type="button" class="retry">Try again</button>
+  <noscript><p>This check needs JavaScript.</p></noscript>
+</main>
+<script src="/.routez/check/check.js" defer></script>
+</body>
+</html>

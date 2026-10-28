@@ -83,6 +83,8 @@ pub const Config = struct {
     /// must be writable by `user`. Needs control_socket; a change takes a
     /// restart.
     bans_file: ?[]const u8 = null,
+    /// The browser check that locations ask for with `browser_check`.
+    browser_check: BrowserCheck = .{},
     /// Write a qlog trace per QUIC connection into this directory: the packets
     /// sent and received with their frames and timestamps, in the format the
     /// other QUIC implementations share. For working out where a connection
@@ -91,6 +93,20 @@ pub const Config = struct {
 };
 
 pub const LogEscape = enum { default, json };
+
+pub const BrowserCheck = struct {
+    /// 32 bytes or more, the same on every routez that should take each
+    /// other's passes. Null: a random one at each start, so passes last
+    /// until the next restart.
+    secret_file: ?[]const u8 = null,
+    /// Leading zero bits of SHA-256 to find: 2^difficulty hashes on
+    /// average; each one more doubles the work.
+    difficulty: u8 = 16,
+    /// How long a pass lasts.
+    pass_ttl_s: u32 = 7 * 24 * 3600,
+    /// The pass cookie's name.
+    cookie: []const u8 = "routez_pass",
+};
 
 /// nginx's `open_file_cache`, with its `open_file_cache_errors` always on:
 /// paths that don't exist are remembered too.
@@ -352,6 +368,11 @@ pub const Location = struct {
     /// When its upstream is at `max_active`: `low` requests wait behind
     /// `normal` ones and are the first turned away.
     priority: Priority = .normal,
+    /// Ask visitors without a pass for the browser check: `.always`, or
+    /// `.under_load`, only while the `proxy_pass` upstream is at
+    /// `max_active` (then pass holders wait for a place and the rest get
+    /// the check instead).
+    browser_check: ?BrowserCheckMode = null,
     /// IP allow/deny rules, nginx-style: the first rule matching the client
     /// decides, and a client no rule matches is allowed; denied ones get 403.
     /// Replaces the server's `access` when not empty. The client is the TCP
@@ -382,6 +403,8 @@ pub const Location = struct {
     }
 
     pub const Priority = enum { normal, low };
+
+    pub const BrowserCheckMode = enum { always, under_load };
 
     pub const LimitReq = struct {
         /// Sustained requests per second.
@@ -588,6 +611,10 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
     const max_socket_path = @sizeOf(@FieldType(std.posix.sockaddr.un, "path")) - 1;
     if (cfg.control_socket) |p| if (p.len == 0 or p.len > max_socket_path)
         return fail("control_socket must be a path of 1 to {d} bytes", .{max_socket_path});
+    if (cfg.browser_check.difficulty == 0 or cfg.browser_check.difficulty > 32) return fail("browser_check.difficulty must be 1 to 32", .{});
+    if (cfg.browser_check.pass_ttl_s < 60) return fail("browser_check.pass_ttl_s must be at least 60", .{});
+    if (!@import("http/common.zig").isToken(cfg.browser_check.cookie) or cfg.browser_check.cookie.len > 64)
+        return fail("browser_check.cookie must be a cookie name of 1 to 64 token characters", .{});
     if (cfg.bans_file) |p| {
         if (p.len == 0) return fail("bans_file is empty", .{});
         if (cfg.control_socket == null) return fail("bans_file needs control_socket", .{});
@@ -661,6 +688,11 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
                 if (r.location) |l| try checkHeader(.{ .name = "location", .value = l });
             }
             if (loc.limit_req) |l| try checkLimitReq(cfg, loc.pattern(), l);
+            if (loc.browser_check == .under_load) {
+                const up = if (loc.proxy_pass) |p| findUpstream(cfg, splitProxyPass(p).target) else null;
+                if (up == null or up.?.max_active == 0)
+                    return fail("location '{s}': browser_check = .under_load needs proxy_pass to an upstream with max_active", .{loc.pattern()});
+            }
             try checkAccess(loc.access, loc.pattern());
             if (loc.auth_basic) |ab| try checkAuthBasic(loc.pattern(), ab);
             if (loc.require_client_cert and (srv.tls == null or srv.tls.?.client_ca == null))

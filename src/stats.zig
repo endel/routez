@@ -23,6 +23,11 @@ pub var requests_limited: std.atomic.Value(u64) = .init(0);
 /// TCP connections closed at accept, QUIC Initials and layer-4 UDP flows
 /// dropped, for a client under a `routez ctl` ban.
 pub var refused_banned: std.atomic.Value(u64) = .init(0);
+/// Browser check pages served, passes issued, and pass cookies that didn't
+/// hold (forged, ended, or from another network).
+pub var check_pages: std.atomic.Value(u64) = .init(0);
+pub var check_passes: std.atomic.Value(u64) = .init(0);
+pub var check_invalid: std.atomic.Value(u64) = .init(0);
 /// Bans `limit_req.ban` made.
 pub var bans_automatic: std.atomic.Value(u64) = .init(0);
 /// Proxied requests waiting for a place under an upstream's `max_active`.
@@ -204,6 +209,12 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_upstream_requests_shed_total {d}\n", .{load(&upstream_shed)});
     try header(w, "routez_bans", "gauge", "Addresses and networks banned, through the control socket or by limit_req.");
     try w.print("routez_bans {d}\n", .{if (clients) |t| t.bans.load(.monotonic) else 0});
+    try header(w, "routez_browser_check_pages_total", "counter", "Browser check pages served in place of what was asked for.");
+    try w.print("routez_browser_check_pages_total {d}\n", .{load(&check_pages)});
+    try header(w, "routez_browser_check_passes_total", "counter", "Browser check passes issued.");
+    try w.print("routez_browser_check_passes_total {d}\n", .{load(&check_passes)});
+    try header(w, "routez_browser_check_invalid_passes_total", "counter", "Pass cookies that didn't hold: forged, ended, or from another network.");
+    try w.print("routez_browser_check_invalid_passes_total {d}\n", .{load(&check_invalid)});
     try header(w, "routez_bans_automatic_total", "counter", "Bans limit_req.ban made.");
     try w.print("routez_bans_automatic_total {d}\n", .{load(&bans_automatic)});
     try header(w, "routez_limit_table_entries", "gauge", "Client entries held for max_connections_per_ip and limit_req.");

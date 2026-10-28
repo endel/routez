@@ -605,6 +605,50 @@ adm_metric() { $CURL_BIN -s http://127.0.0.1:18453/metrics | python3 "$HERE/chec
 SUITE=admission check metrics "$(adm_metric routez_upstream_requests_shed_total) $(adm_metric routez_upstream_requests_queued)" "3 0"
 kill $ADM; wait $ADM 2>/dev/null
 
+# The browser check: `.always` on /, `.under_load` on /busy, whose slow
+# upstream (3 s a request) has one place and one seat in line.
+head -c 48 /dev/urandom | base64 > "$WORK/check.secret"
+cat > "$WORK/check.zon" <<EOF2
+.{ .access_log = false, .workers = 1,
+   .browser_check = .{ .difficulty = 8, .secret_file = "$WORK/check.secret" },
+   .upstreams = .{.{ .name = "slow", .servers = .{"127.0.0.1:19004"}, .max_active = 1, .max_queued = 1, .queue_timeout_ms = 10000 }},
+   .servers = .{.{
+       .listen = .{ .{ .address = "127.0.0.1", .port = 18454, .tls = true }, .{ .address = "127.0.0.1", .port = 18455 } },
+       .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+       .locations = .{
+           .{ .prefix = "/", .@"return" = .{ .body = "app" }, .browser_check = .always },
+           .{ .prefix = "/open", .@"return" = .{ .body = "open" } },
+           .{ .prefix = "/busy", .proxy_pass = "slow", .browser_check = .under_load },
+           .{ .prefix = "/metrics", .metrics = true },
+       },
+   }},
+}
+EOF2
+"$ROOT/zig-out/bin/routez" "$WORK/check.zon" 2> "$WORK/check.log" & CHK=$!; PIDS+=($CHK)
+wait_port 18454
+CB=https://127.0.0.1:18454
+# Status of a GET (curl flags allowed); the body goes to $OUT, default chk.body.
+chk() { $CURL_BIN -s --max-time 10 --cacert "$CERTS/ca.crt" -o "${OUT:-$WORK/chk.body}" -w '%{http_code}' "$@"; }
+what() { if grep -q '/.routez/check/check.js' "${1:-$WORK/chk.body}"; then echo page; else cat "${1:-$WORK/chk.body}"; fi; }
+SUITE=check check no-pass "$(chk $CB/) $(what) $(chk $CB/open) $(what)" "200 page 200 open"
+SUITE=check check assets "$(chk $CB/.routez/check/check.js) $(chk $CB/.routez/check/worker.js) $(chk -X POST $CB/.routez/check/challenge)" "200 200 405"
+solved=$("$PY_TLS" "$HERE/check_solve.py" $CB "$CERTS/ca.crt")
+ticket=$(echo "$solved" | sed -E 's/^204 routez_pass=([^;]*);.*/\1/')
+SUITE=check check verify "$(echo "$solved" | grep -c -E '^204 routez_pass=[A-Za-z0-9_-]{32}; Max-Age=604800; Path=/; HttpOnly; SameSite=Lax; Secure$')" 1
+SUITE=check check verify-bad "$("$PY_TLS" "$HERE/check_solve.py" $CB "$CERTS/ca.crt" bad)" "403 -"
+SUITE=check check plain-http-not-secure "$("$PY_TLS" "$HERE/check_solve.py" http://127.0.0.1:18455 "$CERTS/ca.crt" | grep -c -E '^204 .*HttpOnly; SameSite=Lax$')" 1
+forged="${ticket%?}$([ "${ticket: -1}" = A ] && echo B || echo A)"
+SUITE=check check with-pass "$(chk -b "routez_pass=$ticket" $CB/) $(what) $(chk -b "routez_pass=$forged" $CB/) $(what)" "200 app 200 page"
+# Under load: without a pass, the check once the place is taken; with one, a wait for it.
+OUT="$WORK/chk1.body" chk $CB/busy > "$WORK/chk1" & B1=$!; nap
+nopass=$(chk $CB/busy); nopass_what=$(what)
+OUT="$WORK/chk3.body" chk -b "routez_pass=$ticket" $CB/busy > "$WORK/chk3" & B3=$!
+wait $B1 $B3
+SUITE=check check under-load "$(cat "$WORK/chk1") $(what "$WORK/chk1.body") $nopass $nopass_what $(cat "$WORK/chk3") $(what "$WORK/chk3.body")" "200 late 503 page 200 late"
+chk_metric() { $CURL_BIN -s --cacert "$CERTS/ca.crt" $CB/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+SUITE=check check metrics "$([ "$(chk_metric routez_browser_check_pages_total)" -ge 3 ] && echo pages) $(chk_metric routez_browser_check_passes_total) $([ "$(chk_metric routez_browser_check_invalid_passes_total)" -ge 1 ] && echo invalid)" "pages 2 invalid"
+kill $CHK; wait $CHK 2>/dev/null
+
 # An RSA certificate next to an EC one on the same listener, chosen by SNI;
 # its key in PKCS#1 ("BEGIN RSA PRIVATE KEY").
 $OPENSSL req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/rsa8.key" -out "$WORK/rsa.crt" -days 2 \

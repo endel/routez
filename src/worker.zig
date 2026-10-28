@@ -25,6 +25,7 @@ const logs = @import("logs.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
 const access = @import("access.zig");
+const browser_check = @import("browser_check.zig");
 const guard = @import("guard.zig");
 const auth_pool = @import("auth/pool.zig");
 const file_io = @import("file_io.zig");
@@ -289,6 +290,8 @@ pub const Worker = struct {
         guards: *const guard.Guards,
         /// Compiled regexes of locations and rewrites.
         routes: *const router.Routes,
+        /// Set when some location has `browser_check`.
+        check: ?*const browser_check.Check = null,
         /// bcrypt verifier threads, shared with every other generation;
         /// null until a config uses `auth_basic`.
         auth_pool: ?*auth_pool.Pool = null,
@@ -787,6 +790,12 @@ pub const Worker = struct {
         stats.inc(&stats.bans_automatic);
         var buf: [64]u8 = undefined;
         log.info("banned {s} for {d} s: refused by limit_req at {s} more than {d} times in {d} s", .{ socket.formatNet(net, bits, &buf), b.for_s, loc.pattern(), b.after, b.within_s });
+    }
+
+    /// The browser check's endpoints for one request: a puzzle or a verify.
+    pub fn allowCheck(self: *Worker, client: [16]u8) bool {
+        const t = self.shared.clients orelse return true;
+        return t.allowRequest(self.io, client, client_limits.check_zone, 1, 30, quic.sys.nanoTimestamp());
     }
 
     pub fn anyBans(self: *const Worker) bool {
