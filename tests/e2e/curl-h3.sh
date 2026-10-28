@@ -3,9 +3,14 @@
 # they have it, else (Linux) a pinned static build from stunnel/static-curl,
 # downloaded once into ~/.cache and checked against its SHA-256.
 # Prints the plain curl, and fails, when none can be had.
+#
+# HTTP/3 over ngtcp2 or quiche only. curl's OpenSSL-QUIC backend (Debian
+# 13's curl) fails a download whose connection closes before curl has read
+# what it already received and acked, as a server's drain may; curl has
+# since dropped that backend.
 set -u
 for c in /opt/homebrew/opt/curl/bin/curl /usr/local/opt/curl/bin/curl "$(command -v curl)"; do
-    [ -x "$c" ] && "$c" --version 2>/dev/null | grep -q HTTP3 && { echo "$c"; exit 0; }
+    [ -x "$c" ] && "$c" --version 2>/dev/null | grep -q HTTP3 && "$c" --version | grep -qE 'ngtcp2|quiche' && { echo "$c"; exit 0; }
 done
 PLAIN=$(command -v curl)
 
