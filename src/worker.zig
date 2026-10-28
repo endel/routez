@@ -68,6 +68,11 @@ pub const QuicListener = union(enum) {
             inline else => |l| l.server.drain(.{}),
         }
     }
+    fn closeBanned(self: QuicListener) void {
+        switch (self) {
+            inline else => |l| l.closeBanned(),
+        }
+    }
     fn isDrained(self: QuicListener) bool {
         return switch (self) {
             inline else => |l| l.server.isDrained(),
@@ -159,6 +164,15 @@ pub const Client = struct {
         }
     }
 
+    /// The client: the PROXY protocol's, else the TCP peer.
+    fn ip(self: *Client) ?[16]u8 {
+        return switch (self.kind) {
+            .http => H1Conn.fromClient(self).client_ip,
+            // Not kept: only a new ban asks, and it can afford a getpeername.
+            .tunnel => socket.peerIpKey(Tunnel.fromClient(self).client.sock.fd()),
+        };
+    }
+
     /// Outlived the drain: close the sockets so a reload doesn't leak them.
     /// The memory goes with the process.
     pub fn abandon(self: *Client) void {
@@ -218,6 +232,8 @@ pub const Worker = struct {
 
     conns_head: ?*Client = null,
     conn_count: u32 = 0,
+    /// The client table's `ban_epoch` as of the last look for banned clients.
+    ban_epoch: u32 = 0,
     /// When the max_connections warning last went out, to throttle it.
     max_conn_logged_ms: i64 = std.math.minInt(i64) / 2,
     gzip: gzip.Pool,
@@ -597,7 +613,14 @@ pub const Worker = struct {
 
     fn onTick(t: *timers.Timers) void {
         const self: *Worker = @fieldParentPtr("timers", t);
-        if (self.shared.clients) |tbl| tbl.sweepStep(self.io, quic.sys.nanoTimestamp());
+        if (self.shared.clients) |tbl| {
+            tbl.sweepStep(self.io, quic.sys.nanoTimestamp());
+            const epoch = tbl.ban_epoch.load(.acquire);
+            if (epoch != self.ban_epoch) {
+                self.ban_epoch = epoch;
+                self.closeBanned();
+            }
+        }
         self.files.sweep(self.timers.now_ms);
         self.gzip.trim(self.timers.now_ms);
         self.publishQuicStats();
@@ -616,6 +639,19 @@ pub const Worker = struct {
             }
         }
         if (self.stopping and self.conn_count == 0 and self.quicDrained()) self.finishStop();
+    }
+
+    /// Close what clients banned since the last look still hold: keep-alive
+    /// connections, requests in flight, tunnels, QUIC connections and UDP
+    /// flows. Their new ones are refused already.
+    fn closeBanned(self: *Worker) void {
+        var c = self.conns_head;
+        while (c) |conn| {
+            c = conn.next;
+            if (self.isBanned(conn.ip() orelse continue)) conn.closeIfIdle(true);
+        }
+        for (self.quic_listeners.items) |q| q.closeBanned();
+        for (self.udp_proxies.items) |u| u.closeBanned();
     }
 
     fn onDrainTimeout(d: *timers.Deadline) void {

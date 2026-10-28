@@ -504,10 +504,15 @@ SUITE=quic-idle check server-drops-idle "$open_conns $([ $waited -ge 700 ] && [ 
 kill $IDLE; wait $IDLE 2>/dev/null
 
 # Bans through the control socket, at accept, QUIC Initial and request start,
-# for addresses and networks; limit_req counting a /24 as one client. Clients
-# behind the trusted 127.0.0.1 are named by X-Forwarded-For.
+# for addresses and networks, closing what a client already has open;
+# limit_req counting a /24 as one client. Clients behind the trusted
+# 127.0.0.1 are named by X-Forwarded-For.
 cat > "$WORK/bans.zon" <<EOF2
-.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .bans_file = "$WORK/bans.txt", .real_ip_from = .{"127.0.0.1"}, .servers = .{.{
+.{ .access_log = false, .control_socket = "$WORK/ctl.sock", .bans_file = "$WORK/bans.txt", .real_ip_from = .{"127.0.0.1"},
+   .upstreams = .{ .{ .name = "tunnel", .servers = .{"127.0.0.1:18080"} }, .{ .name = "echo", .servers = .{"127.0.0.1:19011"} } },
+   .tcp_proxies = .{.{ .address = "127.0.0.1", .port = 18451, .proxy_pass = "tunnel" }},
+   .udp_proxies = .{.{ .address = "127.0.0.1", .port = 18452, .proxy_pass = "echo" }},
+   .servers = .{.{
     .listen = .{ .{ .address = "127.0.0.1", .port = 18448 }, .{ .address = "127.0.0.1", .port = 18449, .tls = true, .quic = true } },
     .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
     .locations = .{
@@ -533,12 +538,24 @@ SUITE=bans check list "$(ctl bans | grep -c -E '^(10\.1\.2\.3 (59|60)|10\.9\.0\.
 SUITE=bans check unban "$(ctl unban 10.1.2.3) $(as 10.1.2.3) $(ctl unban 10.1.2.3) $(ctl unban 10.1.2.3 > /dev/null; echo $?)" "ok 200 error: not banned 1"
 SUITE=bans check bad-command "$(ctl ban 10.0.0.1 > /dev/null; echo $?) $(ctl ban all 60 | cut -c1-12)" "1 error: usage"
 SUITE=bans check h3-before "$(h3)" 200
-SUITE=bans check keepalive-closed "$(python3 "$HERE/ban_keepalive.py" 18448 "$ROOT/zig-out/bin/routez" "$WORK/ctl.sock")" "200 closed"
+# Each bans 127.0.0.1 once its connection is open, then lifts the ban.
+open_then_ban() { python3 "$HERE/ban_open.py" "$2" "$ROOT/zig-out/bin/routez" "$WORK/ctl.sock" "$1"; ctl unban 127.0.0.1 > /dev/null; }
+SUITE=bans check open-request-closed "$(open_then_ban request 18448)" "200 closed"
+SUITE=bans check open-idle-closed "$(open_then_ban idle 18448)" "200 closed"
+SUITE=bans check open-tunnel-closed "$(open_then_ban tunnel 18451)" "HTTP/1.1 200 closed"
+SUITE=bans check open-udp-flow-closed "$(open_then_ban udp 18452)" "echoed dropped"
+"$ROOT/zig-out/bin/h3-test-client" 18449 "$CERTS/ca.crt" 1 idle > "$WORK/ban_h3.log" 2>&1 & H3C=$!
+for _ in $(seq 1 50); do grep -q h3-idle "$WORK/ban_h3.log" && break; perl -e 'select(undef,undef,undef,0.05)'; done
+ctl ban 127.0.0.1 60 > /dev/null
+# The server's CONNECTION_CLOSE ends the client cleanly; else its 15 s watchdog fails it.
+for _ in $(seq 1 40); do kill -0 $H3C 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.05)'; done
+SUITE=bans check open-h3-closed "$(grep -o 'h3-ok 1' "$WORK/ban_h3.log")" "h3-ok 1"
+kill $H3C 2>/dev/null; wait $H3C 2>/dev/null
 SUITE=bans check refused-at-accept "$(as 10.1.2.4) $(h3)" "000 000"
 SUITE=bans check unbanned "$(ctl unban 127.0.0.1) $(as 10.1.2.4) $(h3)" "ok 200 200"
 SUITE=bans check limit-req-per-network "$(as 10.5.5.1 /net) $(as 10.5.5.2 /net) $(as 10.5.5.3 /net) $(as 10.5.6.1 /net)" "200 200 429 200"
 bans_metric() { $CURL_BIN -s http://127.0.0.1:18448/metrics | python3 "$HERE/check_metrics.py" "$1"; }
-SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 3 ] && echo closed)" "1 refused closed"
+SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 2 ] && echo closed)" "1 refused closed"
 SUITE=bans check socket-mode "$(stat -f '%Lp' "$WORK/ctl.sock" 2>/dev/null || stat -c '%a' "$WORK/ctl.sock")" 600
 kill $BANS; wait $BANS 2>/dev/null
 SUITE=bans check socket-removed "$([ -e "$WORK/ctl.sock" ] && echo left || echo removed)" removed

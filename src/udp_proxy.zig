@@ -212,6 +212,17 @@ pub const UdpProxy = struct {
         }
     }
 
+    /// Close the flows of banned clients. Backwards: closing one swaps the
+    /// last flow into its place.
+    pub fn closeBanned(self: *UdpProxy) void {
+        var i = self.flows.count();
+        while (i > 0) {
+            i -= 1;
+            const f = self.flows.values()[i];
+            if (self.worker.isBanned(socket.ipKey(&f.client) orelse continue)) f.close();
+        }
+    }
+
     pub fn closeAll(self: *UdpProxy) void {
         var list: std.ArrayListUnmanaged(*Flow) = .empty;
         defer list.deinit(self.worker.alloc);

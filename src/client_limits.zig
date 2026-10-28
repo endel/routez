@@ -68,6 +68,9 @@ pub const Table = struct {
     /// Never cleared: a clear could race a ban being added at that length.
     ban_lengths_v4: std.atomic.Value(u64) = .init(0),
     ban_lengths_v6: [3]std.atomic.Value(u64) = @splat(.init(0)),
+    /// Bumped by every `ban`, so workers know to look for connections a new
+    /// ban covers.
+    ban_epoch: std.atomic.Value(u32) = .init(0),
 
     const Node = struct {
         ip: Ip,
@@ -247,21 +250,23 @@ pub const Table = struct {
         defer s.mutex.unlock(io);
         if (find(s, key, zone, loc.bucket)) |f| {
             s.nodes[f.index].value = until_ns;
-            return;
-        }
-        if (!self.insert(s, key, zone, loc.bucket, until_ns, now_ns)) {
-            // A flood fills the table with buckets just when bans are
-            // needed; dropping one only lets its client start afresh.
-            if (!self.evictBucket(s)) return error.TableFull;
-            const ok = self.insert(s, key, zone, loc.bucket, until_ns, now_ns);
-            std.debug.assert(ok);
-        }
-        // Masked, a key keeps the mapped prefix only at 96 bits or more.
-        if (access.isV4(key)) {
-            _ = self.ban_lengths_v4.fetchOr(@as(u64, 1) << @intCast(bits - 96), .monotonic);
         } else {
-            _ = self.ban_lengths_v6[bits / 64].fetchOr(@as(u64, 1) << @intCast(bits % 64), .monotonic);
+            if (!self.insert(s, key, zone, loc.bucket, until_ns, now_ns)) {
+                // A flood fills the table with buckets just when bans are
+                // needed; dropping one only lets its client start afresh.
+                if (!self.evictBucket(s)) return error.TableFull;
+                const ok = self.insert(s, key, zone, loc.bucket, until_ns, now_ns);
+                std.debug.assert(ok);
+            }
+            // Masked, a key keeps the mapped prefix only at 96 bits or more.
+            if (access.isV4(key)) {
+                _ = self.ban_lengths_v4.fetchOr(@as(u64, 1) << @intCast(bits - 96), .monotonic);
+            } else {
+                _ = self.ban_lengths_v6[bits / 64].fetchOr(@as(u64, 1) << @intCast(bits % 64), .monotonic);
+            }
         }
+        // Last: a worker that acquires the new epoch then finds the ban.
+        _ = self.ban_epoch.fetchAdd(1, .release);
     }
 
     /// Lift the ban on exactly `net`/`bits`; false if there was none.

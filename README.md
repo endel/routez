@@ -53,9 +53,9 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
 - Redirects and header values built from the request with nginx-style
   variables (`$host`, `$request_uri`, ...).
 - Bans at run time: `routez ctl ban 192.0.2.0/24 600` refuses an address
-  or network at accept and before any QUIC handshake, and closes requests
-  on connections already open; shared by every worker, kept across reloads,
-  and optionally across restarts (`bans_file`).
+  or network at accept and before any QUIC handshake, and closes what it
+  already has open; shared by every worker, kept across reloads, and
+  optionally across restarts (`bans_file`).
 - Access control: IP allow/deny rules, Basic auth against htpasswd files
   (bcrypt checked off the event loop), and client certificates (mutual TLS)
   over TLS and HTTP/3, with the client's identity in variables.
@@ -410,10 +410,13 @@ routez ctl unban 192.0.2.7
 
 - A banned client's TCP connections are closed at accept, its QUIC Initials
   are dropped before any reply or decryption, and its new `udp_proxies`
-  flows are refused. A request on a connection opened before the ban, or
-  from a client a `real_ip_from` proxy names, is closed unanswered and
-  logged as 444. On a `proxy_protocol` listener the client its header names
-  is checked.
+  flows are refused. A request from a client a `real_ip_from` proxy names
+  is closed unanswered and logged as 444. On a `proxy_protocol` listener
+  the client its header names is checked.
+- What the client already holds goes within a worker tick (100 ms) of the
+  ban: keep-alive connections and requests in flight, WebSocket and
+  `tcp_proxies` tunnels, QUIC connections (with CONNECTION_CLOSE) and UDP
+  flows.
 - `unban` lifts exactly what `ban` set: an address inside a banned network
   stays banned.
 - Bans live in the client table (`limits.max_tracked_clients`), so every

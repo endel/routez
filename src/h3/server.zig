@@ -137,6 +137,16 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             return self;
         }
 
+        /// CONNECTION_CLOSE to the connections of banned clients.
+        pub fn closeBanned(self: *Self) void {
+            for (self.server.conn_mgr.entries.items) |entry| {
+                const ip = socket.ipKey(entry.conn.peerAddress()) orelse continue;
+                if (!self.worker.isBanned(ip)) continue;
+                var session: event_loop.Session = .{ .entry = entry };
+                session.closeConnection();
+            }
+        }
+
         pub fn addServer(self: *Self, srv: *const config.Server) !void {
             try self.servers.append(self.worker.alloc, srv);
             self.vhosts = .{ .servers = self.servers.items };
