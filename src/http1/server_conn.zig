@@ -452,6 +452,7 @@ pub const Conn = struct {
             .peer_addr = self.peerAddr(),
             .vhosts = &self.listener.vhosts,
             .client_cert = if (self.tls) |t| t.clientCert() else .{},
+            .fingerprint = if (self.tls) |t| t.clientFingerprint() else null,
         }) catch {
             self.rejectRequest(500);
             return false;

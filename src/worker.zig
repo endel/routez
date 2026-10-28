@@ -32,6 +32,7 @@ const file_io = @import("file_io.zig");
 const ofc = @import("open_file_cache.zig");
 const regex = @import("regex.zig");
 const realip = @import("realip.zig");
+const fingerprint = @import("fingerprint.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -164,6 +165,15 @@ pub const Client = struct {
             .http => H1Conn.fromClient(self).closeIfIdle(force),
             .tunnel => Tunnel.fromClient(self).abort(),
         }
+    }
+
+    /// The client's JA4 fingerprint, over TLS; a tunnel's is the
+    /// upstream's to see.
+    fn ja4(self: *Client) ?fingerprint.Key {
+        return switch (self.kind) {
+            .http => if (H1Conn.fromClient(self).tls) |t| t.clientFingerprint() else null,
+            .tunnel => null,
+        };
     }
 
     /// The client: the PROXY protocol's, else the TCP peer.
@@ -652,7 +662,8 @@ pub const Worker = struct {
         var c = self.conns_head;
         while (c) |conn| {
             c = conn.next;
-            if (self.isBanned(conn.ip() orelse continue)) conn.closeIfIdle(true);
+            const ip = conn.ip();
+            if ((ip != null and self.isBanned(ip.?)) or self.isFingerprintBanned(conn.ja4())) conn.closeIfIdle(true);
         }
         for (self.quic_listeners.items) |q| q.closeBanned();
         for (self.udp_proxies.items) |u| u.closeBanned();
@@ -808,6 +819,14 @@ pub const Worker = struct {
     pub fn isBanned(self: *Worker, ip: [16]u8) bool {
         const t = self.shared.clients orelse return false;
         return t.anyBans() and t.banned(self.io, ip, self.timers.now_ms * std.time.ns_per_ms);
+    }
+
+    /// Whether `routez ctl ban` covers the fingerprint `key`, by the loop's
+    /// clock. One atomic load while no fingerprint is banned.
+    pub fn isFingerprintBanned(self: *Worker, key: ?fingerprint.Key) bool {
+        const k = key orelse return false;
+        const t = self.shared.clients orelse return false;
+        return t.anyFingerprintBans() and t.fingerprintBanned(self.io, k, self.timers.now_ms * std.time.ns_per_ms);
     }
 
     /// Live QUIC connections on this worker.

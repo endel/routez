@@ -496,6 +496,7 @@ variant the client doesn't take.
 ```sh
 routez ctl ban 192.0.2.7 3600          # an address, for an hour
 routez ctl ban 2001:db8:1:2::/64 600   # or a network
+routez ctl ban t13d1516h2_8daaf6152771_e5627efa2ab1 600   # or a TLS fingerprint
 routez ctl bans                        # each with its seconds left
 routez ctl unban 192.0.2.7
 ```
@@ -570,6 +571,35 @@ Bans come from `routez ctl`, and from `limit_req`'s `ban` (see
   `bans`, after a line per ban).
 - Counted by `routez_connections_refused_banned_total`,
   `routez_http_requests_banned_total` and the `routez_bans` gauge.
+
+### Fingerprints
+
+Every TLS and QUIC handshake takes the client's
+[JA4](https://github.com/FoxIO-LLC/ja4) fingerprint from its ClientHello:
+what its TLS stack offers, whatever its `User-Agent` claims. A flood tool
+built on Go, Python or curl shows as such, and one tool across thousands of
+addresses shows as one fingerprint.
+
+```sh
+routez ctl ban t13d171100_ab0a1bf427ad_8e6e362c5eac 3600
+```
+
+- `$ssl_ja4` holds it, for the access log or for the app
+  (`proxy_set_headers = .{.{ .name = "x-ja4", .value = "$ssl_ja4" }}`).
+  Plain HTTP has none. It is the same string Wireshark and other JA4
+  tools print, but for clients that put GREASE among their signature
+  algorithms (recent Chrome): JA4's reference implementation leaves it out,
+  as routez does, and Wireshark 4.6 keeps it.
+- A banned fingerprint is refused at the ClientHello, before any key
+  exchange, so a banned tool's handshakes cost next to nothing; connections
+  it already holds are closed within a tick. Fingerprint bans are listed,
+  kept in `bans_file` and shared over `cluster` like network bans. Ban by
+  fingerprint only what is clearly a tool: a browser's fingerprint is
+  shared by everyone running that browser version.
+- Taking the fingerprint costs about 0.5 µs a handshake, against about
+  160 µs for the handshake's own key exchange and signature.
+- Counted by `routez_handshakes_refused_fingerprint_total` and the
+  `routez_fingerprint_bans` gauge.
 
 ### Access control
 
@@ -769,6 +799,7 @@ which proxies to believe:
 | `$ssl_client_s_dn`, `$ssl_client_i_dn` | its subject and issuer, RFC 4514 (`CN=alice,O=Example`) |
 | `$ssl_client_serial` | its serial number, hex |
 | `$ssl_client_fingerprint` | SHA-1 of the certificate, hex |
+| `$ssl_ja4` | the client's [JA4](#fingerprints) TLS fingerprint, over TLS and QUIC |
 | `$1`..`$9`, `$0` | groups of the last regex that matched (a rewrite's or the location's), and its whole match, percent-encoded |
 
 Pass certificate details upstream with `proxy_set_headers`: it replaces

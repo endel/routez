@@ -10,6 +10,7 @@ const stats = @import("stats.zig");
 const access_log = @import("access_log.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
+const fingerprint = @import("fingerprint.zig");
 const guard = @import("guard.zig");
 const router = @import("router.zig");
 const auth_pool = @import("auth/pool.zig");
@@ -120,6 +121,7 @@ const Generation = struct {
         g.shared = try loadShared(arena, io, &g.cfg);
         g.shared.challenges = &manager.challenges;
         g.shared.clients = try clientTable(&g.cfg, g.shared.guards.any_auth);
+        if (g.shared.clients) |t| fingerprint.watch(io, t);
         if (g.shared.guards.any_auth) g.shared.auth_pool = try authPool(io);
         if (servesFiles(&g.cfg)) {
             g.shared.file_pool = try filePool(io, g.cfg.file_io_threads);
@@ -539,6 +541,7 @@ test {
     _ = @import("privileges.zig");
     _ = @import("stats.zig");
     _ = @import("client_limits.zig");
+    _ = @import("fingerprint.zig");
     _ = @import("control.zig");
     _ = @import("browser_check.zig");
     _ = @import("cluster.zig");

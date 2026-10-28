@@ -16,7 +16,8 @@
 //!   $msec                 Unix time in seconds, ms resolution
 //!   $http_<name>          a request header, `_` standing for `-`
 //!
-//! `$remote_user` and the `$ssl_client_*` names are request variables too.
+//! `$remote_user`, `$ssl_ja4` and the `$ssl_client_*` names are request
+//! variables too.
 //!
 //! A variable without a value logs as `-`, or as an empty string under JSON
 //! escaping.

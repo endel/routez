@@ -40,6 +40,7 @@ const browser_check = @import("browser_check.zig");
 const check = @import("handlers/check.zig");
 const realip = @import("realip.zig");
 const socket = @import("net/socket.zig");
+const fingerprint = @import("fingerprint.zig");
 
 pub const Response = struct {
     status: u16,
@@ -150,6 +151,8 @@ pub const Request = struct {
     hop_addr: []const u8,
     /// The TCP or QUIC peer (`$realip_remote_addr`).
     peer_addr: []const u8,
+    /// The connection's JA4 fingerprint, over TLS and QUIC.
+    fingerprint: ?fingerprint.Key,
 
     pub fn get(self: *const Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -183,6 +186,7 @@ pub const RequestInit = struct {
     vhosts: *const router.VirtualHosts,
     /// The connection's client certificate; meaningful over TLS and QUIC.
     client_cert: tls.ClientCert = .{},
+    fingerprint: ?fingerprint.Key = null,
 };
 
 pub const Exchange = struct {
@@ -291,6 +295,7 @@ pub const Exchange = struct {
             .client_ip = client_ip,
             .hop_addr = hop_addr,
             .peer_addr = if (init.peer_addr) |p| try a.dupe(u8, p) else hop_addr,
+            .fingerprint = init.fingerprint,
         };
         // By transport: an HTTP/3 request may claim any :scheme.
         if (init.client_cert.secure) {
@@ -319,7 +324,7 @@ pub const Exchange = struct {
     pub fn start(self: *Exchange) void {
         // A connection opened before its client was banned, or a client a
         // `real_ip_from` proxy names: closed unanswered, logged as nginx's 444.
-        if (self.worker.isBanned(self.req.client_ip)) {
+        if (self.worker.isBanned(self.req.client_ip) or self.worker.isFingerprintBanned(self.req.fingerprint)) {
             stats.inc(&stats.requests_banned);
             self.status = 444;
             return self.respondAbort();
@@ -773,6 +778,7 @@ pub const Exchange = struct {
             .realip_remote_addr = self.req.peer_addr,
             .remote_user = self.remote_user,
             .client_cert = self.client_cert,
+            .fingerprint = self.req.fingerprint,
             .captures = &self.captures,
         };
     }

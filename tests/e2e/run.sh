@@ -569,6 +569,48 @@ SUITE=bans check kept-across-restart "$(ctl bans | grep -c -E '^10\.9\.0\.0/16 (
 SUITE=bans check auto-ban-kept "$(ctl bans | grep -c -E '^10\.7\.7\.7 ')" 1
 kill $BANS; wait $BANS 2>/dev/null
 
+# Fingerprints: $ssl_ja4 over TLS and QUIC; a banned JA4 refused at the
+# ClientHello, what it holds open closed, the ban kept in bans_file.
+cat > "$WORK/fp.zon" <<EOF2
+.{ .access_log = false, .control_socket = "$WORK/fp.sock", .bans_file = "$WORK/fp-bans.txt",
+   .servers = .{.{
+    .listen = .{ .{ .address = "127.0.0.1", .port = 18456, .tls = true, .quic = true }, .{ .address = "127.0.0.1", .port = 18457 } },
+    .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+    .locations = .{
+        .{ .prefix = "/", .@"return" = .{ .body = "ok" }, .add_headers = .{.{ .name = "x-ja4", .value = "\$ssl_ja4" }} },
+        .{ .prefix = "/metrics", .metrics = true },
+    },
+}} }
+EOF2
+start_fp() {
+    "$ROOT/zig-out/bin/routez" "$WORK/fp.zon" 2>> "$WORK/fp.log" & FPS=$!; PIDS+=($FPS)
+    wait_port 18457
+    for _ in $(seq 1 50); do [ -S "$WORK/fp.sock" ] && break; perl -e 'select(undef,undef,undef,0.05)'; done
+}
+start_fp
+fctl() { "$ROOT/zig-out/bin/routez" ctl -s "$WORK/fp.sock" "$@"; }
+ja4_of() { $CURL_BIN -s -D - -o /dev/null --max-time 2 --cacert "$CERTS/ca.crt" "$@" | grep -i '^x-ja4:' | cut -d' ' -f2 | tr -d '\r'; }
+code_of() { $CURL_BIN -s -o /dev/null -w '%{http_code}' --max-time 2 --cacert "$CERTS/ca.crt" "$@"; }
+fp_shape() { [[ "$1" =~ ^$2[di][0-9]{4}[0-9A-Za-z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$ ]] && echo "$2" || echo "bad '$1'"; }
+# Another TLS stack: no ALPN, so never curl's fingerprint.
+py_get() { "$PY_TLS" -c 'import ssl, sys, urllib.request as u
+c = ssl.create_default_context(cafile=sys.argv[1]); c.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+print(u.urlopen("https://127.0.0.1:18456/", context=c, timeout=3).status)' "$CERTS/ca.crt" 2>/dev/null || echo 000; }
+fp_metric() { $CURL_BIN -s http://127.0.0.1:18457/metrics | python3 "$HERE/check_metrics.py" "$1"; }
+TLS_FP=$(ja4_of https://127.0.0.1:18456/)
+H3_FP=$(ja4_of --http3-only https://127.0.0.1:18456/)
+SUITE=fingerprints check ja4-variable "$(fp_shape "$TLS_FP" t13) $(fp_shape "$H3_FP" q13) [$(ja4_of http://127.0.0.1:18457/)]" "t13 q13 []"
+SUITE=fingerprints check ban "$(fctl ban "$TLS_FP" 60) $(code_of https://127.0.0.1:18456/) $(fctl ban "$H3_FP" 600) $(code_of --http3-only https://127.0.0.1:18456/)" "ok 000 ok 000"
+SUITE=fingerprints check other-stack "$(py_get) $(code_of http://127.0.0.1:18457/)" "200 200"
+SUITE=fingerprints check list "$(fctl bans | grep -c -E "^($TLS_FP (59|60)|$H3_FP (599|600))$") $(fctl bans | tail -1)" "2 ok"
+SUITE=fingerprints check metrics "$([ "$(fp_metric routez_handshakes_refused_fingerprint_total)" -ge 2 ] && echo refused) $(fp_metric routez_fingerprint_bans)" "refused 2"
+SUITE=fingerprints check open-closed "$("$PY_TLS" "$HERE/ban_fingerprint.py" 18456 "$CERTS/ca.crt" "$ROOT/zig-out/bin/routez" "$WORK/fp.sock")" "200 closed"
+SUITE=fingerprints check unban "$(fctl unban "$H3_FP") $(code_of --http3-only https://127.0.0.1:18456/)" "ok 200"
+kill $FPS; wait $FPS 2>/dev/null
+start_fp
+SUITE=fingerprints check kept-across-restart "$(fctl bans | grep -c -E "^$TLS_FP ") $(code_of https://127.0.0.1:18456/)" "1 000"
+kill $FPS; wait $FPS 2>/dev/null
+
 # Upstream admission: one place at a time on the slow upstream (3 s a
 # request), one waiting. A normal request bumps a low one from a full line,
 # and is itself turned away when the line holds only normal ones.

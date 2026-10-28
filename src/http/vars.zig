@@ -7,6 +7,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const router = @import("../router.zig");
 const regex = @import("../regex.zig");
+const fingerprint = @import("../fingerprint.zig");
 
 pub const Var = enum {
     /// `http` or `https`.
@@ -40,11 +41,14 @@ pub const Var = enum {
     ssl_client_serial,
     /// SHA-1 of the client certificate (DER), lowercase hex.
     ssl_client_fingerprint,
+    /// The client's JA4 TLS fingerprint
+    /// (`t13d1516h2_8daaf6152771_e5627efa2ab1`), over TLS and QUIC.
+    ssl_ja4,
 
     /// Empty for this request means unset: logged as `-`.
     pub fn optional(v: Var) bool {
         return switch (v) {
-            .remote_user, .ssl_client_s_dn, .ssl_client_i_dn, .ssl_client_serial, .ssl_client_fingerprint => true,
+            .remote_user, .ssl_client_s_dn, .ssl_client_i_dn, .ssl_client_serial, .ssl_client_fingerprint, .ssl_ja4 => true,
             else => false,
         };
     }
@@ -70,6 +74,7 @@ pub const Request = struct {
     realip_remote_addr: []const u8 = "",
     remote_user: []const u8 = "",
     client_cert: ?*const ClientCert = null,
+    fingerprint: ?fingerprint.Key = null,
     captures: ?*const regex.Captures = null,
 };
 
@@ -178,6 +183,10 @@ pub fn append(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Var, req: Re
         .ssl_client_i_dn => if (req.client_cert) |c| try out.appendSlice(alloc, c.i_dn),
         .ssl_client_serial => if (req.client_cert) |c| try out.appendSlice(alloc, c.serial),
         .ssl_client_fingerprint => if (req.client_cert) |c| try out.appendSlice(alloc, c.fingerprint),
+        .ssl_ja4 => if (req.fingerprint) |k| {
+            var buf: [fingerprint.Ja4.text_len]u8 = undefined;
+            try out.appendSlice(alloc, fingerprint.format(k, &buf));
+        },
     }
 }
 
@@ -286,4 +295,7 @@ test "client certificate and user variables" {
     req.client_cert = &cert;
     req.remote_user = "alice";
     try testing.expectEqualStrings("SUCCESS CN=alice,O=Example CN=CA 1001 ab alice", try expand(a, "$ssl_client_verify $ssl_client_s_dn $ssl_client_i_dn $ssl_client_serial $ssl_client_fingerprint $remote_user", req));
+    try testing.expectEqualStrings("[]", try expand(a, "[$ssl_ja4]", req));
+    req.fingerprint = fingerprint.parse("t13d1516h2_8daaf6152771_e5627efa2ab1").?;
+    try testing.expectEqualStrings("t13d1516h2_8daaf6152771_e5627efa2ab1", try expand(a, "$ssl_ja4", req));
 }

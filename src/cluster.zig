@@ -4,9 +4,9 @@
 //! of what it holds; a peer whose own digest differs pulls the whole list,
 //! so a lost datagram or a restarted instance catches up.
 //!
-//! A ban is a key (network and length) with an end in Unix seconds, so
-//! copies merge without coordination: the later version (Unix ms when it
-//! was made, then the origin's id) wins. An unban is a tombstone kept until
+//! A ban is a key (network and length, or a fingerprint) with an end in
+//! Unix seconds, so copies merge without coordination: the later version
+//! (Unix ms when it was made, then the origin's id) wins. An unban is a tombstone kept until
 //! the ban it lifted would have ended, so a late copy can't bring it back.
 //!
 //! Runs on the control thread; workers only ever see the client table.
@@ -316,7 +316,7 @@ const ItemIterator = struct {
         const b = self.rest[0..entry_len];
         self.rest = self.rest[entry_len..];
         self.left -= 1;
-        if (b[16] > 128 or b[17] > 1) return null;
+        if ((b[16] > 128 and b[16] != client_limits.fingerprint_bits) or b[17] > 1) return null;
         return .{
             .key = .{ .net = b[0..16].*, .bits = b[16] },
             .entry = .{
@@ -372,6 +372,7 @@ test "a message opens only with its key, and untouched" {
     const items = [_]Item{
         .{ .key = .{ .net = @splat(1), .bits = 120 }, .entry = .{ .end_s = 2000, .version = 7, .origin = 3, .lifted = false } },
         .{ .key = .{ .net = @splat(2), .bits = 64 }, .entry = .{ .end_s = 3000, .version = 9, .origin = 4, .lifted = true } },
+        .{ .key = .{ .net = @splat(3), .bits = client_limits.fingerprint_bits }, .entry = .{ .end_s = 4000, .version = 11, .origin = 4, .lifted = false } },
     };
     var body: [1 + per_datagram * entry_len]u8 = undefined;
     const dg = seal(key, &buf, .bans, 3, encodeItems(&body, &items));
@@ -381,6 +382,7 @@ test "a message opens only with its key, and untouched" {
     var it = decodeItems(m.body);
     try testing.expectEqual(items[0], it.next().?);
     try testing.expectEqual(items[1], it.next().?);
+    try testing.expectEqual(items[2], it.next().?);
     try testing.expect(it.next() == null);
     try testing.expect(unseal("another key, also 32 bytes long!", dg) == null);
     var bent = buf;

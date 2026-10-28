@@ -23,6 +23,9 @@ pub var requests_limited: std.atomic.Value(u64) = .init(0);
 /// TCP connections closed at accept, QUIC Initials and layer-4 UDP flows
 /// dropped, for a client under a `routez ctl` ban.
 pub var refused_banned: std.atomic.Value(u64) = .init(0);
+/// TLS and QUIC handshakes refused at the ClientHello for a banned JA4
+/// fingerprint.
+pub var refused_fingerprint: std.atomic.Value(u64) = .init(0);
 /// Browser check pages served, passes issued, and pass cookies that didn't
 /// hold (forged, ended, or from another network).
 pub var check_pages: std.atomic.Value(u64) = .init(0);
@@ -205,6 +208,8 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_http_requests_limited_total {d}\n", .{load(&requests_limited)});
     try header(w, "routez_connections_refused_banned_total", "counter", "TCP connections, QUIC Initials and layer-4 UDP flows refused for a banned client.");
     try w.print("routez_connections_refused_banned_total {d}\n", .{load(&refused_banned)});
+    try header(w, "routez_handshakes_refused_fingerprint_total", "counter", "TLS and QUIC handshakes refused for a banned JA4 fingerprint.");
+    try w.print("routez_handshakes_refused_fingerprint_total {d}\n", .{load(&refused_fingerprint)});
     try header(w, "routez_http_requests_banned_total", "counter", "Requests closed unanswered for a banned client.");
     try w.print("routez_http_requests_banned_total {d}\n", .{load(&requests_banned)});
     try header(w, "routez_upstream_requests_queued", "gauge", "Proxied requests waiting for a place under an upstream's max_active.");
@@ -213,6 +218,8 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_upstream_requests_shed_total {d}\n", .{load(&upstream_shed)});
     try header(w, "routez_bans", "gauge", "Addresses and networks banned, through the control socket or by limit_req.");
     try w.print("routez_bans {d}\n", .{if (clients) |t| t.bans.load(.monotonic) else 0});
+    try header(w, "routez_fingerprint_bans", "gauge", "JA4 fingerprints banned through the control socket.");
+    try w.print("routez_fingerprint_bans {d}\n", .{if (clients) |t| t.fingerprint_bans.load(.monotonic) else 0});
     try header(w, "routez_browser_check_pages_total", "counter", "Browser check pages served in place of what was asked for.");
     try w.print("routez_browser_check_pages_total {d}\n", .{load(&check_pages)});
     try header(w, "routez_browser_check_passes_total", "counter", "Browser check passes issued.");
