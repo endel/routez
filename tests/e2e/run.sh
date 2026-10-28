@@ -556,7 +556,7 @@ SUITE=bans check unbanned "$(ctl unban 127.0.0.1) $(as 10.1.2.4) $(h3)" "ok 200 
 SUITE=bans check limit-req-per-network "$(as 10.5.5.1 /net) $(as 10.5.5.2 /net) $(as 10.5.5.3 /net) $(as 10.5.6.1 /net)" "200 200 429 200"
 bans_metric() { $CURL_BIN -s http://127.0.0.1:18448/metrics | python3 "$HERE/check_metrics.py" "$1"; }
 SUITE=bans check metrics "$(bans_metric routez_bans) $([ "$(bans_metric routez_connections_refused_banned_total)" -ge 2 ] && echo refused) $([ "$(bans_metric routez_http_requests_banned_total)" -ge 2 ] && echo closed)" "1 refused closed"
-SUITE=bans check socket-mode "$(stat -f '%Lp' "$WORK/ctl.sock" 2>/dev/null || stat -c '%a' "$WORK/ctl.sock")" 600
+SUITE=bans check socket-mode "$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$WORK/ctl.sock")" 600
 kill $BANS; wait $BANS 2>/dev/null
 SUITE=bans check socket-removed "$([ -e "$WORK/ctl.sock" ] && echo left || echo removed)" removed
 # bans_file: what was banned at the stop is banned again after the start.
