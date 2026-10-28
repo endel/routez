@@ -23,6 +23,8 @@ pub var requests_limited: std.atomic.Value(u64) = .init(0);
 /// TCP connections closed at accept, QUIC Initials and layer-4 UDP flows
 /// dropped, for a client under a `routez ctl` ban.
 pub var refused_banned: std.atomic.Value(u64) = .init(0);
+/// Bans `limit_req.ban` made.
+pub var bans_automatic: std.atomic.Value(u64) = .init(0);
 /// Proxied requests waiting for a place under an upstream's `max_active`.
 pub var upstream_queued: std.atomic.Value(u64) = .init(0);
 /// Proxied requests answered 503 for want of a place.
@@ -200,8 +202,10 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_upstream_requests_queued {d}\n", .{load(&upstream_queued)});
     try header(w, "routez_upstream_requests_shed_total", "counter", "Proxied requests answered 503 for want of a place: the line was full, or the wait ran out.");
     try w.print("routez_upstream_requests_shed_total {d}\n", .{load(&upstream_shed)});
-    try header(w, "routez_bans", "gauge", "Addresses and networks banned through the control socket.");
+    try header(w, "routez_bans", "gauge", "Addresses and networks banned, through the control socket or by limit_req.");
     try w.print("routez_bans {d}\n", .{if (clients) |t| t.bans.load(.monotonic) else 0});
+    try header(w, "routez_bans_automatic_total", "counter", "Bans limit_req.ban made.");
+    try w.print("routez_bans_automatic_total {d}\n", .{load(&bans_automatic)});
     try header(w, "routez_limit_table_entries", "gauge", "Client entries held for max_connections_per_ip and limit_req.");
     try w.print("routez_limit_table_entries {d}\n", .{if (clients) |t| t.entries() else 0});
     try header(w, "routez_limit_table_capacity", "gauge", "Client entries the limit table can hold.");

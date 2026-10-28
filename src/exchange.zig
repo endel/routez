@@ -337,6 +337,7 @@ pub const Exchange = struct {
         if (loc.limit_req) |lim| {
             if (!self.worker.allowRequest(self.server, loc, lim, self.req.client_ip)) {
                 stats.inc(&stats.requests_limited);
+                self.worker.refusedRequest(self.server, loc, lim, self.req.client_ip);
                 return self.sendRetryLater(429);
             }
         }

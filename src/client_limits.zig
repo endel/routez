@@ -179,7 +179,13 @@ pub const Table = struct {
     /// GCRA admission for one request: `rate` per second on average, and
     /// `burst` more at once. `zone` comes from `zoneId`.
     pub fn allowRequest(self: *Table, io: std.Io, ip: Ip, zone: u32, rate: u32, burst: u32, now_ns: i64) bool {
-        const interval: i64 = @max(1, @divTrunc(std.time.ns_per_s, @as(i64, rate)));
+        return self.allowEvery(io, ip, zone, @divTrunc(std.time.ns_per_s, @as(i64, rate)), burst, now_ns);
+    }
+
+    /// `allowRequest` at one event every `interval_ns`, for rates under one
+    /// a second too.
+    pub fn allowEvery(self: *Table, io: std.Io, ip: Ip, zone: u32, interval_ns: i64, burst: u32, now_ns: i64) bool {
+        const interval: i64 = @max(1, interval_ns);
         const tolerance = interval * @as(i64, burst);
         const loc = self.locate(ip, zone);
         const s = loc.shard;
@@ -431,6 +437,12 @@ pub fn zoneId(srv: *const config.Server, loc: *const config.Location) u32 {
     return @as(u32, @truncate(h.final())) | 1;
 }
 
+/// The bucket of a `limit_req` zone's refusals, for its `ban`: odd, as
+/// `zoneId`'s are.
+pub fn strikeZone(zone: u32) u32 {
+    return zone ^ (1 << 30);
+}
+
 /// The network `ip` is counted under: its IPv4 /`v4` or its IPv6 /`v6`.
 pub fn network(ip: Ip, v4: u8, v6: u8) Ip {
     var out = ip;
@@ -615,6 +627,20 @@ test "a full table makes room for a ban from a bucket, never from connections or
     try testing.expect(t.unban(io, ip4(10, 0, 0, 4), 128));
     try testing.expectEqual(Table.Admit.counted, t.acquireConn(io, ip4(10, 0, 1, 2), 5, 150));
     try testing.expectError(error.TableFull, t.ban(io, ip4(10, 0, 0, 5), 128, 200, 150));
+}
+
+test "allowEvery: under one a second, as limit_req.ban counts refusals" {
+    const t = try Table.createSharded(testing.allocator, 64, 4);
+    defer t.destroy(testing.allocator);
+    const io = testing.io;
+    const s = std.time.ns_per_s;
+    const a = ip4(10, 0, 0, 1);
+    // More than 2 in 60 s: every 30 s, 2 at once.
+    try testing.expect(t.allowEvery(io, a, strikeZone(3), 30 * s, 1, 100 * s));
+    try testing.expect(t.allowEvery(io, a, strikeZone(3), 30 * s, 1, 100 * s));
+    try testing.expect(!t.allowEvery(io, a, strikeZone(3), 30 * s, 1, 100 * s));
+    try testing.expect(t.allowEvery(io, a, strikeZone(3), 30 * s, 1, 130 * s));
+    try testing.expect(strikeZone(3) & 1 == 1 and strikeZone(3) != 3);
 }
 
 test "networks" {

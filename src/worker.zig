@@ -24,6 +24,7 @@ const gzip = @import("gzip.zig");
 const logs = @import("logs.zig");
 const privileges = @import("privileges.zig");
 const client_limits = @import("client_limits.zig");
+const access = @import("access.zig");
 const guard = @import("guard.zig");
 const auth_pool = @import("auth/pool.zig");
 const file_io = @import("file_io.zig");
@@ -770,6 +771,22 @@ pub const Worker = struct {
         const t = self.shared.clients orelse return true;
         const key = client_limits.network(client, lim.ipv4_prefix, lim.ipv6_prefix);
         return t.allowRequest(self.io, key, client_limits.zoneId(srv, loc), lim.rate, lim.burst, quic.sys.nanoTimestamp());
+    }
+
+    /// A request `limit_req` refused. With its `ban`, one strike more, and a
+    /// ban once the client has had too many.
+    pub fn refusedRequest(self: *Worker, srv: *const config.Server, loc: *const config.Location, lim: config.Location.LimitReq, client: [16]u8) void {
+        const b = lim.ban orelse return;
+        const t = self.shared.clients orelse return;
+        const now = quic.sys.nanoTimestamp();
+        const net = client_limits.network(client, lim.ipv4_prefix, lim.ipv6_prefix);
+        const every = @divTrunc(@as(i64, b.within_s) * std.time.ns_per_s, b.after);
+        if (t.allowEvery(self.io, net, client_limits.strikeZone(client_limits.zoneId(srv, loc)), every, b.after - 1, now)) return;
+        const bits = if (access.isV4(client)) 96 + lim.ipv4_prefix else lim.ipv6_prefix;
+        t.ban(self.io, net, bits, now + @as(i64, b.for_s) * std.time.ns_per_s, now) catch return;
+        stats.inc(&stats.bans_automatic);
+        var buf: [64]u8 = undefined;
+        log.info("banned {s} for {d} s: refused by limit_req at {s} more than {d} times in {d} s", .{ socket.formatNet(net, bits, &buf), b.for_s, loc.pattern(), b.after, b.within_s });
     }
 
     pub fn anyBans(self: *const Worker) bool {
