@@ -249,7 +249,13 @@ pub const Table = struct {
             s.nodes[f.index].value = until_ns;
             return;
         }
-        if (!self.insert(s, key, zone, loc.bucket, until_ns, now_ns)) return error.TableFull;
+        if (!self.insert(s, key, zone, loc.bucket, until_ns, now_ns)) {
+            // A flood fills the table with buckets just when bans are
+            // needed; dropping one only lets its client start afresh.
+            if (!self.evictBucket(s)) return error.TableFull;
+            const ok = self.insert(s, key, zone, loc.bucket, until_ns, now_ns);
+            std.debug.assert(ok);
+        }
         // Masked, a key keeps the mapped prefix only at 96 bits or more.
         if (access.isV4(key)) {
             _ = self.ban_lengths_v4.fetchOr(@as(u64, 1) << @intCast(bits - 96), .monotonic);
@@ -342,6 +348,24 @@ pub const Table = struct {
         _ = s.len.fetchAdd(1, .monotonic);
         if (banBits(zone) != null) _ = self.bans.fetchAdd(1, .monotonic);
         return true;
+    }
+
+    /// Drop one `limit_req` or `auth_basic` bucket of `s`; false when it holds
+    /// only connection counts and bans.
+    fn evictBucket(self: *Table, s: *Shard) bool {
+        for (s.heads) |*head| {
+            var link = head;
+            while (link.* != none) {
+                const i = link.* - 1;
+                const n = &s.nodes[i];
+                if (n.zone != conn_zone and banBits(n.zone) == null) {
+                    self.remove(s, .{ .index = i, .link = link });
+                    return true;
+                }
+                link = &n.next;
+            }
+        }
+        return false;
     }
 
     fn allocNode(s: *Shard) ?u32 {
@@ -568,7 +592,7 @@ test "bans: addresses and networks, expiry, unban, listing" {
     try testing.expectEqual(@as(usize, 0), t.nextBans(io, &cursor, 20 * s, &buf).len);
 }
 
-test "a full table refuses a ban" {
+test "a full table makes room for a ban from a bucket, never from connections or bans" {
     const t = try Table.createSharded(testing.allocator, 2, 1);
     defer t.destroy(testing.allocator);
     const io = testing.io;
@@ -578,6 +602,14 @@ test "a full table refuses a ban" {
     // An expired one makes room.
     try t.ban(io, ip4(10, 0, 0, 3), 128, 200, 150);
     try testing.expectEqual(@as(u32, 1), t.bans.load(.monotonic));
+
+    // A live bucket gives way; a connection count doesn't.
+    try testing.expect(t.allowRequest(io, ip4(10, 0, 1, 1), 3, 1, 0, 150));
+    try t.ban(io, ip4(10, 0, 0, 4), 128, 200, 150);
+    try testing.expectEqual(@as(u32, 2), t.bans.load(.monotonic));
+    try testing.expect(t.unban(io, ip4(10, 0, 0, 4), 128));
+    try testing.expectEqual(Table.Admit.counted, t.acquireConn(io, ip4(10, 0, 1, 2), 5, 150));
+    try testing.expectError(error.TableFull, t.ban(io, ip4(10, 0, 0, 5), 128, 200, 150));
 }
 
 test "networks" {

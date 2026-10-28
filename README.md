@@ -412,10 +412,12 @@ routez ctl unban 192.0.2.7
 - `unban` lifts exactly what `ban` set: an address inside a banned network
   stays banned.
 - Bans live in the client table (`limits.max_tracked_clients`), so every
-  worker sees one at once and it survives a reload, not a restart. A full
-  table refuses a new ban with an error instead of evicting anything. While
-  no ban is held a check costs one atomic load; with bans, one lookup per
-  prefix length in use.
+  worker sees one at once and it survives a reload, not a restart. A flood
+  can fill the table with `limit_req` buckets just when bans are needed, so
+  a ban that finds no room drops a bucket (that client's count starts
+  afresh); only room full of connection counts and other bans refuses it.
+  While no ban is held a check costs one atomic load; with bans, one lookup
+  per prefix length in use.
 - The socket is created mode 0600 before `user` takes over: started as
   root, only root can use it. `routez ctl -s path` reaches another socket.
   Programs can speak its protocol directly: one command a line, any number
