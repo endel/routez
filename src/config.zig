@@ -85,6 +85,9 @@ pub const Config = struct {
     bans_file: ?[]const u8 = null,
     /// The browser check that locations ask for with `browser_check`.
     browser_check: BrowserCheck = .{},
+    /// Share bans with other routez instances (`cluster.zig`). A change
+    /// takes a restart.
+    cluster: ?Cluster = null,
     /// Write a qlog trace per QUIC connection into this directory: the packets
     /// sent and received with their frames and timestamps, in the format the
     /// other QUIC implementations share. For working out where a connection
@@ -93,6 +96,16 @@ pub const Config = struct {
 };
 
 pub const LogEscape = enum { default, json };
+
+pub const Cluster = struct {
+    /// UDP `host:port` this instance takes its peers' messages on.
+    listen: []const u8,
+    /// The other instances' `listen`.
+    peers: []const []const u8,
+    /// 32 bytes or more, the same on every instance: it signs each message.
+    /// Read at start, before `user` takes over.
+    key_file: []const u8,
+};
 
 pub const BrowserCheck = struct {
     /// 32 bytes or more, the same on every routez that should take each
@@ -615,6 +628,12 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
     if (cfg.browser_check.pass_ttl_s < 60) return fail("browser_check.pass_ttl_s must be at least 60", .{});
     if (!@import("http/common.zig").isToken(cfg.browser_check.cookie) or cfg.browser_check.cookie.len > 64)
         return fail("browser_check.cookie must be a cookie name of 1 to 64 token characters", .{});
+    if (cfg.cluster) |c| {
+        _ = parseHostPort(c.listen) catch return fail("cluster.listen '{s}' is not host:port", .{c.listen});
+        if (c.peers.len == 0 or c.peers.len > 64) return fail("cluster.peers must name 1 to 64 instances", .{});
+        for (c.peers) |p| _ = parseHostPort(p) catch return fail("cluster.peers: '{s}' is not host:port", .{p});
+        if (c.key_file.len == 0) return fail("cluster.key_file is empty", .{});
+    }
     if (cfg.bans_file) |p| {
         if (p.len == 0) return fail("bans_file is empty", .{});
         if (cfg.control_socket == null) return fail("bans_file needs control_socket", .{});

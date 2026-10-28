@@ -15,6 +15,7 @@ const client_limits = @import("client_limits.zig");
 const access = @import("access.zig");
 const socket = @import("net/socket.zig");
 const logs = @import("logs.zig");
+const cluster = @import("cluster.zig");
 
 const sys = quic.sys;
 const posix = std.posix;
@@ -36,6 +37,11 @@ pub var bound: []const u8 = "";
 pub var bans_path: []const u8 = "";
 /// The table `spawn` serves, for the save at exit.
 var served: ?*client_limits.Table = null;
+/// Ban sync with other instances, when `cluster` is set.
+var sync: ?*cluster.Cluster = null;
+/// How often the thread wakes for `sync`: bans workers made go out, and
+/// the digest when its time comes.
+const sync_tick_ms = 1000;
 /// How often the thread looks for bans workers made (`limit_req.ban`) to save.
 const save_interval_ms = 5000;
 
@@ -147,27 +153,46 @@ fn writeBans(io: std.Io, table: *client_limits.Table) !void {
     try af.replace(io);
 }
 
-/// Serve `fd` for the life of the process.
-pub fn spawn(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) !void {
+/// Serve the control socket `fd`, and ban sync `with`, for the life of the
+/// process.
+pub fn spawn(io: std.Io, fd: ?posix.fd_t, with: ?*cluster.Cluster, table: *client_limits.Table) !void {
     served = table;
+    sync = with;
     const t = try std.Thread.spawn(.{}, run, .{ io, fd, table });
     t.detach();
 }
 
-fn run(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) void {
+fn run(io: std.Io, ctl: ?posix.fd_t, table: *client_limits.Table) void {
     // As `user` by now: a bans_file it can't write shows at start.
     var saved = table.ban_epoch.load(.acquire);
+    var saved_at = monoMs();
     saveBans(io, table);
+    if (sync) |s| s.start(io, table);
+    const timeout: c_int = if (sync != null) sync_tick_ms else if (bans_path.len > 0) save_interval_ms else -1;
     while (true) {
-        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-        if (std.c.poll(&pfd, 1, if (bans_path.len > 0) save_interval_ms else -1) <= 0) {
-            const epoch = table.ban_epoch.load(.acquire);
-            if (epoch != saved) {
-                saved = epoch;
-                saveBans(io, table);
-            }
-            continue;
+        var pfds: [2]std.c.pollfd = undefined;
+        var n: usize = 0;
+        if (ctl) |fd| {
+            pfds[n] = .{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 };
+            n += 1;
         }
+        if (sync) |s| {
+            pfds[n] = .{ .fd = s.fd, .events = std.c.POLL.IN, .revents = 0 };
+            n += 1;
+        }
+        const ready = std.c.poll(&pfds, @intCast(n), timeout);
+        if (sync) |s| {
+            if (ready > 0 and pfds[n - 1].revents != 0) s.receive(io, table);
+            s.tick(io, table);
+        }
+        const epoch = table.ban_epoch.load(.acquire);
+        if (epoch != saved and monoMs() - saved_at >= save_interval_ms) {
+            saved = epoch;
+            saved_at = monoMs();
+            saveBans(io, table);
+        }
+        const fd = ctl orelse continue;
+        if (ready <= 0 or pfds[0].revents == 0) continue;
         const c = sys.accept(fd) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionAborted => continue,
             else => {
@@ -183,6 +208,7 @@ fn run(io: std.Io, fd: posix.fd_t, table: *client_limits.Table) void {
         serve(io, c, table, &changed) catch {};
         if (changed) {
             saved = table.ban_epoch.load(.acquire);
+            saved_at = monoMs();
             saveBans(io, table);
         }
     }
@@ -235,6 +261,10 @@ const Out = struct {
     }
 };
 
+fn monoMs() i64 {
+    return @divTrunc(sys.nanoTimestamp(), std.time.ns_per_ms);
+}
+
 fn parseNet(text: ?[]const u8) ?access.Rule {
     const r = access.parse(.deny, text orelse return null) catch return null;
     // `all` or a /0: banning everyone is a firewall's job, not a typo's.
@@ -256,6 +286,7 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         table.ban(io, net.?.net, net.?.bits, now + @as(i64, secs) * std.time.ns_per_s, now) catch
             return out.print("error: the client table is full; raise limits.max_tracked_clients\n", .{});
         log.info("banned {s} for {d} s", .{ socket.formatNet(net.?.net, net.?.bits, &buf), secs });
+        if (sync) |s| s.noteLocal(.{ .net = net.?.net, .bits = net.?.bits }, sys.realtimeSeconds() + secs, false);
         changed.* = true;
         return out.print("ok\n", .{});
     }
@@ -263,6 +294,10 @@ fn execute(io: std.Io, table: *client_limits.Table, line: []const u8, out: *Out,
         const net = parseNet(words.next());
         if (net == null or words.next() != null) return out.print("error: usage: unban <address>[/<prefix>]\n", .{});
         if (!table.unban(io, net.?.net, net.?.bits)) return out.print("error: not banned\n", .{});
+        if (sync) |s| {
+            const key: cluster.Key = .{ .net = net.?.net, .bits = net.?.bits };
+            s.noteLocal(key, s.liftEnd(key), true);
+        }
         log.info("unbanned {s}", .{socket.formatNet(net.?.net, net.?.bits, &buf)});
         changed.* = true;
         return out.print("ok\n", .{});

@@ -28,6 +28,10 @@ pub var refused_banned: std.atomic.Value(u64) = .init(0);
 pub var check_pages: std.atomic.Value(u64) = .init(0);
 pub var check_passes: std.atomic.Value(u64) = .init(0);
 pub var check_invalid: std.atomic.Value(u64) = .init(0);
+/// Bans and unbans taken from peers (`cluster`), and datagrams turned
+/// away: from no peer, or not signed with the cluster's key.
+pub var cluster_received: std.atomic.Value(u64) = .init(0);
+pub var cluster_rejected: std.atomic.Value(u64) = .init(0);
 /// Bans `limit_req.ban` made.
 pub var bans_automatic: std.atomic.Value(u64) = .init(0);
 /// Proxied requests waiting for a place under an upstream's `max_active`.
@@ -215,6 +219,10 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_browser_check_passes_total {d}\n", .{load(&check_passes)});
     try header(w, "routez_browser_check_invalid_passes_total", "counter", "Pass cookies that didn't hold: forged, ended, or from another network.");
     try w.print("routez_browser_check_invalid_passes_total {d}\n", .{load(&check_invalid)});
+    try header(w, "routez_cluster_bans_received_total", "counter", "Bans and unbans taken from cluster peers.");
+    try w.print("routez_cluster_bans_received_total {d}\n", .{load(&cluster_received)});
+    try header(w, "routez_cluster_datagrams_rejected_total", "counter", "Cluster datagrams from no peer, or not signed with the cluster key.");
+    try w.print("routez_cluster_datagrams_rejected_total {d}\n", .{load(&cluster_rejected)});
     try header(w, "routez_bans_automatic_total", "counter", "Bans limit_req.ban made.");
     try w.print("routez_bans_automatic_total {d}\n", .{load(&bans_automatic)});
     try header(w, "routez_limit_table_entries", "gauge", "Client entries held for max_connections_per_ip and limit_req.");
