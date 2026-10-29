@@ -1225,6 +1225,16 @@ kill $WT 2>/dev/null; wait $WT 2>/dev/null
 SUITE=wt check webtransport-session-credit "$(grep -o 'wt-ok\|wt-fail.*' "$WORK/wtcredit.log")" "wt-ok"
 grep -q wt-ok "$WORK/wtcredit.log" || tail -5 "$WORK/wtcredit.log"
 
+# A session is a request to limit_req: of four opened at once at 1/s, some
+# are refused with 429 (one passing, unless they spread over seconds).
+WTL=()
+for i in 1 2 3 4; do "$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" 0 /wt-limited > "$WORK/wtlimit$i.log" 2>&1 & WTL+=($!); done
+for _ in $(seq 1 50); do kill -0 "${WTL[@]}" 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+kill "${WTL[@]}" 2>/dev/null; wait "${WTL[@]}" 2>/dev/null
+ok=$(cat "$WORK"/wtlimit?.log | grep -c 'wt-ok'); limited=$(cat "$WORK"/wtlimit?.log | grep -c 'wt-rejected 429')
+SUITE=wt check webtransport-limit-req "$([ "$ok" -ge 1 ] && [ "$limited" -ge 1 ] && [ $((ok + limited)) -eq 4 ] && echo limited || echo "ok=$ok 429=$limited")" limited
+
+
 B=http://127.0.0.1:18080
 CURL="$CURL_BIN -s --max-time 10"
 SUITE=failover

@@ -384,8 +384,15 @@ pub fn Relay(comptime Listener: type) type {
             if (loc.webtransport_pass == null) return refuse(session, session_id);
 
             // The checks `Exchange.start` makes of a request.
-            const pol = w.shared.guards.policy(loc);
             const ip = clientIp(w, session, headers);
+            if (loc.limit_req) |lim| {
+                if (!w.allowRequest(srv, loc, lim, ip)) {
+                    stats.inc(&stats.requests_limited);
+                    w.refusedRequest(srv, loc, lim, ip);
+                    return answer(session, session_id, "429", retry_later);
+                }
+            }
+            const pol = w.shared.guards.policy(loc);
             if (access.check(pol.rules, ip) == .deny) return answer(session, session_id, "403", null);
             const want = w.shared.guards.clientAuth(srv);
             if (want != null and session.clientAuth() != want) return answer(session, session_id, "421", null);
@@ -399,9 +406,9 @@ pub fn Relay(comptime Listener: type) type {
                 defer std.crypto.secureZero(u8, &buf);
                 switch (basic.check(w, auth, value, ip, &buf, onPasswordChecked)) {
                     .ok => {},
-                    .denied => return answer(session, session_id, "401", auth.challenge),
-                    .limited => return answer(session, session_id, "429", null),
-                    .busy => return answer(session, session_id, "503", null),
+                    .denied => return answer(session, session_id, "401", challenge(auth)),
+                    .limited => return answer(session, session_id, "429", retry_later),
+                    .busy => return answer(session, session_id, "503", retry_later),
                     .pending => |p| return self.hold(l, session, session_id, path, headers, loc, p.job),
                 }
             }
@@ -431,14 +438,20 @@ pub fn Relay(comptime Listener: type) type {
             answer(session, session_id, "404", null);
         }
 
-        fn answer(session: *event_loop.Session, session_id: u64, status: []const u8, challenge: ?[]const u8) void {
+        fn answer(session: *event_loop.Session, session_id: u64, status: []const u8, extra: ?qpack.Header) void {
             var headers: [2]qpack.Header = .{ .{ .name = ":status", .value = status }, undefined };
             var n: usize = 1;
-            if (challenge) |c| {
-                headers[1] = .{ .name = "www-authenticate", .value = c };
+            if (extra) |h| {
+                headers[1] = h;
                 n = 2;
             }
             session.sendResponse(session_id, headers[0..n], "") catch {};
+        }
+
+        const retry_later: qpack.Header = .{ .name = "retry-after", .value = "1" };
+
+        fn challenge(auth: guard.Auth) qpack.Header {
+            return .{ .name = "www-authenticate", .value = auth.challenge };
         }
 
         /// Park a CONNECT until a verifier thread has checked its password.
@@ -484,7 +497,7 @@ pub fn Relay(comptime Listener: type) type {
             var session: event_loop.Session = .{ .entry = p.entry };
             if (!job.ok) {
                 const auth = p.listener.worker.shared.guards.policy(p.loc).auth.?;
-                return answer(&session, p.key.id, "401", auth.challenge);
+                return answer(&session, p.key.id, "401", challenge(auth));
             }
             self.proceed(p.listener, &session, p.key.id, p.path, p.headers, p.loc);
         }
