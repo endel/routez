@@ -21,6 +21,16 @@ pub fn isHopByHop(name: []const u8) bool {
     return false;
 }
 
+/// Headers a proxy writes itself for its upstream; the client's copies are
+/// never passed on, or a client could name its own address.
+pub fn isForwarded(name: []const u8) bool {
+    const list = [_][]const u8{ "x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host" };
+    for (list) |h| {
+        if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
+
 /// Whether the comma-separated `Connection` values name `name`.
 pub fn connectionListHas(connection_values: []const []const u8, name: []const u8) bool {
     for (connection_values) |v| {

@@ -539,6 +539,7 @@ test {
     _ = @import("tcp_proxy.zig");
     _ = @import("fd_budget.zig");
     _ = @import("h3/server.zig");
+    _ = @import("h3/wt_relay.zig");
     _ = @import("gzip.zig");
     _ = @import("encoding.zig");
     _ = @import("acme.zig");

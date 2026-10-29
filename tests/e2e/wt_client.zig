@@ -1,5 +1,6 @@
 //! WebTransport check for the relay: one bidi stream and one datagram, both
-//! must come back echoed. Exits 0 on success, 1 on failure or timeout.
+//! must come back echoed. Exits 0 on success, 1 on failure or timeout; a
+//! refused session prints `wt-rejected <status>`.
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -12,8 +13,16 @@ const Client = struct {
     failed: bool = false,
     payload: []const u8,
     flood: bool = false,
+    headers_only: bool = false,
+    ready: bool = false,
+    rejected: ?[3]u8 = null,
 
-    pub fn onSessionReady(self: *Client, session: *event_loop.ClientSession, session_id: u64, _: []const quic.qpack.Header) void {
+    pub fn onSessionReady(self: *Client, session: *event_loop.ClientSession, session_id: u64, headers: []const quic.qpack.Header) void {
+        if (self.headers_only) {
+            for (headers) |h| if (std.mem.startsWith(u8, h.name, "echo-")) std.debug.print("{s}: {s}\n", .{ h.name, h.value });
+            self.ready = true;
+            return session.closeConnection();
+        }
         const sid = session.openBidiStream(session_id, null) catch return self.fail(session);
         session.sendStreamData(sid, self.payload) catch return self.fail(session);
         session.closeStream(sid);
@@ -36,7 +45,8 @@ const Client = struct {
         self.maybeDone(session);
     }
 
-    pub fn onSessionRejected(self: *Client, session: *event_loop.ClientSession, _: u64, _: []const u8) void {
+    pub fn onSessionRejected(self: *Client, session: *event_loop.ClientSession, _: u64, status: []const u8) void {
+        self.rejected = if (status.len == 3) status[0..3].* else "???".*;
         self.fail(session);
     }
 
@@ -61,12 +71,22 @@ pub fn main(init: std.process.Init) !u8 {
     const payload = try init.arena.allocator().alloc(u8, if (flood_mib > 0) flood_mib * 1024 * 1024 else 500);
     for (payload, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
 
-    var handler: Client = .{ .payload = payload, .flood = flood_mib > 0 };
+    // A fifth argument, "headers", claims an address in forwarding headers
+    // and prints the echo-* headers wt-slow-server answers with.
+    const headers_only = args.len > 5 and std.mem.eql(u8, args[5], "headers");
+    const forged = [_]quic.qpack.Header{
+        .{ .name = "x-forwarded-for", .value = "203.0.113.7" },
+        .{ .name = "x-real-ip", .value = "198.51.100.1" },
+        .{ .name = "x-forwarded-proto", .value = "http" },
+    };
+
+    var handler: Client = .{ .payload = payload, .flood = flood_mib > 0, .headers_only = headers_only };
     var client = try event_loop.Client(Client).init(std.heap.page_allocator, &handler, .{
         .port = port,
         .server_name = "localhost",
         .ca = .{ .file = ca },
         .path = if (args.len > 4) args[4] else "/.well-known/webtransport",
+        .connect_headers = if (headers_only) &forged else &.{},
     });
     defer client.deinit();
     try client.run();
@@ -76,7 +96,12 @@ pub fn main(init: std.process.Init) !u8 {
         std.mem.eql(u8, handler.stream_echo.items, try std.fmt.bufPrint(&want_buf, "got {d}", .{payload.len}))
     else
         std.mem.startsWith(u8, handler.stream_echo.items, "Echo: ") and std.mem.endsWith(u8, handler.stream_echo.items, payload);
-    if (!handler.failed and echoed and handler.datagram_ok) {
+    if (handler.rejected) |status| {
+        std.debug.print("wt-rejected {s}\n", .{&status});
+        return 1;
+    }
+    const done = if (handler.headers_only) handler.ready else echoed and handler.datagram_ok;
+    if (!handler.failed and done) {
         std.debug.print("wt-ok\n", .{});
         return 0;
     }

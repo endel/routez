@@ -276,9 +276,7 @@ pub const Proxy = struct {
     }
 
     fn skipForwarded(name: []const u8) bool {
-        const list = [_][]const u8{ "x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host", "expect" };
-        for (list) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
-        return false;
+        return common.isForwarded(name) or std.ascii.eqlIgnoreCase(name, "expect");
     }
 
     /// Queue request bytes for the upstream, keeping a replay copy.
