@@ -1234,6 +1234,13 @@ kill "${WTL[@]}" 2>/dev/null; wait "${WTL[@]}" 2>/dev/null
 ok=$(cat "$WORK"/wtlimit?.log | grep -c 'wt-ok'); limited=$(cat "$WORK"/wtlimit?.log | grep -c 'wt-rejected 429')
 SUITE=wt check webtransport-limit-req "$([ "$ok" -ge 1 ] && [ "$limited" -ge 1 ] && [ $((ok + limited)) -eq 4 ] && echo limited || echo "ok=$ok 429=$limited")" limited
 
+# The upstream learns the client's address from the relay, whatever the
+# client claimed: its X-Forwarded-For is kept as history, the rest replaced.
+"$ROOT/zig-out/bin/wt-test-client" 18443 "$CERTS/ca.crt" 0 /wt-headers headers > "$WORK/wthdr.log" 2>&1 & WT=$!
+for _ in $(seq 1 50); do kill -0 $WT 2>/dev/null || break; perl -e 'select(undef,undef,undef,0.1)'; done
+kill $WT 2>/dev/null; wait $WT 2>/dev/null
+SUITE=wt check webtransport-forwarded "$(grep '^echo-' "$WORK/wthdr.log" | sort | paste -sd '|' -)" \
+    "echo-x-forwarded-for: 203.0.113.7, 127.0.0.1|echo-x-forwarded-host: localhost|echo-x-forwarded-proto: https|echo-x-real-ip: 127.0.0.1"
 
 B=http://127.0.0.1:18080
 CURL="$CURL_BIN -s --max-time 10"

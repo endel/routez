@@ -29,8 +29,19 @@ const Handler = struct {
         for (doomed.items) |k| _ = self.streams.remove(k);
     }
 
-    pub fn onConnectRequest(_: *Handler, session: *event_loop.Session, session_id: u64, _: []const u8, _: []const quic.qpack.Header) void {
-        session.acceptSession(session_id) catch {};
+    /// Answers each forwarding header the relay sent as `echo-<name>`, which
+    /// the relay passes back to the client.
+    pub fn onConnectRequest(_: *Handler, session: *event_loop.Session, session_id: u64, _: []const u8, headers: []const quic.qpack.Header) void {
+        var names: [4][32]u8 = undefined;
+        var echo: [4]quic.qpack.Header = undefined;
+        var n: usize = 0;
+        for (headers) |h| {
+            if (n == echo.len) break;
+            if (!std.mem.startsWith(u8, h.name, "x-forwarded-") and !std.mem.eql(u8, h.name, "x-real-ip")) continue;
+            echo[n] = .{ .name = std.fmt.bufPrint(&names[n], "echo-{s}", .{h.name}) catch continue, .value = h.value };
+            n += 1;
+        }
+        session.acceptSessionWithHeaders(session_id, echo[0..n]) catch {};
     }
 
     pub fn onStreamData(self: *Handler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {

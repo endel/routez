@@ -520,12 +520,10 @@ pub fn Relay(comptime Listener: type) type {
             const arena = r.arena_state.allocator();
 
             // Everything the client config borrows lives in the session arena.
-            var fwd: std.ArrayListUnmanaged(qpack.Header) = .empty;
-            for (headers) |h| {
-                if (h.name.len == 0 or h.name[0] == ':') continue;
-                if (common.isHopByHop(h.name)) continue;
-                try fwd.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
-            }
+            var hop_buf: [64]u8 = undefined;
+            var client_buf: [64]u8 = undefined;
+            const hop = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
+            const fwd = try forwardHeaders(arena, headers, socket.formatIpKey(hop, &hop_buf), socket.formatIpKey(clientIp(w, session, headers), &client_buf));
             var addr_buf: [64]u8 = undefined;
             const addr_text = try arena.dupe(u8, switch (peer.addr) {
                 .ip4 => |ip| try std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{ ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3] }),
@@ -554,7 +552,7 @@ pub fn Relay(comptime Listener: type) type {
                 .port = peer.addr.getPort(),
                 .server_name = server_name,
                 .path = try arena.dupe(u8, path),
-                .connect_headers = fwd.items,
+                .connect_headers = fwd,
                 .ipv6 = peer.addr == .ip6,
                 .ca = if (cfg.tls_ca) |ca| .{ .file = ca } else .system,
                 .skip_cert_verify = !verify,
@@ -673,4 +671,59 @@ pub fn Relay(comptime Listener: type) type {
             }
         }
     };
+}
+
+/// The CONNECT's headers for the upstream: the end-to-end ones as they came,
+/// then the X-Forwarded-* set `proxy_pass` sends, so an upstream counting or
+/// banning clients sees them rather than routez. `hop` is the address the
+/// CONNECT came from, appended to X-Forwarded-For; `client` is the client
+/// after `real_ip_from`, for X-Real-IP. Copied into `arena`.
+fn forwardHeaders(arena: std.mem.Allocator, headers: []const qpack.Header, hop: []const u8, client: []const u8) ![]qpack.Header {
+    var out: std.ArrayListUnmanaged(qpack.Header) = .empty;
+    var xff: ?[]const u8 = null;
+    var authority: []const u8 = "";
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.name, ":authority")) authority = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) xff = h.value;
+        if (h.name.len == 0 or h.name[0] == ':') continue;
+        if (common.isHopByHop(h.name) or common.isForwarded(h.name)) continue;
+        try out.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
+    }
+    const chain = if (xff) |prev| try arena.print("{s}, {s}", .{ prev, hop }) else try arena.dupe(u8, hop);
+    try out.append(arena, .{ .name = "x-forwarded-for", .value = chain });
+    try out.append(arena, .{ .name = "x-real-ip", .value = try arena.dupe(u8, client) });
+    try out.append(arena, .{ .name = "x-forwarded-proto", .value = "https" });
+    if (authority.len > 0) try out.append(arena, .{ .name = "x-forwarded-host", .value = try arena.dupe(u8, authority) });
+    return out.items;
+}
+
+test "a relayed CONNECT names its client, never as the client said" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const in = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "game.example:443" },
+        .{ .name = "x-real-ip", .value = "198.51.100.1" },
+        .{ .name = "x-forwarded-for", .value = "203.0.113.7" },
+        .{ .name = "x-forwarded-proto", .value = "http" },
+        .{ .name = "origin", .value = "https://game.example" },
+        .{ .name = "connection", .value = "close" },
+    };
+    const out = try forwardHeaders(arena_state.allocator(), &in, "192.0.2.10", "192.0.2.20");
+    const want = [_]qpack.Header{
+        .{ .name = "origin", .value = "https://game.example" },
+        .{ .name = "x-forwarded-for", .value = "203.0.113.7, 192.0.2.10" },
+        .{ .name = "x-real-ip", .value = "192.0.2.20" },
+        .{ .name = "x-forwarded-proto", .value = "https" },
+        .{ .name = "x-forwarded-host", .value = "game.example:443" },
+    };
+    try std.testing.expectEqual(want.len, out.len);
+    for (want, out) |w, o| {
+        try std.testing.expectEqualStrings(w.name, o.name);
+        try std.testing.expectEqualStrings(w.value, o.value);
+    }
+
+    // Without one from the client, the chain starts at the hop.
+    const bare = try forwardHeaders(arena_state.allocator(), in[0..2], "192.0.2.10", "192.0.2.10");
+    try std.testing.expectEqualStrings("192.0.2.10", bare[0].value);
 }
