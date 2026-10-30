@@ -226,6 +226,15 @@ A ZON file; see `src/config.zig` for every field and default.
   buffer is handed to `splice(2)`, which moves the bytes through a pipe
   without copying them into the process; there is nothing to configure.
 
+- `udp_proxies` forwards UDP datagrams, keeping a flow per client address.
+  With `quic_lb`, a new flow goes to the server its packet's destination
+  connection ID names. A client's Initial or 0-RTT packet carries an ID it
+  chose, so that holds only while the server is healthy; otherwise it goes to
+  the balancer. Any other packet's ID was issued by the server holding the
+  connection, so it goes there however its health checks fare: a server
+  draining for a deploy fails them on purpose to stop getting new clients,
+  and keeps the clients it has when their address changes or routez reloads.
+
 ### Locations
 
 ```zig

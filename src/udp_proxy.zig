@@ -180,11 +180,17 @@ pub const UdpProxy = struct {
     }
 
     /// The peer named by a QUIC-LB server ID in the destination CID, if any.
+    /// An Initial or 0-RTT packet's DCID is the client's choice, naming a
+    /// server only by chance, so it goes there only while healthy. Any
+    /// other's was issued by the server holding the connection, which no
+    /// other can serve: it goes there whatever the health checks say, so a
+    /// server draining for a deploy, failing them on purpose, keeps the
+    /// clients that change address, or that a reload of ours forgot.
     fn routeByCid(self: *UdpProxy, pkt: []const u8) ?*upstream.Peer {
         const lb = self.lb orelse return null;
         const i = peerIndexForPacket(&lb, self.lb_ids, pkt) orelse return null;
         const p = &self.group.peers[i];
-        return if (p.health_ok) p else null;
+        return if (p.health_ok or !clientChoseDcid(pkt)) p else null;
     }
 
     fn removeFlow(self: *UdpProxy, flow: *Flow) void {
@@ -211,6 +217,19 @@ pub const UdpProxy = struct {
         for (list.items) |f| f.close();
     }
 };
+
+/// Whether `pkt` is an Initial or 0-RTT packet, whose DCID the client
+/// chose; true for a long header of a version we don't know.
+fn clientChoseDcid(pkt: []const u8) bool {
+    if (pkt.len == 0 or pkt[0] & 0x80 == 0) return false;
+    if (pkt.len < 5) return true;
+    const kind = (pkt[0] >> 4) & 0x3;
+    return switch (std.mem.readInt(u32, pkt[1..5], .big)) {
+        0x0000_0001 => kind == 0 or kind == 1,
+        0x6b33_43cf => kind == 1 or kind == 2, // v2 (RFC 9369) reorders the types
+        else => true,
+    };
+}
 
 /// Index into `ids` of the server ID encoded in `pkt`'s destination CID.
 /// Long headers carry the DCID length; short headers use the QUIC-LB length.
@@ -406,6 +425,21 @@ test "route short and long headers by QUIC-LB server id" {
         long[5] = 8;
         try std.testing.expectEqual(@as(?usize, null), peerIndexForPacket(&lb, &ids, long[0..24]));
     }
+}
+
+test "only Initial and 0-RTT packets carry a DCID the client chose" {
+    const v1 = [_]u8{ 0, 0, 0, 1 };
+    const v2 = [_]u8{ 0x6b, 0x33, 0x43, 0xcf };
+    try std.testing.expect(clientChoseDcid(&([_]u8{0xc0} ++ v1))); // Initial
+    try std.testing.expect(clientChoseDcid(&([_]u8{0xd0} ++ v1))); // 0-RTT
+    try std.testing.expect(!clientChoseDcid(&([_]u8{0xe0} ++ v1))); // Handshake
+    try std.testing.expect(!clientChoseDcid(&([_]u8{0xf0} ++ v1))); // Retry
+    try std.testing.expect(clientChoseDcid(&([_]u8{0xd0} ++ v2))); // v2 Initial
+    try std.testing.expect(clientChoseDcid(&([_]u8{0xe0} ++ v2))); // v2 0-RTT
+    try std.testing.expect(!clientChoseDcid(&([_]u8{0xf0} ++ v2))); // v2 Handshake
+    try std.testing.expect(clientChoseDcid(&([_]u8{ 0xc0, 0xff, 0, 0, 0x1d }))); // a version we don't know
+    try std.testing.expect(!clientChoseDcid(&[_]u8{ 0x40, 1, 2, 3 })); // short header
+    try std.testing.expect(!clientChoseDcid(""));
 }
 
 test "addr key distinguishes ports" {
