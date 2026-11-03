@@ -55,6 +55,11 @@ pub var upstream_deprioritized: std.atomic.Value(u64) = .init(0);
 pub var requests_banned: std.atomic.Value(u64) = .init(0);
 /// QUIC datagrams handed to the worker owning their connection.
 pub var quic_steered: std.atomic.Value(u64) = .init(0);
+/// `routez tunnel` sessions open; upstream connections carried to them,
+/// and those of them that came from a worker other than the tunnel's.
+pub var tunnels_open: std.atomic.Value(u64) = .init(0);
+pub var tunnel_streams: std.atomic.Value(u64) = .init(0);
+pub var tunnel_streams_cross_worker: std.atomic.Value(u64) = .init(0);
 /// Finished responses by protocol (HTTP/1.x, HTTP/3) and status class.
 pub var responses: [2][5]Counter = @splat(@splat(.{}));
 /// Request and response body bytes, the latter as sent (compressed).
@@ -274,6 +279,12 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_tcp_spliced_bytes_total {d}\n", .{load(&tcp_spliced_bytes)});
     try header(w, "routez_quic_steered_datagrams_total", "counter", "QUIC datagrams passed to the worker owning their connection.");
     try w.print("routez_quic_steered_datagrams_total {d}\n", .{load(&quic_steered)});
+    try header(w, "routez_tunnels_open", "gauge", "routez tunnel sessions open.");
+    try w.print("routez_tunnels_open {d}\n", .{load(&tunnels_open)});
+    try header(w, "routez_tunnel_streams_total", "counter", "Upstream connections carried to a tunnel's agent.");
+    try w.print("routez_tunnel_streams_total {d}\n", .{load(&tunnel_streams)});
+    try header(w, "routez_tunnel_streams_cross_worker_total", "counter", "Tunnel streams for a request on a worker other than the tunnel's.");
+    try w.print("routez_tunnel_streams_cross_worker_total {d}\n", .{load(&tunnel_streams_cross_worker)});
 
     try header(w, "routez_upstream_requests_total", "counter", "Requests (retries included), WebTransport sessions and UDP flows sent to an upstream server.");
     for (upstreams) |u| try w.print("routez_upstream_requests_total{{upstream=\"{f}\",server=\"{f}\"}} {d}\n", .{ label(u.stats.upstream), label(u.stats.server), load(&u.stats.requests) });

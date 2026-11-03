@@ -1,13 +1,50 @@
 const std = @import("std");
-const quic = @import("quic");
 const IpAddress = std.Io.net.IpAddress;
 
 /// Resolve `host` (literal or name, via getaddrinfo) and `port`. Blocking;
 /// only used at startup.
 pub fn resolve(host: []const u8, port: u16) !IpAddress {
-    if (IpAddress.parse(host, port)) |a| return a else |_| {}
-    const storage = try quic.sys.resolveHost(host, port);
-    return fromStorage(&storage) orelse error.UnknownHostName;
+    var one: [1]IpAddress = undefined;
+    _ = try resolveAll(host, port, &one);
+    return one[0];
+}
+
+/// Every address `host` resolves to, in the resolver's order and without
+/// repeats, up to `out.len`; how many. Blocking.
+pub fn resolveAll(host: []const u8, port: u16, out: []IpAddress) !usize {
+    if (IpAddress.parse(host, port)) |a| {
+        out[0] = a;
+        return 1;
+    } else |_| {}
+    var host_buf: [256]u8 = undefined;
+    const host_z = std.fmt.bufPrintSentinel(&host_buf, "{s}", .{host}, 0) catch return error.NameTooLong;
+    var port_buf: [8]u8 = undefined;
+    const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch unreachable;
+    var hints = std.mem.zeroes(std.c.addrinfo);
+    hints.family = std.posix.AF.UNSPEC;
+    hints.socktype = std.posix.SOCK.DGRAM; // one entry per address, not per socket type
+    var res: ?*std.c.addrinfo = null;
+    if (@backingInt(std.c.getaddrinfo(host_z, port_z, &hints, &res)) != 0) return error.UnknownHostName;
+    defer if (res) |r| std.c.freeaddrinfo(r);
+    var n: usize = 0;
+    var it = res;
+    while (it) |ai| : (it = ai.next) {
+        if (n == out.len) break;
+        const sa = ai.addr orelse continue;
+        var storage = std.mem.zeroes(std.posix.sockaddr.storage);
+        const len = @min(@as(usize, ai.addrlen), @sizeOf(std.posix.sockaddr.storage));
+        @memcpy(std.mem.asBytes(&storage)[0..len], @as([*]const u8, @ptrCast(sa))[0..len]);
+        const a = fromStorage(&storage) orelse continue;
+        const seen = for (out[0..n]) |o| {
+            if (o.eql(&a)) break true;
+        } else false;
+        if (!seen) {
+            out[n] = a;
+            n += 1;
+        }
+    }
+    if (n == 0) return error.UnknownHostName;
+    return n;
 }
 
 pub fn storageLen(sa: *const std.posix.sockaddr.storage) std.posix.socklen_t {

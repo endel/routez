@@ -15,6 +15,7 @@ const router = @import("router.zig");
 const Worker = @import("worker.zig").Worker;
 const static = @import("handlers/static.zig");
 const proxy = @import("handlers/proxy.zig");
+const tunnel_edge = @import("tunnel/edge.zig");
 const microcache = @import("microcache.zig");
 const Header = common.Header;
 const stats = @import("stats.zig");
@@ -497,6 +498,7 @@ pub const Exchange = struct {
         if (loc.metrics) return self.sendMetrics();
         if (loc.root) |root| return static.start(self, loc, root);
         if (loc.proxy_pass) |target| return proxy.start(self, loc, config.splitProxyPass(target).target);
+        if (loc.tunnel_pass) return tunnel_edge.pass(self, loc);
         // webtransport_pass only means something to a CONNECT over HTTP/3.
         return self.sendError(404);
     }

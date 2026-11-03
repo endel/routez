@@ -96,6 +96,24 @@ pub const Group = struct {
         return g;
     }
 
+    /// A group of one peer, `name`, whose connections `dial` makes in
+    /// place of connecting to an address (a tunnel's socketpairs).
+    /// `name` must outlive the group.
+    pub fn initDialed(worker: *Worker, name: []const u8, dial: Peer.Dial, peer_stats: *stats.Peer) !*Group {
+        const g = try worker.alloc.create(Group);
+        errdefer worker.alloc.destroy(g);
+        g.* = .{ .worker = worker, .cfg = .{ .name = name, .servers = &.{} }, .peers = try worker.alloc.alloc(Peer, 1) };
+        g.peers[0] = .{
+            .group = g,
+            .addr = .{ .ip4 = .unspecified(0) },
+            .label = name,
+            .host = name,
+            .dial = dial,
+            .stats = peer_stats,
+        };
+        return g;
+    }
+
     pub fn deinit(self: *Group) void {
         self.worker.timers.clear(&self.health_tick);
         for (self.peers) |*p| p.closeIdle();
@@ -239,8 +257,13 @@ pub const Peer = struct {
     probe: ?*Probe = null,
     /// Set for TLS upstreams.
     tls: ?quic.tls_client.Config = null,
+    /// Connects in place of `addr` (`Group.initDialed`).
+    dial: ?Dial = null,
     /// Process-wide counters for this server, for metrics.
     stats: *stats.Peer,
+
+    /// A connected socket, the caller's from then on.
+    pub const Dial = *const fn (*Peer) anyerror!std.posix.socket_t;
 
     pub fn recordFailure(self: *Peer) void {
         stats.inc(&self.stats.failures);
@@ -284,6 +307,10 @@ pub const Peer = struct {
         const c = try w.alloc.create(UpConn);
         errdefer w.alloc.destroy(c);
         c.* = .{ .peer = self, .sock = undefined, .user = user };
+        if (self.dial) |dial| {
+            c.sock.adopt(c, &w.loop, &w.timers, w.alloc, try dial(self));
+            return c;
+        }
         if (self.tls) |*cfg| c.tls = try tls.Client.create(w.alloc, cfg);
         errdefer if (c.tls) |t| t.destroy();
         try c.sock.connect(c, &w.loop, &w.timers, w.alloc, self.addr);

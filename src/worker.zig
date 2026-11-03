@@ -35,6 +35,7 @@ const realip = @import("realip.zig");
 const fingerprint = @import("fingerprint.zig");
 const senders = @import("senders.zig");
 const microcache = @import("microcache.zig");
+const tunnel_edge = @import("tunnel/edge.zig");
 pub const H3Listener = h3_server.Listener(.h3);
 /// A QUIC listener that also relays WebTransport sessions.
 pub const WtListener = h3_server.Listener(.webtransport);
@@ -269,6 +270,8 @@ pub const Worker = struct {
     files: ofc.Cache,
     /// Upstream answers kept a moment (`microcache`).
     microcache: microcache.Cache,
+    /// `routez tunnel` agents' sessions held here, and pipes to them.
+    tunnels: tunnel_edge.Edge,
     inbox_drain: std.ArrayListUnmanaged(steering.Datagram) = .empty,
     stop_c: xev.Completion = .{},
     stopping: bool = false,
@@ -377,7 +380,10 @@ pub const Worker = struct {
             }),
             .gzip = .{ .alloc = alloc },
             .microcache = undefined,
+            .tunnels = undefined,
         };
+        w.tunnels = try .init(w);
+        errdefer w.tunnels.deinit();
         w.timers = try timers.Timers.init(&w.loop);
         w.microcache = .init(alloc, &w.timers, cfg.limits.microcache_bytes);
         w.timers.on_tick = onTick;
@@ -398,6 +404,7 @@ pub const Worker = struct {
         self.groups.deinit(self.alloc);
         self.group_names.deinit(self.alloc);
         self.closeSockets();
+        self.tunnels.deinit();
         self.listeners.deinit(self.alloc);
         self.timers.deinit();
         self.stop_async.deinit();
@@ -514,7 +521,7 @@ pub const Worker = struct {
                 if (l.quic and l.port == port and std.mem.eql(u8, l.address, address)) break true;
             } else false;
             if (!here) continue;
-            for (srv.locations) |loc| if (loc.webtransport_pass != null) return true;
+            for (srv.locations) |*loc| if (loc.takesWebTransport()) return true;
         }
         return false;
     }
@@ -568,6 +575,8 @@ pub const Worker = struct {
         self.file_inbox.wake.wait(&self.loop, &self.file_inbox.wake_c, Worker, self, onFileInbox);
         steering.registry.register(self.io, self.alloc, steering.serverId(self.id), &self.inbox) catch {};
         defer steering.registry.unregister(self.io, steering.serverId(self.id));
+        self.tunnels.start();
+        defer self.tunnels.stop();
         for (self.listeners.items) |l| l.start();
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
@@ -634,6 +643,7 @@ pub const Worker = struct {
         }
         // GOAWAY: in-flight HTTP/3 requests finish, new ones go elsewhere.
         for (self.quic_listeners.items) |q| q.drain();
+        self.tunnels.drain();
         self.stop_started_ms = self.timers.now_ms;
         self.timers.set(&self.stop_deadline, drain_timeout_ms);
         return .disarm;
@@ -661,6 +671,7 @@ pub const Worker = struct {
             .wt => |l| l.relay.checkPaused(),
             .h3 => {},
         };
+        self.tunnels.checkPaused();
         if (self.finishing) return self.pollFinish();
         if (self.stopping and !self.fresh_closed and self.timers.now_ms - self.stop_started_ms >= fresh_grace_ms) {
             // A connection that stays silent mustn't hold up the stop.

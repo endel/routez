@@ -356,6 +356,16 @@ pub const Location = struct {
     /// Relay WebTransport sessions to this upstream (HTTP/3 only).
     webtransport_pass: ?[]const u8 = null,
 
+    /// Take `routez tunnel` agents here: a WebTransport session (HTTP/3
+    /// only) opens a tunnel, which `tunnel_pass` serves at
+    /// `https://<name>.<domain>`. The location's `auth_basic`, `access`,
+    /// `limit_req` and `require_client_cert` decide who may open one.
+    tunnel_accept: ?TunnelAccept = null,
+    /// Proxy requests down the tunnel named by the first label of the
+    /// request's host, as `proxy_pass` does to an upstream: `game.play.example.com`
+    /// reaches the agent that opened `game`. 404 when no such tunnel is open.
+    tunnel_pass: bool = false,
+
     /// Answer with a fixed status and body, or redirect.
     @"return": ?Return = null,
     /// Rules applied once the location is chosen, before its handler; see
@@ -408,6 +418,17 @@ pub const Location = struct {
     stub_status: bool = false,
     /// Serve counters in the Prometheus text format.
     metrics: bool = false,
+
+    pub const TunnelAccept = struct {
+        /// Host (and `:port`, if not 443) the public names sit under; the
+        /// agent is told `https://<name>.<domain>`.
+        domain: []const u8,
+    };
+
+    /// Whether a WebTransport CONNECT (HTTP/3 only) means anything here.
+    pub fn takesWebTransport(self: *const Location) bool {
+        return self.webtransport_pass != null or self.tunnel_accept != null;
+    }
 
     pub const Match = enum { prefix, exact, regex };
 
@@ -708,10 +729,22 @@ pub fn validate(alloc: std.mem.Allocator, cfg: *const Config) error{ InvalidConf
             if (loc.root != null) actions += 1;
             if (loc.proxy_pass != null) actions += 1;
             if (loc.webtransport_pass != null) actions += 1;
+            if (loc.tunnel_accept != null) actions += 1;
+            if (loc.tunnel_pass) actions += 1;
             if (loc.@"return" != null) actions += 1;
             if (loc.stub_status) actions += 1;
             if (loc.metrics) actions += 1;
-            if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, return, stub_status, metrics", .{loc.pattern()});
+            if (actions != 1) return fail("location '{s}' needs exactly one of root, proxy_pass, webtransport_pass, tunnel_accept, tunnel_pass, return, stub_status, metrics", .{loc.pattern()});
+            if (loc.tunnel_accept) |ta| {
+                if (ta.domain.len == 0) return fail("location '{s}': tunnel_accept needs a domain", .{loc.pattern()});
+                const has_quic = for (srv.listen) |l| {
+                    if (l.quic) break true;
+                } else false;
+                if (!has_quic) return fail("location '{s}': tunnel_accept needs a quic listen (agents come over WebTransport)", .{loc.pattern()});
+                const guarded = loc.auth_basic != null or loc.require_client_cert or loc.access.len > 0 or srv.access.len > 0;
+                if (!guarded and !@import("builtin").is_test)
+                    std.log.scoped(.config).warn("location '{s}': tunnel_accept has no auth_basic, access or require_client_cert: anyone can open a tunnel", .{loc.pattern()});
+            }
             if (loc.proxy_pass) |p| try checkProxyPass(cfg, loc, p);
             for (loc.proxy_set_headers) |h| try checkHeader(h);
             for (loc.add_headers) |h| try checkHeader(h);
@@ -940,11 +973,15 @@ fn isDnsName(n: []const u8) bool {
     if (n.len == 0 or n.len > 253) return false;
     if (std.Io.net.IpAddress.parse(n, 0)) |_| return false else |_| {}
     var it = std.mem.splitScalar(u8, n, '.');
-    while (it.next()) |label| {
-        if (label.len == 0 or label.len > 63) return false;
-        if (label[0] == '-' or label[label.len - 1] == '-') return false;
-        for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
-    }
+    while (it.next()) |label| if (!isDnsLabel(label)) return false;
+    return true;
+}
+
+/// 1 to 63 letters, digits and inner hyphens.
+pub fn isDnsLabel(label: []const u8) bool {
+    if (label.len == 0 or label.len > 63) return false;
+    if (label[0] == '-' or label[label.len - 1] == '-') return false;
+    for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
     return true;
 }
 
@@ -986,6 +1023,19 @@ pub fn parseHostPort(text_in: []const u8) error{InvalidAddress}!HostPort {
     return .{ .host = host, .port = port };
 }
 
+/// `parseHostPort`, but `host` and `[v6]` alone take `default_port`.
+pub fn parseHostPortOr(text: []const u8, default_port: u16) error{InvalidAddress}!HostPort {
+    const host_end = if (std.mem.startsWith(u8, text, "["))
+        (std.mem.indexOfScalar(u8, text, ']') orelse return error.InvalidAddress) + 1
+    else
+        0;
+    if (std.mem.indexOfScalarPos(u8, text, host_end, ':') != null) return parseHostPort(text);
+    if (host_end > 0 and host_end != text.len) return error.InvalidAddress;
+    const host = if (host_end > 0) text[1 .. host_end - 1] else text;
+    if (host.len == 0) return error.InvalidAddress;
+    return .{ .host = host, .port = default_port };
+}
+
 test "parse sample config" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1011,6 +1061,41 @@ test "reject location with two actions" {
     defer arena_state.deinit();
     try std.testing.expectError(error.InvalidConfig, parse(arena_state.allocator(),
         \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .root = "x", .proxy_pass = "a:1" }} }} }
+    , "test"));
+}
+
+test "host and port, with a default" {
+    const hp = try parseHostPortOr("edge.example", 443);
+    try std.testing.expectEqualStrings("edge.example", hp.host);
+    try std.testing.expectEqual(@as(u16, 443), hp.port);
+    try std.testing.expectEqual(@as(u16, 8443), (try parseHostPortOr("edge.example:8443", 443)).port);
+    try std.testing.expectEqualStrings("::1", (try parseHostPortOr("[::1]", 443)).host);
+    try std.testing.expectEqual(@as(u16, 80), (try parseHostPortOr("[::1]:80", 443)).port);
+    try std.testing.expectError(error.InvalidAddress, parseHostPortOr("[::1]x", 443));
+    try std.testing.expectError(error.InvalidAddress, parseHostPortOr("[]", 443));
+    try std.testing.expectError(error.InvalidAddress, parseHostPortOr("", 443));
+}
+
+test "tunnel locations" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg = try parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 443, .tls = true, .quic = true }}, .tls = .{ .cert = "c", .key = "k" },
+        \\    .locations = .{ .{ .prefix = "/.tunnel", .tunnel_accept = .{ .domain = "play.example" } }, .{ .prefix = "/", .tunnel_pass = true } } }} }
+    , "test");
+    try std.testing.expectEqualStrings("play.example", cfg.servers[0].locations[0].tunnel_accept.?.domain);
+    try std.testing.expect(cfg.servers[0].locations[1].tunnel_pass);
+    // Agents come over WebTransport: no QUIC, no tunnel_accept.
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 80 }}, .locations = .{.{ .prefix = "/", .tunnel_accept = .{ .domain = "x" } }} }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 443, .tls = true, .quic = true }}, .tls = .{ .cert = "c", .key = "k" },
+        \\    .locations = .{.{ .prefix = "/", .tunnel_accept = .{ .domain = "" } }} }} }
+    , "test"));
+    try std.testing.expectError(error.InvalidConfig, parse(a,
+        \\.{ .servers = .{.{ .listen = .{.{ .port = 1 }}, .locations = .{.{ .prefix = "/", .tunnel_pass = true, .root = "x" }} }} }
     , "test"));
 }
 

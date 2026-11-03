@@ -38,6 +38,10 @@ const max_attempts = 4;
 
 pub fn start(ex: *Exchange, loc: *const config.Location, target: []const u8) void {
     const group = ex.worker.findGroup(target) orelse return ex.sendError(502);
+    startGroup(ex, loc, group);
+}
+
+pub fn startGroup(ex: *Exchange, loc: *const config.Location, group: *upstream.Group) void {
     const looked = ex.worker.microcache.lookup(ex, loc);
     if (looked == .hit) return microcache.serve(ex, looked.hit);
     const p = ex.worker.alloc.create(Proxy) catch {
@@ -246,7 +250,8 @@ pub const Proxy = struct {
         const path = ex.req.path;
         // The part of the path the location matched, to replace or strip.
         const matched: ?[]const u8 = loc.prefix orelse loc.exact;
-        if (config.splitProxyPass(loc.proxy_pass.?).uri) |uri| {
+        const pass_uri = if (loc.proxy_pass) |p| config.splitProxyPass(p).uri else null;
+        if (pass_uri) |uri| {
             if (vars.has(uri)) {
                 const target = try ex.expand(uri);
                 if (std.mem.indexOfAny(u8, target, " \t") != null) return error.BadTarget;

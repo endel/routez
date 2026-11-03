@@ -70,6 +70,8 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         read_c: xev.Completion = .{},
         write_c: xev.Completion = .{},
         connect_c: if (connects) xev.Completion else void = if (connects) .{} else {},
+        /// `adopt`'s connect, reported a loop iteration later.
+        adopted: if (connects) timers.Deferred else void = if (connects) .{ .callback = onAdopted } else {},
         closed_cb: timers.Deferred = .{ .callback = onDeferredClose },
 
         reading: bool = false,
@@ -146,20 +148,37 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             self.tcp.connect(loop, &self.connect_c, addr, Self, self, onConnect);
         }
 
-        fn onConnect(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, r: xev.ConnectError!void) xev.CallbackAction {
-            const self = ud.?;
+        /// Take `fd`, already connected (a socketpair's end), as `connect`
+        /// leaves a socket: `onSocketConnect` comes a loop iteration later,
+        /// where a connect's outcome would, and writes queue until then.
+        pub fn adopt(self: *Self, owner: *Owner, loop: *xev.Loop, t: *timers.Timers, alloc: std.mem.Allocator, fd_: std.posix.socket_t) void {
+            if (!connects) @compileError("this socket never connects");
+            self.init(owner, loop, t, alloc, xev.TCP.initFd(fd_));
+            self.connecting = true;
+            t.defer_(&self.adopted);
+        }
+
+        fn onAdopted(d: *timers.Deferred) void {
+            const self: *Self = @fieldParentPtr("adopted", d);
+            self.connected();
+        }
+
+        fn connected(self: *Self) void {
             self.connecting = false;
-            if (self.state == .closing) {
-                self.maybeFinishClose();
-                return .disarm;
-            }
-            r catch |err| {
-                Owner.onSocketConnect(self.owner, err);
-                return .disarm;
-            };
+            if (self.state == .closing) return self.maybeFinishClose();
             Owner.onSocketConnect(self.owner, null);
             if (self.state == .open or self.state == .flushing) self.kickWrite();
             if (self.state == .open) self.startReading();
+        }
+
+        fn onConnect(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, r: xev.ConnectError!void) xev.CallbackAction {
+            const self = ud.?;
+            r catch |err| {
+                self.connecting = false;
+                if (self.state == .closing) self.maybeFinishClose() else Owner.onSocketConnect(self.owner, err);
+                return .disarm;
+            };
+            self.connected();
             return .disarm;
         }
 
@@ -684,6 +703,15 @@ pub fn formatSockaddr(storage: *const std.posix.sockaddr.storage, buf: []u8) []c
         },
         else => return "-",
     }
+}
+
+/// `ip` without its port, as a dialler parses it: an IPv6 one stays IPv6,
+/// mapped or not.
+pub fn formatIp(ip: std.Io.net.IpAddress, buf: []u8) []const u8 {
+    return switch (ip) {
+        .ip4 => |a| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch "-",
+        .ip6 => |a| formatIp6(a.bytes, buf),
+    };
 }
 
 /// An `ipKey` as text; IPv4-mapped addresses read better in their v4 form.

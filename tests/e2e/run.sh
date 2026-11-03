@@ -1248,6 +1248,12 @@ SUITE=failover
 kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null; sleep 0.2  # take down 19002
 check failover "$(for i in 1 2 3 4 5 6; do $CURL -o /dev/null -w '%{http_code}' "$B/api/f"; done)" "200200200200200200"
 
+# routez tunnel, on an edge and agents of its own; its checks count here.
+out=$(SKIP_BUILD=1 CURL_BIN="$CURL_BIN" "$HERE/tunnel.sh" 2>&1)
+grep -E '^(FAIL|skip)' <<< "$out"
+t=$(sed -n 's/^tunnel: passed=\([0-9]*\) failed=\([0-9]*\)$/\1 \2/p' <<< "$out")
+if [ -n "$t" ]; then pass=$((pass + ${t% *})); fail=$((fail + ${t#* })); else fail=$((fail+1)); echo "FAIL [tunnel] suite didn't finish:"; tail -20 <<< "$out"; fi
+
 if grep -qiE "panic|segmentation" "$WORK/server.log"; then fail=$((fail+1)); echo "FAIL server crashed:"; cat "$WORK/server.log"; fi
 # libxev's kqueue backend logs this when a completion is queued twice.
 if grep -q "invalid state" "$WORK/server.log"; then fail=$((fail+1)); echo "FAIL event loop: $(grep -c 'invalid state' "$WORK/server.log") invalid-state errors"; fi
