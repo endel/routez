@@ -30,6 +30,10 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   tracking and active HTTP health checks.
 - Layer-4 TCP proxy for protocols routez doesn't terminate, and a layer-4
   UDP proxy for QUIC traffic, with QUIC-LB connection-ID routing.
+- Tunnels, ngrok-style: `routez tunnel https://edge.example.com/.tunnel 2567`
+  shares a server on your machine at `https://<name>.play.example.com`
+  through an edge running routez, WebSockets included, with no port opened
+  on your side. See [Tunnels](#tunnels).
 - Worker threads with SO_REUSEPORT. Graceful shutdown on SIGINT/SIGTERM:
   keep-alive connections close once idle, after the client has been sent
   every byte of its last response (queued output and `sendfile` ranges
@@ -137,8 +141,9 @@ A ZON file; see `src/config.zig` for every field and default.
 ```
 
 - A location has exactly one of `root`, `proxy_pass`, `return`,
-  `stub_status`, `metrics` or `webtransport_pass`, and matches by `prefix`,
-  `exact` or `regex` (see [Locations](#locations)).
+  `stub_status`, `metrics`, `webtransport_pass`, `tunnel_accept` or
+  `tunnel_pass`, and matches by `prefix`, `exact` or `regex` (see
+  [Locations](#locations)).
 - `proxy_pass` may name a URI after the upstream, as in nginx:
   `.{ .prefix = "/api/", .proxy_pass = "backend/v2/" }` sends `/api/x` as
   `/v2/x`; `strip_prefix = true` is the same as `"backend/"`. A URI with
@@ -790,6 +795,63 @@ which proxies to believe:
 - These settings are global, not per server: the PROXY header is read
   before SNI or `Host` has chosen a server.
 
+### Tunnels
+
+`routez tunnel` shares a server running on your machine, say a game server
+for a playtest, through an edge that runs routez: playtesters reach
+`https://<name>.play.example.com`, and nothing on your side listens on the
+internet. The agent dials out to the edge over WebTransport and stays
+connected, so it works from behind NAT and firewalls that let UDP out.
+
+```zig
+.servers = .{
+    .{  // where agents connect: one HTTP/3 port with the rest
+        .server_names = .{"play.example.com"},
+        .listen = .{.{ .port = 443, .tls = true, .quic = true }},
+        .tls = .{ .cert = "play.pem", .key = "play.key" },
+        .locations = .{.{
+            .prefix = "/.tunnel",
+            .tunnel_accept = .{ .domain = "play.example.com" },
+            .auth_basic = .{ .user_file = "/etc/routez/tunnel-users" },
+        }},
+    },
+    .{  // what playtesters reach: <name>.play.example.com
+        .server_names = .{"*.play.example.com"},
+        .listen = .{ .{ .port = 80 }, .{ .port = 443, .tls = true, .quic = true } },
+        .tls = .{ .cert = "wildcard.pem", .key = "wildcard.key" },
+        .locations = .{.{ .prefix = "/", .tunnel_pass = true }},
+    },
+},
+```
+
+```sh
+routez tunnel -n mygame -u dev:secret https://play.example.com/.tunnel 2567
+# https://mygame.play.example.com -> 127.0.0.1:2567
+```
+
+- `tunnel_accept` takes agents' WebTransport sessions. Who may open a
+  tunnel is the location's `auth_basic`, `access`, `require_client_cert`
+  and `limit_req`, as for any request; without one of the first three,
+  anyone can put a page under your domain, and the config check warns.
+- An agent asks for a name with `-n` (letters, digits and inner hyphens, up
+  to 63) or gets a random one. A name held by another agent is refused
+  (409) and the agent keeps trying, which also covers its own last session
+  not yet timed out.
+- `tunnel_pass` serves the tunnel named by the first label of the host,
+  404 when none is open. It is the reverse proxy of `proxy_pass` with the
+  agent as upstream: HTTP/1.1, TLS and HTTP/3 clients, WebSocket upgrades,
+  X-Forwarded-* headers, keep-alive pooling, `limit_req` and the other
+  location settings all apply. The local server sees the public host in
+  `Host` and the client in `X-Forwarded-For` / `X-Real-IP`.
+- The agent connects each request's upstream connection to the local
+  server; if nothing answers there, the client gets a 502 saying so.
+- It reconnects by itself when the session drops, and when the edge
+  reloads or stops it opens a new session before the old one goes, so a
+  `SIGHUP` on the edge doesn't interrupt a playtest. Ctrl-C closes the
+  session, freeing the name at once.
+- `routez_tunnels_open` and `routez_tunnel_streams_total` in
+  [metrics](#operations) count tunnels and the connections carried to them.
+
 ### Operations
 
 ```zig
@@ -938,6 +1000,7 @@ Instead of `cert` and `key`, a server can ask an ACME CA for its certificate:
 ```sh
 zig build test          # unit tests
 tests/e2e/run.sh        # end-to-end over HTTP/1.1, TLS, HTTP/3 and WebTransport
+tests/e2e/tunnel.sh     # routez tunnel: an edge, agents and local servers (run.sh runs it too)
 tests/acme/run.sh       # ACME against Pebble in Docker (skipped without Docker)
 zig build regex-diff && tests/regex/differential.py   # regex engine against Python's re
 ```
@@ -1279,6 +1342,13 @@ to the app directly.
 - During a reload, new QUIC connections that the kernel hands to the old
   generation's sockets are refused until it finishes draining (up to 10 s);
   browsers fall back to TCP meanwhile.
+- Tunnels carry the HTTP proxy's connections, so WebTransport and plain UDP
+  don't reach a tunnelled server yet: a game sharing one that way needs its
+  WebSocket fallback. A tunnel carries at most 100 connections at once (the
+  agent's QUIC stream limit); past that, requests get a 502.
+- An agent that is killed rather than stopped holds its name until the
+  edge's QUIC idle timeout (30 s by default); started again meanwhile, it
+  waits for the name.
 - A reload that lowers `workers` closes the extra TCP listening sockets,
   resetting any connection queued on them at that moment.
 - QUIC connections close after `limits.quic_idle_timeout_ms` of silence

@@ -131,6 +131,8 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 .retry_token_key = w.shared.quic_keys.retry,
                 .static_reset_key = w.shared.quic_keys.reset,
                 .send_buffer_size = 4 * 1024 * 1024,
+                // Connection ids unique across the worker: `worker.tunnels` keys by them.
+                .id_base = @as(u64, w.quic_listeners.items.len) << 48,
             }) catch |err| {
                 if (sock == null) worker_mod.bindFailed("quic", l.address, l.port, err);
                 return err;
@@ -203,7 +205,9 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             pub fn onWritable(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: ?u64) void {
                 const sid = stream_id orelse session_id;
                 if (self.listener.streamFor(session, sid)) |s| return s.onWritable();
-                if (proto == .webtransport) self.listener.relay.onWritable(session, session_id, stream_id);
+                if (proto != .webtransport) return;
+                if (self.listener.worker.tunnels.onWritable(session, stream_id)) return;
+                self.listener.relay.onWritable(session, session_id, stream_id);
             }
 
             pub fn onConnectionClosed(self: *Handler, session: *event_loop.Session) void {
@@ -225,15 +229,21 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 self.listener.relay.onConnectRequest(self.listener, session, session_id, path, headers);
             }
 
+            // Tunnels (`tunnel/edge.zig`) look first; the rest is the relay's,
+            // which drops what it doesn't know (an agent's datagrams).
+
             pub fn onBidiStream(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: u64) void {
+                if (self.listener.worker.tunnels.onAgentStream(session, session_id, stream_id)) return;
                 self.listener.relay.onStream(session, session_id, stream_id, true);
             }
 
             pub fn onUniStream(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: u64) void {
+                if (self.listener.worker.tunnels.onAgentStream(session, session_id, stream_id)) return;
                 self.listener.relay.onStream(session, session_id, stream_id, false);
             }
 
             pub fn onStreamData(self: *Handler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+                if (self.listener.worker.tunnels.onStreamData(session, stream_id, data, fin)) return;
                 self.listener.relay.onStreamData(session, stream_id, data, fin);
             }
 
@@ -242,14 +252,17 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             }
 
             pub fn onStreamReset(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: u64, error_code: u32) void {
+                if (self.listener.worker.tunnels.onStreamAbort(session, stream_id)) return;
                 self.listener.relay.onStreamReset(session, session_id, stream_id, error_code);
             }
 
             pub fn onStopSending(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: u64, error_code: u32) void {
+                if (self.listener.worker.tunnels.onStreamAbort(session, stream_id)) return;
                 self.listener.relay.onStopSending(session, session_id, stream_id, error_code);
             }
 
             pub fn onSessionClosed(self: *Handler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
+                if (self.listener.worker.tunnels.onSessionClosed(session, session_id)) return;
                 self.listener.relay.onSessionClosed(session, session_id, error_code, reason);
             }
         };

@@ -23,6 +23,7 @@ const control = @import("control.zig");
 const cluster = @import("cluster.zig");
 const browser_check = @import("browser_check.zig");
 const build_options = @import("build_options");
+const tunnel_agent = @import("tunnel/agent.zig");
 
 pub const std_options: std.Options = .{
     // Everything is compiled in; `log_level` in the config filters at run time.
@@ -41,6 +42,7 @@ const log = std.log.scoped(.main);
 const usage =
     \\usage: routez [-t] [config.zon]
     \\       routez ctl [-s socket] <command>
+    \\       routez tunnel [options] <edge-url> <local>   (routez tunnel -h)
     \\  -t   check the configuration and exit
     \\  ctl  send a command to a running server's control_socket
     \\       (default /run/routez.sock):
@@ -416,6 +418,7 @@ fn loadUpstreamCas(arena: std.mem.Allocator, cfg: *const config.Config) ![]const
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "tunnel")) return tunnel_agent.main(arena, args[2..]);
     if (args.len > 1 and std.mem.eql(u8, args[1], "ctl")) {
         const custom = args.len > 3 and std.mem.eql(u8, args[2], "-s");
         const words = args[if (custom) 4 else 2..];
@@ -553,6 +556,9 @@ test {
     _ = @import("senders.zig");
     _ = @import("microcache.zig");
     _ = @import("control.zig");
+    _ = @import("tunnel/registry.zig");
+    _ = @import("tunnel/edge.zig");
+    _ = @import("tunnel/agent.zig");
     _ = @import("browser_check.zig");
     _ = @import("cluster.zig");
     _ = @import("handlers/check.zig");

@@ -40,7 +40,86 @@ const high_water = socket.high_water;
 const low_water = socket.low_water;
 
 /// WebTransport session error for "the other side went away".
-const relay_error: u32 = 0;
+pub const relay_error: u32 = 0;
+
+/// Bytes, and the FIN behind them, that the destination's session
+/// credit refused. The source stays paused while any are held.
+pub const Held = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    fin: bool = false,
+
+    pub fn empty(h: *const Held) bool {
+        return h.bytes.items.len == 0;
+    }
+};
+
+/// Largest wait `onWritable` is asked for, so a big held chunk drains
+/// as credit trickles in instead of waiting for all of it at once.
+pub const writable_chunk = 16 * 1024;
+
+/// Forward `data` to `dst`, holding whatever its session credit
+/// refuses. False when bytes are held and the source must pause.
+fn forward(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held, data: []const u8, fin: bool) bool {
+    var rest = data;
+    if (held.empty()) {
+        if (data.len > 0) rest = data[sendSome(dst, stream, data)..];
+        if (rest.len == 0) {
+            if (fin) dst.closeStream(stream);
+            return true;
+        }
+    }
+    held.bytes.appendSlice(a, rest) catch {
+        dst.resetStream(stream, relay_error);
+        return true;
+    };
+    if (fin) held.fin = true;
+    dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};
+    return false;
+}
+
+/// Send what `dst` now admits of `held`. True once it is all gone.
+pub fn drain(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held) bool {
+    if (held.empty()) return true;
+    const items = held.bytes.items;
+    const n = sendSome(dst, stream, items);
+    @memmove(items[0 .. items.len - n], items[n..]);
+    held.bytes.items.len -= n;
+    if (!held.empty()) {
+        dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};
+        return false;
+    }
+    held.bytes.clearAndFree(a);
+    if (held.fin) dst.closeStream(stream);
+    held.fin = false;
+    return true;
+}
+
+/// Write as much of `data` as `dst` takes; the count taken. QUIC
+/// buffers past its own flow control, so only WT_MAX_DATA refuses.
+pub fn sendSome(dst: anytype, stream: u64, data: []const u8) usize {
+    dst.sendStreamData(stream, data) catch |err| switch (err) {
+        error.WtDataLimitReached => {
+            // Gone streams report no capacity: nothing left to hold for.
+            const n = @min(dst.streamSendCapacity(stream) orelse return data.len, data.len);
+            if (n == 0) return 0;
+            dst.sendStreamData(stream, data[0..n]) catch return data.len;
+            return n;
+        },
+        else => return data.len,
+    };
+    return data.len;
+}
+
+/// Answer a CONNECT with `status`, and `extra` if given, and no body.
+pub fn answer(session: *event_loop.Session, session_id: u64, status: []const u8, extra: ?qpack.Header) void {
+    var headers: [2]qpack.Header = .{ .{ .name = ":status", .value = status }, undefined };
+    var n: usize = 1;
+    if (extra) |h| {
+        headers[1] = h;
+        n = 2;
+    }
+    session.sendResponse(session_id, headers[0..n], "") catch {};
+}
 
 pub fn Relay(comptime Listener: type) type {
     return struct {
@@ -174,74 +253,6 @@ pub fn Relay(comptime Listener: type) type {
                 return d.streamBufferedBytes(p.down_stream) orelse 0;
             }
         };
-
-        /// Bytes, and the FIN behind them, that the destination's session
-        /// credit refused. The source stays paused while any are held.
-        const Held = struct {
-            bytes: std.ArrayListUnmanaged(u8) = .empty,
-            fin: bool = false,
-
-            fn empty(h: *const Held) bool {
-                return h.bytes.items.len == 0;
-            }
-        };
-
-        /// Largest wait `onWritable` is asked for, so a big held chunk drains
-        /// as credit trickles in instead of waiting for all of it at once.
-        const writable_chunk = 16 * 1024;
-
-        /// Forward `data` to `dst`, holding whatever its session credit
-        /// refuses. False when bytes are held and the source must pause.
-        fn forward(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held, data: []const u8, fin: bool) bool {
-            var rest = data;
-            if (held.empty()) {
-                if (data.len > 0) rest = data[sendSome(dst, stream, data)..];
-                if (rest.len == 0) {
-                    if (fin) dst.closeStream(stream);
-                    return true;
-                }
-            }
-            held.bytes.appendSlice(a, rest) catch {
-                dst.resetStream(stream, relay_error);
-                return true;
-            };
-            if (fin) held.fin = true;
-            dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};
-            return false;
-        }
-
-        /// Send what `dst` now admits of `held`. True once it is all gone.
-        fn drain(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held) bool {
-            if (held.empty()) return true;
-            const items = held.bytes.items;
-            const n = sendSome(dst, stream, items);
-            @memmove(items[0 .. items.len - n], items[n..]);
-            held.bytes.items.len -= n;
-            if (!held.empty()) {
-                dst.notifyWritable(session_id, stream, @min(held.bytes.items.len, writable_chunk)) catch {};
-                return false;
-            }
-            held.bytes.clearAndFree(a);
-            if (held.fin) dst.closeStream(stream);
-            held.fin = false;
-            return true;
-        }
-
-        /// Write as much of `data` as `dst` takes; the count taken. QUIC
-        /// buffers past its own flow control, so only WT_MAX_DATA refuses.
-        fn sendSome(dst: anytype, stream: u64, data: []const u8) usize {
-            dst.sendStreamData(stream, data) catch |err| switch (err) {
-                error.WtDataLimitReached => {
-                    // Gone streams report no capacity: nothing left to hold for.
-                    const n = @min(dst.streamSendCapacity(stream) orelse return data.len, data.len);
-                    if (n == 0) return 0;
-                    dst.sendStreamData(stream, data[0..n]) catch return data.len;
-                    return n;
-                },
-                else => return data.len,
-            };
-            return data.len;
-        }
 
         /// The upstream client and its handler; outlives its session until
         /// the client is off the loop.
@@ -381,7 +392,7 @@ pub fn Relay(comptime Listener: type) type {
             var caps: regex.Captures = .{};
             const m: router.Matcher = .{ .routes = w.shared.routes, .scratch = &w.regex_scratch };
             const loc = router.matchLocation(srv, target.path, m, &caps) orelse return refuse(session, session_id);
-            if (loc.webtransport_pass == null) return refuse(session, session_id);
+            if (!loc.takesWebTransport()) return refuse(session, session_id);
 
             // The checks `Exchange.start` makes of a request.
             const ip = clientIp(w, session, headers);
@@ -417,6 +428,7 @@ pub fn Relay(comptime Listener: type) type {
 
         fn proceed(self: *Self, l: *Listener, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header, loc: *const Location) void {
             const w = l.worker;
+            if (loc.tunnel_accept) |ta| return w.tunnels.accept(session, session_id, headers, ta);
             const group = w.findGroup(loc.webtransport_pass.?) orelse return refuse(session, session_id);
             var client_buf: [64]u8 = undefined;
             const client_addr = socket.formatIpKey(clientIp(w, session, headers), &client_buf);
@@ -436,16 +448,6 @@ pub fn Relay(comptime Listener: type) type {
 
         fn refuse(session: *event_loop.Session, session_id: u64) void {
             answer(session, session_id, "404", null);
-        }
-
-        fn answer(session: *event_loop.Session, session_id: u64, status: []const u8, extra: ?qpack.Header) void {
-            var headers: [2]qpack.Header = .{ .{ .name = ":status", .value = status }, undefined };
-            var n: usize = 1;
-            if (extra) |h| {
-                headers[1] = h;
-                n = 2;
-            }
-            session.sendResponse(session_id, headers[0..n], "") catch {};
         }
 
         const retry_later: qpack.Header = .{ .name = "retry-after", .value = "1" };
@@ -525,10 +527,7 @@ pub fn Relay(comptime Listener: type) type {
             const hop = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
             const fwd = try forwardHeaders(arena, headers, socket.formatIpKey(hop, &hop_buf), socket.formatIpKey(clientIp(w, session, headers), &client_buf));
             var addr_buf: [64]u8 = undefined;
-            const addr_text = try arena.dupe(u8, switch (peer.addr) {
-                .ip4 => |ip| try std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{ ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3] }),
-                .ip6 => |ip| socket.formatIp6(ip.bytes, &addr_buf),
-            });
+            const addr_text = try arena.dupe(u8, socket.formatIp(peer.addr, &addr_buf));
 
             const cfg = group.cfg;
             const server_name = try arena.dupe(u8, cfg.tls_server_name orelse peer.host);
