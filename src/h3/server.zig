@@ -220,7 +220,10 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                     if (e.key_ptr.conn == conn) doomed.append(l.worker.alloc, e.value_ptr.*) catch {};
                 }
                 for (doomed.items) |s| s.gone();
-                if (proto == .webtransport) l.relay.onConnectionClosed(session);
+                if (proto == .webtransport) {
+                    l.relay.onConnectionClosed(session);
+                    l.worker.tunnels.onConnectionClosed(session);
+                }
             }
 
             // WebTransport. Only a `.webtransport` server ever calls these.
@@ -229,16 +232,16 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 self.listener.relay.onConnectRequest(self.listener, session, session_id, path, headers);
             }
 
-            // Tunnels (`tunnel/edge.zig`) look first; the rest is the relay's,
-            // which drops what it doesn't know (an agent's datagrams).
+            // Tunnels (`tunnel/edge.zig`) look first: agents' sessions and
+            // players' through them. The rest is the relay's.
 
             pub fn onBidiStream(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: u64) void {
-                if (self.listener.worker.tunnels.onAgentStream(session, session_id, stream_id)) return;
+                if (self.listener.worker.tunnels.onSessionStream(session, session_id, stream_id, true)) return;
                 self.listener.relay.onStream(session, session_id, stream_id, true);
             }
 
             pub fn onUniStream(self: *Handler, session: *event_loop.Session, session_id: u64, stream_id: u64) void {
-                if (self.listener.worker.tunnels.onAgentStream(session, session_id, stream_id)) return;
+                if (self.listener.worker.tunnels.onSessionStream(session, session_id, stream_id, false)) return;
                 self.listener.relay.onStream(session, session_id, stream_id, false);
             }
 
@@ -248,6 +251,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             }
 
             pub fn onDatagram(self: *Handler, session: *event_loop.Session, session_id: u64, data: []const u8) void {
+                if (self.listener.worker.tunnels.onDatagram(session, session_id, data)) return;
                 self.listener.relay.onDatagram(session, session_id, data);
             }
 
@@ -262,7 +266,7 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
             }
 
             pub fn onSessionClosed(self: *Handler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
-                if (self.listener.worker.tunnels.onSessionClosed(session, session_id)) return;
+                if (self.listener.worker.tunnels.onSessionClosed(session, session_id, error_code, reason)) return;
                 self.listener.relay.onSessionClosed(session, session_id, error_code, reason);
             }
         };

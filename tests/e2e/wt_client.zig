@@ -1,6 +1,11 @@
 //! WebTransport check for the relay: one bidi stream and one datagram, both
 //! must come back echoed. Exits 0 on success, 1 on failure or timeout; a
-//! refused session prints `wt-rejected <status>`.
+//! refused session prints `wt-rejected <status>`. `WT_HOST` names the
+//! server (and turns certificate checks off, for a tunnel's wildcard host).
+//!
+//! The fifth argument `game` runs a game-like session against
+//! wt-slow-server's `/push` instead: streams both ways, opened by either
+//! side, one of each kind, and a datagram.
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -60,6 +65,91 @@ const Client = struct {
     }
 };
 
+/// The `game` session: what each stream must have carried when it ends.
+const Game = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+    const a = std.heap.page_allocator;
+    /// What arrived on each stream, and whether it ended.
+    got: std.AutoArrayHashMapUnmanaged(u64, std.ArrayListUnmanaged(u8)) = .empty,
+    ended: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
+    ours: u64 = 0,
+    /// The server's bidirectional stream, answered once it said hello.
+    theirs: ?u64 = null,
+    answered: bool = false,
+    datagram_ok: bool = false,
+    failed: bool = false,
+    rejected: ?[3]u8 = null,
+
+    pub fn onSessionReady(self: *Game, session: *event_loop.ClientSession, session_id: u64, _: []const quic.qpack.Header) void {
+        var buf: [500]u8 = undefined;
+        @memset(&buf, 'b');
+        self.ours = session.openBidiStream(session_id, null) catch return self.fail(session);
+        session.sendStreamData(self.ours, &buf) catch return self.fail(session);
+        session.closeStream(self.ours);
+        const uni = session.openUniStream(session_id, null) catch return self.fail(session);
+        session.sendStreamData(uni, buf[0..300]) catch return self.fail(session);
+        session.closeStream(uni);
+        session.sendDatagram(session_id, "ping") catch return self.fail(session);
+    }
+
+    pub fn onBidiStream(self: *Game, _: *event_loop.ClientSession, _: u64, stream_id: u64) void {
+        self.theirs = stream_id;
+    }
+
+    pub fn onStreamData(self: *Game, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+        const gop = self.got.getOrPut(a, stream_id) catch return self.fail(session);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.appendSlice(a, data) catch return self.fail(session);
+        if (fin) self.ended.put(a, stream_id, {}) catch return self.fail(session);
+        if (self.theirs == stream_id and !self.answered and std.mem.eql(u8, gop.value_ptr.items, "bidi-hello")) {
+            self.answered = true;
+            session.sendStreamData(stream_id, "xyz") catch return self.fail(session);
+            session.closeStream(stream_id);
+        }
+        if (self.done()) session.closeConnection();
+    }
+
+    pub fn onDatagram(self: *Game, session: *event_loop.ClientSession, _: u64, data: []const u8) void {
+        if (std.mem.eql(u8, data, "ping")) self.datagram_ok = true;
+        if (self.done()) session.closeConnection();
+    }
+
+    pub fn onSessionRejected(self: *Game, session: *event_loop.ClientSession, _: u64, status: []const u8) void {
+        self.rejected = if (status.len == 3) status[0..3].* else "???".*;
+        self.fail(session);
+    }
+
+    fn ended_with(self: *Game, want: []const u8) bool {
+        for (self.ended.keys()) |id| if (std.mem.eql(u8, self.got.get(id).?.items, want)) return true;
+        return false;
+    }
+
+    fn done(self: *Game) bool {
+        return self.datagram_ok and self.ended_with("got 500") and self.ended_with("got 300") and
+            self.ended_with("uni-hello") and self.ended_with("bidi-hellogot 3");
+    }
+
+    fn fail(self: *Game, session: *event_loop.ClientSession) void {
+        self.failed = true;
+        session.closeConnection();
+    }
+
+    fn report(self: *Game) u8 {
+        if (self.rejected) |status| {
+            std.debug.print("wt-rejected {s}\n", .{&status});
+            return 1;
+        }
+        if (!self.failed and self.done()) {
+            std.debug.print("wt-ok\n", .{});
+            return 0;
+        }
+        std.debug.print("wt-fail datagram={}", .{self.datagram_ok});
+        for (self.got.keys(), self.got.values()) |id, v| std.debug.print(" {d}{s}='{s}'", .{ id, if (self.ended.contains(id)) "" else "(open)", v.items });
+        std.debug.print("\n", .{});
+        return 1;
+    }
+};
+
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const port = try std.fmt.parseInt(u16, args[1], 10);
@@ -80,12 +170,29 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "x-forwarded-proto", .value = "http" },
     };
 
+    const host = init.environ_map.get("WT_HOST");
+    const path = if (args.len > 4) args[4] else "/.well-known/webtransport";
+    if (args.len > 5 and std.mem.eql(u8, args[5], "game")) {
+        var game: Game = .{};
+        var gc = try event_loop.Client(Game).init(std.heap.page_allocator, &game, .{
+            .port = port,
+            .server_name = host orelse "localhost",
+            .ca = .{ .file = ca },
+            .skip_cert_verify = host != null,
+            .path = path,
+        });
+        defer gc.deinit();
+        try gc.run();
+        return game.report();
+    }
+
     var handler: Client = .{ .payload = payload, .flood = flood_mib > 0, .headers_only = headers_only };
     var client = try event_loop.Client(Client).init(std.heap.page_allocator, &handler, .{
         .port = port,
-        .server_name = "localhost",
+        .server_name = host orelse "localhost",
         .ca = .{ .file = ca },
-        .path = if (args.len > 4) args[4] else "/.well-known/webtransport",
+        .skip_cert_verify = host != null,
+        .path = path,
         .connect_headers = if (headers_only) &forged else &.{},
     });
     defer client.deinit();
