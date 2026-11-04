@@ -236,6 +236,8 @@ start_edge
 for n in game authd $ANON; do wait_status $n 200 300; done
 wait_status ws 400 300  # its server answers a plain GET so
 check unnamed-kept-name "$(grep -c . "$WORK/anon.out") $(grep -c 'draining this session' "$WORK/anon.log")" "1 2"
+# On the new generation by the restart, so told to drain a second time.
+check moved-before-restart "$(grep -c 'draining this session' "$WORK/game.log")" 2
 check edge-restart "$(get_status game) $(get_status authd) $(python3 "$HERE/tunnel_ws.py" ws.play.test:28080 28080)" "200 200 ws-ok"
 
 if grep -qiE "panic|segmentation|reached unreachable" "$WORK"/*.log; then

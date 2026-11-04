@@ -198,6 +198,8 @@ pub const Agent = struct {
     /// The URL last announced, to say so only when it changes.
     url: std.ArrayListUnmanaged(u8) = .empty,
     backoff_ms: u32 = 0,
+    /// Between tries the edge refuses while we take over a draining session.
+    refused_ms: u32 = 0,
     reconnect: timers.Deadline = .{ .callback = onReconnect },
     quitting: bool = false,
     /// The edge's addresses, tried in turn: a name like `localhost` gives
@@ -205,6 +207,9 @@ pub const Agent = struct {
     addrs: [8]std.Io.net.IpAddress = undefined,
     addr_count: usize = 0,
     addr_index: usize = 0,
+    /// The last address a session came up on, first again when the name is
+    /// resolved anew.
+    good: ?std.Io.net.IpAddress = null,
 
     /// The CONNECT's headers. Clients borrow them, so they are never freed.
     fn connectHeaders(self: *Agent) ![]const qpack.Header {
@@ -223,7 +228,7 @@ pub const Agent = struct {
     fn connect(self: *Agent) void {
         self.open() catch |err| {
             log.warn("cannot reach {s}:{d}: {s}", .{ self.opts.host, self.opts.port, @errorName(err) });
-            self.retryLater(false);
+            self.retryLater(.backoff);
         };
     }
 
@@ -233,7 +238,13 @@ pub const Agent = struct {
     }
 
     fn open(self: *Agent) !void {
-        if (self.addr_count == 0) self.addr_count = try addr.resolveAll(self.opts.host, self.opts.port, &self.addrs);
+        if (self.addr_count == 0) {
+            self.addr_count = try addr.resolveAll(self.opts.host, self.opts.port, &self.addrs);
+            if (self.good) |*g| for (self.addrs[0..self.addr_count], 0..) |*a, i| if (a.eql(g)) {
+                std.mem.swap(std.Io.net.IpAddress, &self.addrs[0], &self.addrs[i]);
+                break;
+            };
+        }
         const ip = self.addrs[self.addr_index];
         var ip_buf: [64]u8 = undefined;
         const c = try self.alloc.create(Conn);
@@ -267,18 +278,40 @@ pub const Agent = struct {
         self.conn = c;
     }
 
-    /// `next_address`: this one never answered, so try the edge's next at
-    /// once; past the last, wait and resolve again.
-    fn retryLater(self: *Agent, next_address: bool) void {
+    const Retry = enum {
+        /// The handshake never finished: the edge's next address at once;
+        /// past the last, wait and resolve again.
+        next_address,
+        /// The edge answered CONNECTION_REFUSED, so this address works.
+        refused,
+        /// Anything else, after the backoff.
+        backoff,
+    };
+
+    fn retryLater(self: *Agent, how: Retry) void {
         if (self.quitting) return self.finish();
-        if (next_address) {
-            self.addr_index += 1;
-            if (self.addr_index < self.addr_count) return self.timers.set(&self.reconnect, 0);
-            self.addr_index = 0;
-            self.addr_count = 0;
+        switch (how) {
+            .next_address => {
+                self.addr_index += 1;
+                if (self.addr_index < self.addr_count) return self.timers.set(&self.reconnect, 0);
+                self.addr_index = 0;
+                self.addr_count = 0;
+            },
+            // Taking over from a reloading edge, whose draining workers refuse
+            // what the kernel hands them: a fresh socket may hash to a new one.
+            .refused => if (self.old != null) {
+                self.refused_ms = if (self.refused_ms == 0) 100 else @min(self.refused_ms * 2, 1000);
+                return self.timers.set(&self.reconnect, self.refused_ms);
+            },
+            .backoff => {},
         }
         self.backoff_ms = if (self.backoff_ms == 0) 500 else @min(self.backoff_ms * 2, max_backoff_ms);
         self.timers.set(&self.reconnect, self.backoff_ms);
+    }
+
+    fn refusedByEdge(c: *Conn) bool {
+        const e = c.client.conn.local_err orelse return false;
+        return !e.is_app and e.code == @backingInt(quic.frame.TransportError.connection_refused);
     }
 
     /// Let `c` go: its pipes close, and it is freed once off the loop.
@@ -298,7 +331,10 @@ pub const Agent = struct {
         if (self.conn == c) {
             self.conn = null;
             if (c.state == .ready) log.warn("session to the edge lost; reconnecting", .{});
-            self.retryLater(c.state == .connecting);
+            self.retryLater(switch (c.state) {
+                .connecting => if (refusedByEdge(c)) .refused else .next_address,
+                else => .backoff,
+            });
         }
     }
 
@@ -334,8 +370,9 @@ pub const Agent = struct {
             log.info("closing the tunnel", .{});
             self.finish();
         }
-        // So is one whose handshake ran past `handshake_ms`.
-        if (self.conn) |c| if (c.client.conn.isClosed()) self.retire(c);
+        // So is one whose handshake ran past `handshake_ms`, or that the edge
+        // closed before it was up (no need to sit out the draining period).
+        if (self.conn) |c| if (c.client.conn.isClosed() or (c.state == .connecting and c.client.conn.isDraining())) self.retire(c);
         if (self.old) |c| {
             const taken_over = if (self.conn) |n| n.state == .ready else false;
             if (c.client.conn.isClosed() or (taken_over and self.pipesOn(c) == 0)) self.retire(c);
@@ -363,7 +400,9 @@ pub const Agent = struct {
         c.sid = sid;
         c.state = .ready;
         self.backoff_ms = 0;
+        self.refused_ms = 0;
         // Reconnect to this address first.
+        self.good = self.addrs[self.addr_index];
         if (self.addr_index != 0) {
             std.mem.swap(std.Io.net.IpAddress, &self.addrs[0], &self.addrs[self.addr_index]);
             self.addr_index = 0;
