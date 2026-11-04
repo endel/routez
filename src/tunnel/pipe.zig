@@ -1,7 +1,7 @@
-//! A stream of a tunnel's WebTransport session paired with a socket: bytes
-//! both ways, nothing parsed. At the edge the socket is one end of a
-//! socketpair whose other end is an upstream connection of the HTTP proxy;
-//! at the agent it is a connection to the local server.
+//! A WebTransport stream paired with a socket: bytes both ways, nothing
+//! parsed. At the edge the socket is one end of a socketpair whose other
+//! end is an upstream connection of the HTTP proxy, or a player's stream on
+//! another worker; at the agent it is a connection to the local server.
 //!
 //! Backpressure as in the WebTransport relay: reading the stream pauses
 //! while the socket has more than `high_water` queued, and reading the
@@ -13,6 +13,7 @@
 //! Endings map one to one: a socket's FIN is the stream's FIN and a reset
 //! (or any failure) is a stream reset, both ways, so an upstream body read
 //! until the close ends complete only when the local server closed cleanly.
+//! Each way ends on its own (a half-close); the socket closes once both have.
 const std = @import("std");
 const socket = @import("../net/socket.zig");
 const wt = @import("../h3/wt_relay.zig");
@@ -89,11 +90,24 @@ pub fn Pipe(comptime Owner: type, comptime connects: bool) type {
 
         // ---- the stream ----
 
+        /// The stream only comes in: nothing goes out on it (a peer's
+        /// unidirectional stream).
+        pub fn inOnly(self: *Self) void {
+            self.sent_end = true;
+        }
+
+        /// The stream only goes out: the socket hears at once that nothing
+        /// will come.
+        pub fn outOnly(self: *Self) void {
+            self.recv_end = true;
+            self.sock.shutdownAfterFlush();
+        }
+
         pub fn onStreamData(self: *Self, data: []const u8, fin: bool) void {
             if (data.len > 0) self.sock.write(data);
             if (fin) {
                 self.recv_end = true;
-                return self.sock.closeAfterFlush();
+                return if (self.sent_end) self.sock.closeAfterFlush() else self.sock.shutdownAfterFlush();
             }
             if (!self.stream_paused and self.sock.buffered() > high_water) {
                 const l = self.link orelse return;
@@ -115,7 +129,10 @@ pub fn Pipe(comptime Owner: type, comptime connects: bool) type {
             var s = l.session();
             const fin = self.held.fin;
             if (!wt.drain(self.alloc(), &s, l.sid, self.stream, &self.held)) return;
-            if (fin) self.sent_end = true;
+            if (fin) {
+                self.sent_end = true;
+                if (self.recv_end) return self.sock.closeAfterFlush();
+            }
             self.checkPaused();
         }
 
@@ -146,7 +163,7 @@ pub fn Pipe(comptime Owner: type, comptime connects: bool) type {
 
         /// The session is gone: nothing more goes on the stream, and the
         /// socket closes.
-        fn detach(self: *Self) void {
+        pub fn detach(self: *Self) void {
             self.link = null;
             self.sent_end = true;
             self.recv_end = true;
@@ -185,10 +202,11 @@ pub fn Pipe(comptime Owner: type, comptime connects: bool) type {
                 self.endStream(true);
                 return self.sock.reset();
             }
+            // Held bytes go first; `onWritable` sends the FIN after them.
             if (self.held.empty()) self.endStream(false) else self.held.fin = true;
             // The other direction may still be running; the stream's own
             // end closes the socket.
-            if (self.recv_end) self.sock.closeAfterFlush();
+            if (self.recv_end and self.sent_end) self.sock.closeAfterFlush();
         }
 
         pub fn onSocketWritable(self: *Self) void {

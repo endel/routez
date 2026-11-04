@@ -136,6 +136,62 @@ check slow-client-body "$(wc -c < "$WORK/slow.bin" | tr -d ' ')" 24000000
 check slow-client-edge "$([ $((edge_peak - EDGE_BASE)) -lt 16384 ] && echo bounded || echo "grew $((edge_peak - EDGE_BASE)) KB")" bounded
 check slow-client-agent "$([ $((agent_peak - AGENT_BASE)) -lt 16384 ] && echo bounded || echo "grew $((agent_peak - AGENT_BASE)) KB")" bounded
 
+# Players' WebTransport sessions: the agent opens each again on its local
+# WebTransport server, and streams (either side's, either kind) and
+# datagrams go both ways.
+(cd "$ROOT" && zig build wt-test-client wt-slow-server) || exit 1
+WTC="$ROOT/zig-out/bin/wt-test-client"
+"$ROOT/zig-out/bin/wt-slow-server" 29004 "$CERTS/server.crt" "$CERTS/server.key" >/dev/null 2>&1 & PIDS+=($!)
+agent wt 29001 --wt 29004; WTA=$AGENT
+agent wtdown 29001 --wt 29098  # no WebTransport server there
+for n in wt wtdown; do wait_file "$WORK/$n.out" 100 || echo "agent $n never opened: $(tail -3 "$WORK/$n.log")"; done
+# wt NAME TENTHS ARGS...: start the test client on NAME's tunnel; its pid in WTP.
+wt_start() { local name=$1; shift; WT_HOST=$name.play.test "$WTC" 28443 "$CERTS/ca.crt" "$@" > "$WORK/wtc.log" 2>&1 & WTP=$!; }
+# ...and its verdict, waiting up to TENTHS.
+wt_verdict() {
+    for _ in $(seq 1 "$1"); do kill -0 $WTP 2>/dev/null || break; nap 0.1; done
+    kill $WTP 2>/dev/null; wait $WTP 2>/dev/null
+    grep -o 'wt-ok\|wt-fail.*\|wt-rejected [0-9]*' "$WORK/wtc.log" | head -1
+}
+wt() { local name=$1 t=$2; shift 2; wt_start "$name" "$@"; wt_verdict "$t"; }
+check wt-game "$(wt wt 100 0 /push game)" wt-ok
+grep -q wt-ok "$WORK/wtc.log" || cat "$WORK/wtc.log"
+# A player's connection lands on any worker: until one has crossed, more.
+if [ "$(uname -s)" == Linux ] && [ "$WORKERS" -gt 1 ]; then
+    games=""
+    for _ in $(seq 1 12); do
+        [ "$(metric routez_tunnel_player_sessions_cross_worker_total)" -gt 0 ] && break
+        games="$games$(wt wt 100 0 /push game) "
+    done
+    check wt-cross-worker "$([ "$(metric routez_tunnel_player_sessions_cross_worker_total)" -gt 0 ] && echo crossed) $(tr ' ' '\n' <<< "$games" | grep -v '^wt-ok$' | grep -c .)" "crossed 0"
+fi
+check wt-forwarded "$(wt wt 100 0 /h headers) $(grep '^echo-' "$WORK/wtc.log" | sort | paste -sd '|' -)" \
+    "wt-ok echo-x-forwarded-for: 203.0.113.7, 127.0.0.1|echo-x-forwarded-host: wt.play.test|echo-x-forwarded-proto: https|echo-x-real-ip: 127.0.0.1"
+check wt-unknown-tunnel "$(wt nope 50 0 /push game)" "wt-rejected 404"
+check wt-local-down "$(wt wtdown 150 0 /push game)" "wt-rejected 502"
+# 24 MiB into a server reading ~8 MB/s: the edge and the agent hold the
+# player back. Holding costs the paused streams' receive windows (6 MiB
+# each) and the socket buffers; buffering it all would cost 24 MB on each.
+EDGE_BASE=$(rss $EDGE); AGENT_BASE=$(rss $WTA); edge_peak=$EDGE_BASE; agent_peak=$AGENT_BASE
+wt_start wt 24 /flood
+for _ in $(seq 1 600); do
+    kill -0 $WTP 2>/dev/null || break
+    e=$(rss $EDGE); a=$(rss $WTA)
+    [ "$e" -gt "$edge_peak" ] && edge_peak=$e; [ "$a" -gt "$agent_peak" ] && agent_peak=$a
+    nap 0.1
+done
+check wt-flood "$(wt_verdict 1)" wt-ok; echo "wt-flood growth: edge $((edge_peak - EDGE_BASE)) KB, agent $((agent_peak - AGENT_BASE)) KB"
+check wt-flood-edge "$([ $((edge_peak - EDGE_BASE)) -lt 32768 ] && echo bounded || echo "grew $((edge_peak - EDGE_BASE)) KB")" bounded
+check wt-flood-agent "$([ $((agent_peak - AGENT_BASE)) -lt 32768 ] && echo bounded || echo "grew $((agent_peak - AGENT_BASE)) KB")" bounded
+wait_metric() { for _ in $(seq 1 50); do [ "$(metric "$1")" == "$2" ] && break; nap 0.1; done; metric "$1"; }
+check wt-sessions-closed "$(wait_metric routez_tunnel_player_sessions 0)" 0
+# The agent goes mid-session: the player's session ends at once, not at an
+# idle timeout.
+wt_start wt 48 /flood
+for _ in $(seq 1 50); do [ "$(metric routez_tunnel_player_sessions)" == 1 ] && break; nap 0.1; done
+nap 0.5; kill -INT $WTA
+check wt-agent-gone "$(wt_verdict 50 | cut -c1-7) $(wait_metric routez_tunnel_player_sessions 0)" "wt-fail 0"
+
 # A second agent asking for a held name hears 409 and keeps trying.
 agent game 29001; DUP=$AGENT
 for _ in $(seq 1 50); do grep -q 409 "$WORK/game.log" && break; nap 0.1; done

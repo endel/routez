@@ -107,6 +107,10 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         failed: bool = false,
         /// Closing with a reset: see `reset`.
         resetting: bool = false,
+        /// `shutdownAfterFlush` was asked for: nothing more is queued, and
+        /// the write side shuts once what is goes out.
+        shut_after_flush: bool = false,
+        write_shut: bool = false,
         /// Completions the owner armed against this fd. The close waits for
         /// them: on epoll a disarm after the fd is gone fails the ctl.
         external: u8 = 0,
@@ -235,7 +239,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
 
         /// Queue bytes for sending. Dropped silently once the socket is closing.
         pub fn write(self: *Self, data_in: []const u8) void {
-            if (self.state != .open) return;
+            if (self.state != .open or self.shut_after_flush) return;
             if (data_in.len == 0) return;
             self.queued_total += data_in.len;
             var data = data_in;
@@ -394,6 +398,10 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                 }
                 if (self.pending.items.len == 0) {
                     if (self.state == .flushing) self.finishFlush();
+                    if (self.shut_after_flush and !self.write_shut) {
+                        self.write_shut = true;
+                        _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.WR);
+                    }
                     return;
                 }
                 std.mem.swap(std.ArrayListUnmanaged(u8), &self.active, &self.pending);
@@ -502,6 +510,14 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         pub fn closeAfterFlush(self: *Self) void {
             if (self.state != .open) return;
             self.state = .flushing;
+            if (!self.writing and !self.connecting) self.kickWrite();
+        }
+
+        /// Send what is queued, then shut the write side and go on reading:
+        /// the peer sees our end of the bytes while its own keep coming.
+        pub fn shutdownAfterFlush(self: *Self) void {
+            if (self.state != .open or self.shut_after_flush) return;
+            self.shut_after_flush = true;
             if (!self.writing and !self.connecting) self.kickWrite();
         }
 

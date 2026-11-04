@@ -59,7 +59,7 @@ pub const writable_chunk = 16 * 1024;
 
 /// Forward `data` to `dst`, holding whatever its session credit
 /// refuses. False when bytes are held and the source must pause.
-fn forward(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held, data: []const u8, fin: bool) bool {
+pub fn forward(a: std.mem.Allocator, dst: anytype, session_id: u64, stream: u64, held: *Held, data: []const u8, fin: bool) bool {
     var rest = data;
     if (held.empty()) {
         if (data.len > 0) rest = data[sendSome(dst, stream, data)..];
@@ -295,18 +295,9 @@ pub fn Relay(comptime Listener: type) type {
             pub fn onSessionReady(self: *UpHandler, _: *event_loop.ClientSession, session_id: u64, headers: []const qpack.Header) void {
                 const r = self.rs() orelse return;
                 r.up_sid = session_id;
-                // Relay the negotiated subprotocol and other end-to-end headers.
                 var extra: [32]qpack.Header = undefined;
-                var n: usize = 0;
-                for (headers) |h| {
-                    if (h.name.len == 0 or h.name[0] == ':') continue;
-                    if (common.isHopByHop(h.name) or std.mem.eql(u8, h.name, "date") or std.mem.eql(u8, h.name, "server")) continue;
-                    if (n == extra.len) break;
-                    extra[n] = h;
-                    n += 1;
-                }
                 var d = r.down();
-                d.acceptSessionWithHeaders(r.down_sid, extra[0..n]) catch return r.close(relay_error, "accept failed", false, false);
+                d.acceptSessionWithHeaders(r.down_sid, endToEnd(headers, &extra)) catch return r.close(relay_error, "accept failed", false, false);
                 r.accepted = true;
             }
 
@@ -429,6 +420,7 @@ pub fn Relay(comptime Listener: type) type {
         fn proceed(self: *Self, l: *Listener, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header, loc: *const Location) void {
             const w = l.worker;
             if (loc.tunnel_accept) |ta| return w.tunnels.accept(session, session_id, headers, ta);
+            if (loc.tunnel_pass) return w.tunnels.connectPlayer(session, session_id, path, headers);
             const group = w.findGroup(loc.webtransport_pass.?) orelse return refuse(session, session_id);
             var client_buf: [64]u8 = undefined;
             const client_addr = socket.formatIpKey(clientIp(w, session, headers), &client_buf);
@@ -438,12 +430,6 @@ pub fn Relay(comptime Listener: type) type {
                 log.warn("relay to {s}: {s}", .{ peer.label, @errorName(err) });
                 refuse(session, session_id);
             };
-        }
-
-        /// The one a trusted proxy names in the CONNECT's headers, else the peer.
-        fn clientIp(w: *Worker, session: *event_loop.Session, headers: []const qpack.Header) [16]u8 {
-            const peer = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
-            return realip.fromHeaders(&w.shared.real_ip, peer, headers) orelse peer;
         }
 
         fn refuse(session: *event_loop.Session, session_id: u64) void {
@@ -522,10 +508,7 @@ pub fn Relay(comptime Listener: type) type {
             const arena = r.arena_state.allocator();
 
             // Everything the client config borrows lives in the session arena.
-            var hop_buf: [64]u8 = undefined;
-            var client_buf: [64]u8 = undefined;
-            const hop = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
-            const fwd = try forwardHeaders(arena, headers, socket.formatIpKey(hop, &hop_buf), socket.formatIpKey(clientIp(w, session, headers), &client_buf));
+            const fwd = try forwardFor(arena, w, session, headers);
             var addr_buf: [64]u8 = undefined;
             const addr_text = try arena.dupe(u8, socket.formatIp(peer.addr, &addr_buf));
 
@@ -670,6 +653,36 @@ pub fn Relay(comptime Listener: type) type {
             }
         }
     };
+}
+
+/// The client of a CONNECT: the one a trusted proxy names in its headers,
+/// else the peer.
+pub fn clientIp(w: *Worker, session: *event_loop.Session, headers: []const qpack.Header) [16]u8 {
+    const peer = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
+    return realip.fromHeaders(&w.shared.real_ip, peer, headers) orelse peer;
+}
+
+/// `forwardHeaders` for a CONNECT that came on `session`.
+pub fn forwardFor(arena: std.mem.Allocator, w: *Worker, session: *event_loop.Session, headers: []const qpack.Header) ![]qpack.Header {
+    var hop_buf: [64]u8 = undefined;
+    var client_buf: [64]u8 = undefined;
+    const hop = socket.ipKey(session.entry.conn.peerAddress()) orelse @as([16]u8, @splat(0));
+    return forwardHeaders(arena, headers, socket.formatIpKey(hop, &hop_buf), socket.formatIpKey(clientIp(w, session, headers), &client_buf));
+}
+
+/// Of an upstream's answer to a CONNECT, the headers its client gets: the
+/// negotiated subprotocol and the other end-to-end ones, as many as `out`
+/// holds.
+pub fn endToEnd(headers: []const qpack.Header, out: []qpack.Header) []qpack.Header {
+    var n: usize = 0;
+    for (headers) |h| {
+        if (h.name.len == 0 or h.name[0] == ':') continue;
+        if (common.isHopByHop(h.name) or std.mem.eql(u8, h.name, "date") or std.mem.eql(u8, h.name, "server")) continue;
+        if (n == out.len) break;
+        out[n] = h;
+        n += 1;
+    }
+    return out[0..n];
 }
 
 /// The CONNECT's headers for the upstream: the end-to-end ones as they came,

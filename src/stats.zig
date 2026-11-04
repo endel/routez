@@ -60,6 +60,10 @@ pub var quic_steered: std.atomic.Value(u64) = .init(0);
 pub var tunnels_open: std.atomic.Value(u64) = .init(0);
 pub var tunnel_streams: std.atomic.Value(u64) = .init(0);
 pub var tunnel_streams_cross_worker: std.atomic.Value(u64) = .init(0);
+/// Players' WebTransport sessions open through tunnels, and those ever
+/// opened on a worker other than the tunnel's.
+pub var tunnel_player_sessions: std.atomic.Value(u64) = .init(0);
+pub var tunnel_player_sessions_cross_worker: std.atomic.Value(u64) = .init(0);
 /// Finished responses by protocol (HTTP/1.x, HTTP/3) and status class.
 pub var responses: [2][5]Counter = @splat(@splat(.{}));
 /// Request and response body bytes, the latter as sent (compressed).
@@ -285,6 +289,10 @@ pub fn prometheus(w: *std.Io.Writer, upstreams: []const UpstreamView, clients: ?
     try w.print("routez_tunnel_streams_total {d}\n", .{load(&tunnel_streams)});
     try header(w, "routez_tunnel_streams_cross_worker_total", "counter", "Tunnel streams for a request on a worker other than the tunnel's.");
     try w.print("routez_tunnel_streams_cross_worker_total {d}\n", .{load(&tunnel_streams_cross_worker)});
+    try header(w, "routez_tunnel_player_sessions", "gauge", "Players' WebTransport sessions open through tunnels.");
+    try w.print("routez_tunnel_player_sessions {d}\n", .{load(&tunnel_player_sessions)});
+    try header(w, "routez_tunnel_player_sessions_cross_worker_total", "counter", "Players' WebTransport sessions on a worker other than their tunnel's.");
+    try w.print("routez_tunnel_player_sessions_cross_worker_total {d}\n", .{load(&tunnel_player_sessions_cross_worker)});
 
     try header(w, "routez_upstream_requests_total", "counter", "Requests (retries included), WebTransport sessions and UDP flows sent to an upstream server.");
     for (upstreams) |u| try w.print("routez_upstream_requests_total{{upstream=\"{f}\",server=\"{f}\"}} {d}\n", .{ label(u.stats.upstream), label(u.stats.server), load(&u.stats.requests) });

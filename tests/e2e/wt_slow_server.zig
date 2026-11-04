@@ -4,6 +4,12 @@
 //! holds a fast client back instead of buffering. Usage: PORT CERT KEY
 //! [CREDIT_KIB], the last granting each session only that much WebTransport
 //! session credit (WT_MAX_DATA), so a sender runs into it.
+//!
+//! Like a game server, it also opens streams of its own: a session on
+//! `/push` gets a unidirectional "uni-hello" and a bidirectional stream that
+//! starts "bidi-hello" and answers like the others. A unidirectional stream
+//! from the client is answered on one of the server's, and datagrams are
+//! echoed.
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -17,6 +23,8 @@ const Handler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
     /// Keyed by connection and stream: stream ids restart on every connection.
     streams: std.AutoHashMapUnmanaged(Key, Stream) = .empty,
+    /// Each connection's session, for the streams we open.
+    sessions: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
     const Key = struct { conn: u64, stream: u64 };
 
@@ -27,11 +35,12 @@ const Handler = struct {
         var it = self.streams.keyIterator();
         while (it.next()) |k| if (k.conn == session.id()) doomed.append(std.heap.page_allocator, k.*) catch {};
         for (doomed.items) |k| _ = self.streams.remove(k);
+        _ = self.sessions.remove(session.id());
     }
 
     /// Answers each forwarding header the relay sent as `echo-<name>`, which
     /// the relay passes back to the client.
-    pub fn onConnectRequest(_: *Handler, session: *event_loop.Session, session_id: u64, _: []const u8, headers: []const quic.qpack.Header) void {
+    pub fn onConnectRequest(self: *Handler, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const quic.qpack.Header) void {
         var names: [4][32]u8 = undefined;
         var echo: [4]quic.qpack.Header = undefined;
         var n: usize = 0;
@@ -42,6 +51,17 @@ const Handler = struct {
             n += 1;
         }
         session.acceptSessionWithHeaders(session_id, echo[0..n]) catch {};
+        self.sessions.put(std.heap.page_allocator, session.id(), session_id) catch {};
+        if (!std.mem.eql(u8, path, "/push")) return;
+        const uni = session.openUniStream(session_id, null) catch return;
+        session.sendStreamData(uni, "uni-hello") catch {};
+        session.closeStream(uni);
+        const bidi = session.openBidiStream(session_id, null) catch return;
+        session.sendStreamData(bidi, "bidi-hello") catch {};
+    }
+
+    pub fn onDatagram(_: *Handler, session: *event_loop.Session, session_id: u64, data: []const u8) void {
+        session.sendDatagram(session_id, data) catch {};
     }
 
     pub fn onStreamData(self: *Handler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
@@ -53,8 +73,16 @@ const Handler = struct {
         s.window += data.len;
         if (fin) {
             var buf: [32]u8 = undefined;
-            session.sendStreamData(stream_id, std.fmt.bufPrint(&buf, "got {d}", .{s.total}) catch unreachable) catch {};
-            session.closeStream(stream_id);
+            const got = std.fmt.bufPrint(&buf, "got {d}", .{s.total}) catch unreachable;
+            // The client's unidirectional streams (ids 2 mod 4) can't carry the answer.
+            const reply = if (stream_id & 3 == 2) blk: {
+                const sid = self.sessions.get(session.id()) orelse break :blk null;
+                break :blk session.openUniStream(sid, null) catch null;
+            } else stream_id;
+            if (reply) |r| {
+                session.sendStreamData(r, got) catch {};
+                session.closeStream(r);
+            }
             _ = self.streams.remove(key);
             return;
         }

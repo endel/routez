@@ -5,7 +5,9 @@
 //! stream on the session for each upstream connection its proxy makes to
 //! the tunnel (`edge.zig`); the agent connects each stream to the local
 //! server and pipes the two together (`pipe.zig`). The stream carries the
-//! proxy's HTTP/1.1 as-is, WebSocket upgrades included.
+//! proxy's HTTP/1.1 as-is, WebSocket upgrades included. A player's
+//! WebTransport session comes as streams of its own (`wire.zig`), which the
+//! agent opens again on the local server (`local_wt.zig`).
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
@@ -18,13 +20,17 @@ const socket = @import("../net/socket.zig");
 const timers = @import("../timers.zig");
 const pipe_mod = @import("pipe.zig");
 const edge = @import("edge.zig");
+const wire = @import("wire.zig");
+const local_wt = @import("local_wt.zig");
 
 const log = std.log.scoped(.tunnel);
 
 pub const usage =
-    \\usage: routez tunnel [-n name] [-u user:password] [--ca file] [-k] <edge-url> <local>
+    \\usage: routez tunnel [-n name] [-u user:password] [--ca file] [-k] [--wt local] <edge-url> <local>
     \\  <edge-url>  https://host[:port]/path of the edge's tunnel_accept location
     \\  <local>     port, or host:port, of the server to share (host 127.0.0.1)
+    \\  --wt local  where players' WebTransport sessions go, over UDP (default:
+    \\              <local>); its certificate isn't checked
     \\  -n name     ask for this name (default: the edge picks one)
     \\  -u user:password  for a location with auth_basic
     \\  --ca file   trust this CA bundle (PEM) for the edge, not the system's
@@ -40,6 +46,10 @@ const max_backoff_ms = 5_000;
 /// A handshake that hasn't finished by then moves on to the edge's next
 /// address.
 const handshake_ms = 3_000;
+/// Streams the edge may have open on the session at once: one per upstream
+/// connection, one per player's WebTransport session and one per stream of
+/// it.
+const max_streams = 1000;
 
 const Options = struct {
     host: []const u8,
@@ -47,6 +57,9 @@ const Options = struct {
     path: []const u8,
     local: std.Io.net.IpAddress,
     local_label: []const u8,
+    /// Players' WebTransport sessions go here.
+    wt: std.Io.net.IpAddress,
+    wt_host: []const u8,
     name: ?[]const u8 = null,
     auth: ?[]const u8 = null,
     ca: ?[]const u8 = null,
@@ -94,6 +107,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
     var name: ?[]const u8 = null;
     var auth: ?[]const u8 = null;
     var ca: ?[]const u8 = null;
+    var wt_text: ?[]const u8 = null;
     var insecure = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -101,10 +115,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return error.Help;
         if (std.mem.eql(u8, arg, "-k")) {
             insecure = true;
-        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--ca")) {
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--ca") or std.mem.eql(u8, arg, "--wt")) {
             i += 1;
             if (i == args.len) return error.MissingValue;
-            if (arg[1] == 'n') name = args[i] else if (arg[1] == 'u') auth = args[i] else ca = args[i];
+            if (arg[1] == 'n') name = args[i] else if (arg[1] == 'u') auth = args[i] else if (arg[2] == 'c') ca = args[i] else wt_text = args[i];
         } else {
             if (n == positional.len) return error.TooManyArguments;
             positional[n] = arg;
@@ -119,19 +133,18 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
     const hp = config.parseHostPortOr(rest[0..slash], 443) catch return error.BadEdgeHost;
     const path = if (slash < rest.len) rest[slash..] else "/";
 
-    const local_text = positional[1];
-    const local: config.HostPort = if (std.fmt.parseInt(u16, local_text, 10)) |port|
-        .{ .host = "127.0.0.1", .port = port }
-    else |_|
-        config.parseHostPort(local_text) catch return error.LocalNeedsPort;
-    if (local.port == 0) return error.LocalNeedsPort;
+    const local = try parseLocal(positional[1]);
     const ip = addr.resolve(local.host, local.port) catch return error.CannotResolveLocal;
+    const wt_local = if (wt_text) |t| try parseLocal(t) else local;
+    const wt_ip = addr.resolve(wt_local.host, wt_local.port) catch return error.CannotResolveLocal;
     return .{
         .host = hp.host,
         .port = hp.port,
         .path = path,
         .local = ip,
         .local_label = try std.fmt.allocPrint(arena, "{s}:{d}", .{ local.host, local.port }),
+        .wt = wt_ip,
+        .wt_host = wt_local.host,
         .name = name,
         .auth = auth,
         .ca = ca,
@@ -139,10 +152,23 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
     };
 }
 
+/// A port, or host:port; the host is 127.0.0.1 unless named.
+fn parseLocal(text: []const u8) !config.HostPort {
+    const hp: config.HostPort = if (std.fmt.parseInt(u16, text, 10)) |port|
+        .{ .host = "127.0.0.1", .port = port }
+    else |_|
+        config.parseHostPort(text) catch return error.LocalNeedsPort;
+    if (hp.port == 0) return error.LocalNeedsPort;
+    return hp;
+}
+
 const AgentPipe = pipe_mod.Pipe(Agent, true);
 const Client = event_loop.Client(Handler);
 
-const Agent = struct {
+/// An edge-opened stream until its head says what it carries.
+const Fresh = struct { head: [wire.max_head]u8 = undefined, len: usize = 0 };
+
+pub const Agent = struct {
     pub const Link = Conn;
 
     alloc: std.mem.Allocator,
@@ -163,6 +189,12 @@ const Agent = struct {
     next_serial: u64 = 1,
     /// By connection serial and stream.
     pipes: AgentPipe.Set = .{},
+    /// Edge-opened streams whose head is still coming, likewise.
+    fresh: std.AutoHashMapUnmanaged(local_wt.Key, Fresh) = .empty,
+    /// Players' WebTransport sessions.
+    wt: local_wt.Sessions = .{},
+    /// A datagram for the edge, behind its session's token.
+    datagram_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// The URL last announced, to say so only when it changes.
     url: std.ArrayListUnmanaged(u8) = .empty,
     backoff_ms: u32 = 0,
@@ -223,6 +255,12 @@ const Agent = struct {
                 .max_datagram_frame_size = (event_loop.ClientConfig{}).max_datagram_frame_size,
                 .keep_alive_period = keepalive_ms,
                 .handshake_timeout = handshake_ms,
+                .initial_max_streams_bidi = max_streams,
+            },
+            .wt_credits = credits: {
+                var cr: quic.webtransport_flow_control.Credits = .default;
+                cr.max_streams_bidi = max_streams;
+                break :credits cr;
             },
         });
         c.client.start();
@@ -249,6 +287,12 @@ const Agent = struct {
         c.retired = true;
         if (self.old == c) self.old = null;
         self.pipes.detach(c);
+        self.wt.detach(c);
+        var it = self.fresh.keyIterator();
+        while (it.next()) |k| if (k.conn == c.serial) {
+            self.fresh.removeByPtr(k);
+            it = self.fresh.keyIterator();
+        };
         c.client.stop();
         self.retired.append(self.alloc, c) catch {};
         if (self.conn == c) {
@@ -279,7 +323,7 @@ const Agent = struct {
     }
 
     fn pipesOn(self: *Agent, c: *Conn) usize {
-        var n: usize = 0;
+        var n: usize = self.wt.on(c);
         for (self.pipes.map.values()) |p| n += @intFromBool(p.link == c);
         return n;
     }
@@ -297,6 +341,7 @@ const Agent = struct {
             if (c.client.conn.isClosed() or (taken_over and self.pipesOn(c) == 0)) self.retire(c);
         }
         self.pipes.checkPaused();
+        self.wt.tick();
         var i: usize = 0;
         while (i < self.retired.items.len) {
             const c = self.retired.items[i];
@@ -308,7 +353,7 @@ const Agent = struct {
             c.client.deinit();
             self.alloc.destroy(c);
         }
-        if (self.quitting and self.conn == null and self.retired.items.len == 0 and self.pipes.map.count() == 0) {
+        if (self.quitting and self.conn == null and self.retired.items.len == 0 and self.pipes.map.count() == 0 and self.wt.idle()) {
             self.timers.stop();
             self.loop.stop();
         }
@@ -360,18 +405,63 @@ const Agent = struct {
         self.retire(c);
     }
 
-    fn openPipe(self: *Agent, c: *Conn, stream: u64) void {
+    /// The edge opened a stream: what it carries is in its first bytes.
+    fn freshStream(self: *Agent, c: *Conn, stream: u64) void {
+        self.fresh.put(self.alloc, .{ .conn = c.serial, .stream = stream }, .{}) catch {
+            var s = c.session();
+            refuseStream(&s, stream);
+        };
+    }
+
+    /// More of a fresh stream; false when `stream` isn't one.
+    fn freshData(self: *Agent, c: *Conn, stream: u64, data: []const u8, fin: bool) bool {
+        const key: local_wt.Key = .{ .conn = c.serial, .stream = stream };
+        const f = self.fresh.getPtr(key) orelse return false;
+        var s = c.session();
+        const take = @min(data.len, f.head.len - f.len);
+        @memcpy(f.head[f.len..][0..take], data[0..take]);
+        const before = f.len;
+        f.len += take;
+        const parsed = wire.parseHead(f.head[0..f.len]) catch {
+            _ = self.fresh.remove(key);
+            refuseStream(&s, stream);
+            return true;
+        };
+        const h = parsed orelse {
+            if (fin) {
+                _ = self.fresh.remove(key);
+                refuseStream(&s, stream);
+            }
+            return true;
+        };
+        _ = self.fresh.remove(key);
+        const rest = data[h.len - before ..];
+        switch (h.kind) {
+            .http => if (self.openPipe(c, stream)) |p| if (rest.len > 0 or fin) p.onStreamData(rest, fin),
+            .session => self.wt.openSession(c, stream, h.token, rest, fin),
+            .stream => self.wt.openStream(c, stream, h.token, h.uni, rest, fin),
+        }
+        return true;
+    }
+
+    fn openPipe(self: *Agent, c: *Conn, stream: u64) ?*AgentPipe {
         const p = self.alloc.create(AgentPipe) catch {
             var s = c.session();
-            return s.resetStream(stream, pipe_mod.gone_error);
+            s.resetStream(stream, pipe_mod.gone_error);
+            return null;
         };
         p.* = .{ .owner = self, .link = c, .conn = c.serial, .stream = stream, .sock = undefined };
         p.sock.connect(p, &self.loop, &self.timers, self.alloc, self.opts.local) catch {
             self.alloc.destroy(p);
             var s = c.session();
-            return s.resetStream(stream, pipe_mod.gone_error);
+            s.resetStream(stream, pipe_mod.gone_error);
+            return null;
         };
-        self.pipes.add(self.alloc, p) catch return p.sock.abort();
+        self.pipes.add(self.alloc, p) catch {
+            p.sock.abort();
+            return null;
+        };
+        return p;
     }
 
     /// The local server didn't answer: the edge's proxy gets a 502 saying so.
@@ -386,8 +476,13 @@ const Agent = struct {
     }
 };
 
+fn refuseStream(s: *event_loop.ClientSession, stream: u64) void {
+    s.resetStream(stream, pipe_mod.gone_error);
+    s.stopSending(stream, pipe_mod.gone_error);
+}
+
 /// One connection to the edge, and its session.
-const Conn = struct {
+pub const Conn = struct {
     agent: *Agent,
     /// Tells this connection's pipes from an earlier one's: stream ids
     /// start over on each.
@@ -443,7 +538,7 @@ const Handler = struct {
 
     pub fn onBidiStream(self: *Handler, _: *event_loop.ClientSession, _: u64, stream_id: u64) void {
         const c = self.live() orelse return;
-        c.agent.openPipe(c, stream_id);
+        c.agent.freshStream(c, stream_id);
     }
 
     pub fn onUniStream(_: *Handler, session: *event_loop.ClientSession, _: u64, stream_id: u64) void {
@@ -451,19 +546,36 @@ const Handler = struct {
     }
 
     pub fn onStreamData(self: *Handler, _: *event_loop.ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
-        if (self.pipe(stream_id)) |p| p.onStreamData(data, fin);
+        if (self.pipe(stream_id)) |p| return p.onStreamData(data, fin);
+        const c = self.live() orelse return;
+        if (c.agent.wt.onTunnelData(c, stream_id, data, fin)) return;
+        _ = c.agent.freshData(c, stream_id, data, fin);
     }
 
-    pub fn onStreamReset(self: *Handler, _: *event_loop.ClientSession, _: u64, stream_id: u64, _: u32) void {
-        if (self.pipe(stream_id)) |p| p.onStreamAbort();
+    pub fn onStreamReset(self: *Handler, _: *event_loop.ClientSession, _: u64, stream_id: u64, error_code: u32) void {
+        self.onAbort(stream_id, true, error_code);
     }
 
-    pub fn onStopSending(self: *Handler, _: *event_loop.ClientSession, _: u64, stream_id: u64, _: u32) void {
-        if (self.pipe(stream_id)) |p| p.onStreamAbort();
+    pub fn onStopSending(self: *Handler, _: *event_loop.ClientSession, _: u64, stream_id: u64, error_code: u32) void {
+        self.onAbort(stream_id, false, error_code);
+    }
+
+    fn onAbort(self: *Handler, stream_id: u64, reset: bool, error_code: u32) void {
+        if (self.pipe(stream_id)) |p| return p.onStreamAbort();
+        const c = self.live() orelse return;
+        if (c.agent.wt.onTunnelAbort(c, stream_id, reset, error_code)) return;
+        _ = c.agent.fresh.remove(.{ .conn = c.serial, .stream = stream_id });
     }
 
     pub fn onWritable(self: *Handler, _: *event_loop.ClientSession, _: u64, stream_id: ?u64) void {
-        if (self.pipe(stream_id)) |p| p.onWritable();
+        if (self.pipe(stream_id)) |p| return p.onWritable();
+        const c = self.live() orelse return;
+        _ = c.agent.wt.onTunnelWritable(c, stream_id orelse return);
+    }
+
+    pub fn onDatagram(self: *Handler, _: *event_loop.ClientSession, _: u64, data: []const u8) void {
+        const c = self.live() orelse return;
+        c.agent.wt.onTunnelDatagram(c, data);
     }
 };
 

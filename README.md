@@ -32,8 +32,8 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   UDP proxy for QUIC traffic, with QUIC-LB connection-ID routing.
 - Tunnels, ngrok-style: `routez tunnel https://edge.example.com/.tunnel 2567`
   shares a server on your machine at `https://<name>.play.example.com`
-  through an edge running routez, WebSockets included, with no port opened
-  on your side. See [Tunnels](#tunnels).
+  through an edge running routez, WebSockets and WebTransport included, with
+  no port opened on your side. See [Tunnels](#tunnels).
 - Worker threads with SO_REUSEPORT. Graceful shutdown on SIGINT/SIGTERM:
   keep-alive connections close once idle, after the client has been sent
   every byte of its last response (queued output and `sendfile` ranges
@@ -845,12 +845,19 @@ routez tunnel -n mygame -u dev:secret https://play.example.com/.tunnel 2567
   `Host` and the client in `X-Forwarded-For` / `X-Real-IP`.
 - The agent connects each request's upstream connection to the local
   server; if nothing answers there, the client gets a 502 saying so.
+- A player's WebTransport session on a `tunnel_pass` host goes to the agent,
+  which opens the same session on the local server, over UDP at the same
+  port unless `--wt` names another: streams opened by either side, both
+  kinds, and datagrams. The session's CONNECT carries `X-Forwarded-For` and
+  `X-Real-IP`, and the player gets the local server's answer (its status, or
+  its subprotocol). Nothing answering there is a 502.
 - It reconnects by itself when the session drops, and when the edge
   reloads or stops it opens a new session before the old one goes, so a
   `SIGHUP` on the edge doesn't interrupt a playtest. Ctrl-C closes the
   session, freeing the name at once.
-- `routez_tunnels_open` and `routez_tunnel_streams_total` in
-  [metrics](#operations) count tunnels and the connections carried to them.
+- `routez_tunnels_open`, `routez_tunnel_streams_total` and
+  `routez_tunnel_player_sessions` in [metrics](#operations) count tunnels,
+  the connections carried to them and players' WebTransport sessions open.
 
 ### Operations
 
@@ -1342,10 +1349,13 @@ to the app directly.
 - During a reload, new QUIC connections that the kernel hands to the old
   generation's sockets are refused until it finishes draining (up to 10 s);
   browsers fall back to TCP meanwhile.
-- Tunnels carry the HTTP proxy's connections, so WebTransport and plain UDP
-  don't reach a tunnelled server yet: a game sharing one that way needs its
-  WebSocket fallback. A tunnel carries at most 100 connections at once (the
-  agent's QUIC stream limit); past that, requests get a 502.
+- Tunnels carry HTTP (WebSockets included) and WebTransport, not plain UDP.
+  A tunnel carries at most 1000 streams the edge opens at once (one per
+  upstream connection, one per player's WebTransport session and one per
+  stream a player opens); past that, requests get a 502 and players' streams
+  are refused. A local server may have 100 of its own open at once. A
+  player's datagram loses 1 to 8 bytes of room to the session's token on the
+  way to the agent.
 - An agent that is killed rather than stopped holds its name until the
   edge's QUIC idle timeout (30 s by default); started again meanwhile, it
   waits for the name.

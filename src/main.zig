@@ -559,6 +559,7 @@ test {
     _ = @import("tunnel/registry.zig");
     _ = @import("tunnel/edge.zig");
     _ = @import("tunnel/agent.zig");
+    _ = @import("tunnel/wire.zig");
     _ = @import("browser_check.zig");
     _ = @import("cluster.zig");
     _ = @import("handlers/check.zig");

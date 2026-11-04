@@ -364,6 +364,8 @@ pub const Location = struct {
     /// Proxy requests down the tunnel named by the first label of the
     /// request's host, as `proxy_pass` does to an upstream: `game.play.example.com`
     /// reaches the agent that opened `game`. 404 when no such tunnel is open.
+    /// A WebTransport session (HTTP/3 only) goes down it too: the agent
+    /// opens the same session on its local server.
     tunnel_pass: bool = false,
 
     /// Answer with a fixed status and body, or redirect.
@@ -427,7 +429,7 @@ pub const Location = struct {
 
     /// Whether a WebTransport CONNECT (HTTP/3 only) means anything here.
     pub fn takesWebTransport(self: *const Location) bool {
-        return self.webtransport_pass != null or self.tunnel_accept != null;
+        return self.webtransport_pass != null or self.tunnel_accept != null or self.tunnel_pass;
     }
 
     pub const Match = enum { prefix, exact, regex };
