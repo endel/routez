@@ -21,6 +21,11 @@ fn onForeign(ctx: ?*anyopaque, dg: *const event_loop.ForeignDatagram) void {
     steering.registry.route(w.io, dg);
 }
 
+fn onNewWhileDraining(ctx: ?*anyopaque, dg: *const event_loop.ForeignDatagram) bool {
+    const w: *Worker = @ptrCast(@alignCast(ctx.?));
+    return steering.registry.routeNew(w.io, dg);
+}
+
 /// quic-zig asks before an Initial opens a connection.
 fn admitSource(ctx: ?*anyopaque, peer: *const std.posix.sockaddr.storage) bool {
     const w: *Worker = @ptrCast(@alignCast(ctx.?));
@@ -127,6 +132,8 @@ pub fn Listener(comptime proto: event_loop.Protocol) type {
                 // our packets after a client's address changes can pass them on.
                 .quic_lb = steering.lbConfig(w.id),
                 .foreign_datagram = .{ .ctx = w, .func = onForeign },
+                // Draining, a newcomer goes to a worker that takes it (a reload's).
+                .new_while_draining = .{ .ctx = w, .func = onNewWhileDraining },
                 .source_filter = .{ .ctx = w, .func = admitSource },
                 .retry_token_key = w.shared.quic_keys.retry,
                 .static_reset_key = w.shared.quic_keys.reset,

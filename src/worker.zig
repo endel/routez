@@ -580,6 +580,8 @@ pub const Worker = struct {
         for (self.listeners.items) |l| l.start();
         for (self.udp_proxies.items) |u| u.start();
         for (self.quic_listeners.items) |q| q.start();
+        for (self.quic_listeners.items) |q| steering.registry.startAccepting(self.io, self.alloc, steering.serverId(self.id), q.port(), &self.inbox) catch {};
+        defer steering.registry.stopAccepting(self.io, steering.serverId(self.id));
         try self.loop.run(.until_done);
         self.microcache.deinit();
         self.files.deinit();
@@ -641,6 +643,8 @@ pub const Worker = struct {
         for (self.groups.items) |g| {
             for (g.peers) |*p| p.closeIdle();
         }
+        // Off the list before draining, so no newcomer is handed back here.
+        steering.registry.stopAccepting(self.io, steering.serverId(self.id));
         // GOAWAY: in-flight HTTP/3 requests finish, new ones go elsewhere.
         for (self.quic_listeners.items) |q| q.drain();
         self.tunnels.drain();

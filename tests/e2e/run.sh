@@ -325,16 +325,24 @@ check close-notify "$(cut_get $B/tls/cut/close-notify)" "1000 0"
 check health "$(grep -c '19005 is unhealthy' "$WORK/server.log")" 0
 
 # Reload: edit the config, SIGHUP, keep serving throughout.
+(cd "$ROOT" && zig build h3-test-client) || exit 1
 (for i in $(seq 1 100); do $CURL_BIN -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/ping; done > "$WORK/reload_codes.txt") & LOOP=$!
+# A 3 s request keeps the old generation's worker, and its QUIC socket, draining.
+$CURL_BIN -s -o /dev/null http://127.0.0.1:18080/slowup/hold & HOLD=$!
+perl -e 'select(undef,undef,undef,0.2)'
 python3 -c "import sys; p=sys.argv[1]; s=open(p).read().replace('pong\\\\n', 'pong2\\\\n'); open(p,'w').write(s)" "$WORK/routez.zon"
 kill -HUP $SERVER
 for _ in $(seq 1 50); do [ "$($CURL_BIN -s http://127.0.0.1:18080/ping)" == pong2 ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
-wait $LOOP
-# The old generation keeps its QUIC socket until it has drained; wait it out
-# so the QUIC checks below don't land on it.
+# Meanwhile the kernel hands the draining worker its share of new QUIC
+# connections (on Linux), which it passes to the new one instead of refusing.
+# All at once, inside the hold; not curl, which quietly retries a refused one.
+H3_RELOAD=$( (for _ in $(seq 1 30); do ("$ROOT/zig-out/bin/h3-test-client" 18443 "$CERTS/ca.crt" 1 2>&1 | grep -o 'h3-ok\|h3-fail' | tail -1) & done; wait) | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')
+wait $LOOP; wait $HOLD
+# Let the old generation finish, so the checks below see only the new one.
 for _ in $(seq 1 100); do grep -q "worker 0 stopped" "$WORK/server.log" && break; perl -e 'select(undef,undef,undef,0.1)'; done
 SUITE=reload check reload-applied "$($CURL_BIN -s http://127.0.0.1:18080/ping)" "pong2"
 SUITE=reload check reload-no-errors "$(sort -u "$WORK/reload_codes.txt" | tr '\n' ' ')" "200 "
+SUITE=reload check reload-h3-none-refused "$H3_RELOAD" "h3-ok:30 "
 
 SUITE=limits check per-ip-limit "$(python3 "$HERE/conn_limit.py" 25)" 5
 # The held connections' closes race the next accept, which the per-IP
