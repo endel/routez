@@ -146,11 +146,13 @@ agent wt 29001 --wt 29004; WTA=$AGENT
 agent wtdown 29001 --wt 29098  # no WebTransport server there
 for n in wt wtdown; do wait_file "$WORK/$n.out" 100 || echo "agent $n never opened: $(tail -3 "$WORK/$n.log")"; done
 # wt NAME TENTHS ARGS...: start the test client on NAME's tunnel; its pid in WTP.
-wt_start() { local name=$1; shift; WT_HOST=$name.play.test "$WTC" 28443 "$CERTS/ca.crt" "$@" > "$WORK/wtc.log" 2>&1 & WTP=$!; }
-# ...and its verdict, waiting up to TENTHS.
+wt_start() { local name=$1; shift; WTARGS="$name $*"; WT_HOST=$name.play.test "$WTC" 28443 "$CERTS/ca.crt" "$@" > "$WORK/wtc.log" 2>&1 & WTP=$!; }
+# ...and its verdict, waiting up to TENTHS. Each client's last lines go to
+# wtc-all.log too, as the next client overwrites wtc.log.
 wt_verdict() {
     for _ in $(seq 1 "$1"); do kill -0 $WTP 2>/dev/null || break; nap 0.1; done
     kill $WTP 2>/dev/null; wait $WTP 2>/dev/null
+    { echo "=== $(date +%T) $WTARGS"; tail -100 "$WORK/wtc.log"; } >> "$WORK/wtc-all.log"
     grep -o 'wt-ok\|wt-fail.*\|wt-rejected [0-9]*' "$WORK/wtc.log" | head -1
 }
 wt() { local name=$1 t=$2; shift 2; wt_start "$name" "$@"; wt_verdict "$t"; }
@@ -185,6 +187,9 @@ check wt-flood-edge "$([ $((edge_peak - EDGE_BASE)) -lt 32768 ] && echo bounded 
 check wt-flood-agent "$([ $((agent_peak - AGENT_BASE)) -lt 32768 ] && echo bounded || echo "grew $((agent_peak - AGENT_BASE)) KB")" bounded
 wait_metric() { for _ in $(seq 1 50); do [ "$(metric "$1")" == "$2" ] && break; nap 0.1; done; metric "$1"; }
 check wt-sessions-closed "$(wait_metric routez_tunnel_player_sessions 0)" 0
+# Streams the local server opens as it accepts can reach the player's worker
+# before its accept does; right after a flood they mostly do.
+check wt-game-after-flood "$(wt wt 100 0 /push game)" wt-ok
 # The agent goes mid-session: the player's session ends at once, not at an
 # idle timeout.
 wt_start wt 48 /flood
@@ -236,6 +241,8 @@ start_edge
 for n in game authd $ANON; do wait_status $n 200 300; done
 wait_status ws 400 300  # its server answers a plain GET so
 check unnamed-kept-name "$(grep -c . "$WORK/anon.out") $(grep -c 'draining this session' "$WORK/anon.log")" "1 2"
+# On the new generation by the restart, so told to drain a second time.
+check moved-before-restart "$(grep -c 'draining this session' "$WORK/game.log")" 2
 check edge-restart "$(get_status game) $(get_status authd) $(python3 "$HERE/tunnel_ws.py" ws.play.test:28080 28080)" "200 200 ws-ok"
 
 if grep -qiE "panic|segmentation|reached unreachable" "$WORK"/*.log; then
