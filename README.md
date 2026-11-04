@@ -40,8 +40,9 @@ and [quic-zig](../quic-zig). No C dependencies beyond libc.
   included); HTTP/3 connections get GOAWAY and finish their requests. All
   within a 10 s limit, after which what is left is closed.
 - Reload on SIGHUP: new workers start on the new config beside the old ones,
-  taking over their TCP listening sockets, and the old ones drain. A config
-  that fails to load is rejected and the running one kept.
+  taking over their TCP listening sockets, and the old ones drain, passing
+  any new QUIC connection that reaches them to a new one. A config that fails
+  to load is rejected and the running one kept.
 - Locations matched as nginx does: exact paths, longest prefix (optionally
   ending the search, like `^~`) and regular expressions, case-sensitive or
   not, on a linear-time engine, so no pattern can be turned into a ReDoS.
@@ -1346,9 +1347,6 @@ to the app directly.
 - HTTP/3 requests are logged when their response is produced, not when
   the client has acknowledged it: a stream reset or lost connection after
   that isn't reflected in `$body_bytes_sent` or `$request_completion`.
-- During a reload, new QUIC connections that the kernel hands to the old
-  generation's sockets are refused until it finishes draining (up to 10 s);
-  browsers fall back to TCP meanwhile.
 - Tunnels carry HTTP (WebSockets included) and WebTransport, not plain UDP.
   A tunnel carries at most 1000 streams the edge opens at once (one per
   upstream connection, one per player's WebTransport session and one per
