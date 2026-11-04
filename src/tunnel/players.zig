@@ -166,25 +166,25 @@ pub const Players = struct {
 
     // ---- from the agent, through the inbox ----
 
-    /// The local server opened a stream: open the player's, on `fd`.
+    /// The local server opened a stream: open the player's, on `fd`. One
+    /// opened as the local server accepted can beat its accept here: the
+    /// accept comes over the control socket, the stream through the inbox.
     pub fn openStream(self: *Players, token: u64, uni: bool, fd: std.posix.fd_t) void {
         const p = self.by_token.get(token) orelse {
             _ = std.c.close(fd);
             return;
         };
-        if (p.state != .accepted) {
-            _ = std.c.close(fd);
-            return;
+        switch (p.state) {
+            .accepted => p.openStream(uni, fd),
+            .waiting => if (p.early.items.len < Player.max_early) {
+                p.early.append(p.alloc(), .{ .fd = fd, .uni = uni }) catch {
+                    _ = std.c.close(fd);
+                };
+            } else {
+                _ = std.c.close(fd);
+            },
+            .gone => _ = std.c.close(fd),
         }
-        var s = p.link.session();
-        const stream = (if (uni) s.openUniStream(p.link.sid, null) else s.openBidiStream(p.link.sid, null)) catch |err| {
-            log.warn("a player's session: no stream for the local server's: {s}", .{@errorName(err)});
-            _ = std.c.close(fd);
-            return;
-        };
-        const pipe = self.edge().newPipe(&p.link, stream, fd) orelse return s.resetStream(stream, pipe_mod.gone_error);
-        if (uni) pipe.outOnly();
-        pipe.sock.startReading();
     }
 
     pub fn datagram(self: *Players, token: u64, bytes: []const u8) void {
@@ -212,9 +212,33 @@ pub const Player = struct {
     ctl: socket.Socket(Player, false),
     reader: wire.Reader = .{},
     state: enum { waiting, accepted, gone } = .waiting,
+    /// The local server's streams that came before its accept, in order.
+    early: std.ArrayListUnmanaged(Early) = .empty,
+
+    const Early = struct { fd: std.posix.fd_t, uni: bool };
+    /// More than this before the accept is no game server's opening.
+    const max_early = 64;
 
     fn alloc(p: *Player) std.mem.Allocator {
         return p.players.edge().worker.alloc;
+    }
+
+    fn openStream(p: *Player, uni: bool, fd: std.posix.fd_t) void {
+        var s = p.link.session();
+        const stream = (if (uni) s.openUniStream(p.link.sid, null) else s.openBidiStream(p.link.sid, null)) catch |err| {
+            log.warn("a player's session: no stream for the local server's: {s}", .{@errorName(err)});
+            _ = std.c.close(fd);
+            return;
+        };
+        const pipe = p.players.edge().newPipe(&p.link, stream, fd) orelse return s.resetStream(stream, pipe_mod.gone_error);
+        if (uni) pipe.outOnly();
+        pipe.sock.startReading();
+    }
+
+    /// Closing them tells the agent, as the local server's streams' resets.
+    fn dropEarly(p: *Player) void {
+        for (p.early.items) |e| _ = std.c.close(e.fd);
+        p.early.clearAndFree(p.alloc());
     }
 
     /// The player's side ended: the agent hears why, and the rest closes.
@@ -247,6 +271,7 @@ pub const Player = struct {
         stats.dec(&stats.tunnel_player_sessions);
         p.forget();
         p.players.edge().pipes.detach(&p.link);
+        p.dropEarly();
         p.state = .gone;
     }
 
@@ -264,6 +289,7 @@ pub const Player = struct {
     }
 
     fn free(p: *Player) void {
+        p.dropEarly();
         p.reader.deinit(p.alloc());
         p.alloc().destroy(p);
     }
@@ -278,6 +304,8 @@ pub const Player = struct {
                 const hs = encoded.decode(&got) catch return p.fail("bad accept");
                 s.acceptSessionWithHeaders(p.link.sid, wt_relay.endToEnd(hs, &extra)) catch return p.fail("accept failed");
                 p.state = .accepted;
+                for (p.early.items) |e| p.openStream(e.uni, e.fd);
+                p.early.clearAndFree(p.alloc());
             },
             .refuse => |status| {
                 if (p.state != .waiting) return p.fail("refused once accepted");
