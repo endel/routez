@@ -25,17 +25,7 @@ const browser_check = @import("browser_check.zig");
 const build_options = @import("build_options");
 const tunnel_agent = @import("tunnel/agent.zig");
 
-pub const std_options: std.Options = .{
-    // Everything is compiled in; `log_level` in the config filters at run time.
-    .log_level = .debug,
-    .logFn = logs.logFn,
-    // quic-zig logs every handshake step and frame on the default scope.
-    .log_scope_levels = &.{
-        // quic-zig reports a peer's normal CONNECTION_CLOSE as a warning.
-        .{ .scope = .default, .level = .err },
-        .{ .scope = .event_loop, .level = .warn },
-    },
-};
+pub const std_options = logs.std_options;
 
 const log = std.log.scoped(.main);
 
@@ -418,7 +408,7 @@ fn loadUpstreamCas(arena: std.mem.Allocator, cfg: *const config.Config) ![]const
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len > 1 and std.mem.eql(u8, args[1], "tunnel")) return tunnel_agent.main(arena, args[2..]);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "tunnel")) return tunnel_agent.main(arena, "routez tunnel", args[2..], init.environ_map);
     if (args.len > 1 and std.mem.eql(u8, args[1], "ctl")) {
         const custom = args.len > 3 and std.mem.eql(u8, args[2], "-s");
         const words = args[if (custom) 4 else 2..];

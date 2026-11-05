@@ -856,6 +856,13 @@ routez tunnel -n mygame -u dev:secret https://play.example.com/.tunnel 2567
   reloads or stops it opens a new session before the old one goes, so a
   `SIGHUP` on the edge doesn't interrupt a playtest. Ctrl-C closes the
   session, freeing the name at once.
+- `ROUTEZ_TUNNEL_AUTH=user:password` in the environment does what `-u`
+  does, out of other users' sight in `ps`. `zig build tunnel-agent` builds
+  the tunnel agent alone, as `routez-tunnel-agent` (about 40% of routez's
+  size), for machines that only share.
+- Each tunnel's usage goes to the log at `info`, hourly and when it closes:
+  its `auth_basic` user, the bytes it carried each way and the players'
+  sessions it opened.
 - `routez_tunnels_open`, `routez_tunnel_streams_total` and
   `routez_tunnel_player_sessions` in [metrics](#operations) count tunnels,
   the connections carried to them and players' WebTransport sessions open.

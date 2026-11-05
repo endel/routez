@@ -24,6 +24,10 @@ const low_water = socket.low_water;
 /// WebTransport stream error for "the other side went away".
 pub const gone_error = wt.relay_error;
 
+/// Payload bytes a session's pipes carried: sent on its streams, and
+/// received from them. A link with a `carried` field gets them counted.
+pub const Carried = struct { sent: u64 = 0, received: u64 = 0 };
+
 /// `Owner` outlives its pipes, which it keeps in `pipes: Set`.
 /// `Owner.Link` holds the session: `session()`, `sid` and
 /// `backlog(stream)` (bytes QUIC has yet to send). A link can go before its
@@ -104,6 +108,9 @@ pub fn Pipe(comptime Owner: type, comptime connects: bool) type {
         }
 
         pub fn onStreamData(self: *Self, data: []const u8, fin: bool) void {
+            if (comptime @hasField(Link, "carried")) if (self.link) |l| {
+                l.carried.received += data.len;
+            };
             if (data.len > 0) self.sock.write(data);
             if (fin) {
                 self.recv_end = true;
@@ -183,6 +190,7 @@ pub fn Pipe(comptime Owner: type, comptime connects: bool) type {
         pub fn onSocketData(self: *Self, data: []const u8) void {
             const l = self.link orelse return;
             if (self.sent_end) return;
+            if (comptime @hasField(Link, "carried")) l.carried.sent += data.len;
             var s = l.session();
             var rest = data;
             if (self.held.empty()) rest = data[wt.sendSome(&s, self.stream, data)..];

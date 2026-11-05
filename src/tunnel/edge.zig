@@ -16,6 +16,18 @@
 //! streams for it come back as socketpairs handed to the player's. What
 //! each stream carries is in its first bytes (`wire.zig`).
 //!
+//! Each tunnel's usage goes to the log, hourly and when it closes:
+//!
+//!     tunnel game usage: user=alice secs=3600 to_local=1830 from_local=5242880 player_sessions=2
+//!     tunnel game closed: user=alice secs=412 to_local=0 from_local=0 player_sessions=0
+//!
+//! A line counts from the tunnel's previous one (or its opening), so the sum
+//! of a user's lines is what their tunnels carried. `user` is auth_basic's
+//! (`-` without it); `to_local` and `from_local` are payload bytes on the
+//! tunnel's session, toward the local server and back from it, HTTP and
+//! players' streams and datagrams alike. A tunnel that comes back after a
+//! reload or a reconnect is a new one, so its line restarts the count.
+//!
 //! Known gap: a socketpair has no reset, so a local server resetting its
 //! connection reaches the proxy as a plain close. A body read until the
 //! close can then pass for complete; a sized or chunked one cannot.
@@ -38,6 +50,7 @@ const wire = @import("wire.zig");
 const players = @import("players.zig");
 const Worker = @import("../worker.zig").Worker;
 const stats = @import("../stats.zig");
+const htpasswd = @import("../auth/htpasswd.zig");
 
 const log = std.log.scoped(.tunnel);
 const registry = &reg.registry;
@@ -50,12 +63,20 @@ pub const url_header = "routez-tunnel-url";
 pub const Key = struct { conn: u64, id: u64 };
 pub const EdgePipe = pipe_mod.Pipe(Edge, false);
 
+/// A tunnel's usage line comes this often, and at its close.
+const usage_interval_ms = std.time.ms_per_hour;
+
 /// One agent's session.
 pub const Tunnel = struct {
     link: Edge.Link,
     /// The registry's, for this claim of `name`.
     id: u64,
     name: []u8,
+    /// auth_basic's user, or "-".
+    user: []u8,
+    /// Since the last usage line: when, and players' sessions opened.
+    since_ms: i64,
+    player_sessions: u64 = 0,
 };
 
 /// A stream the agent opened, until its head says where it goes.
@@ -71,6 +92,8 @@ pub const Edge = struct {
     pub const Link = struct {
         entry: *ConnEntry,
         sid: u64,
+        /// Counted by its pipes; read for a tunnel's usage.
+        carried: pipe_mod.Carried = .{},
 
         pub fn session(self: *Link) event_loop.Session {
             return .{ .entry = self.entry };
@@ -131,7 +154,10 @@ pub const Edge = struct {
             a.free(e.key_ptr.*);
         }
         self.groups.deinit(a);
-        for (self.tunnels.values()) |t| self.free(t);
+        for (self.tunnels.values()) |t| {
+            self.logUsage(t, "closed");
+            self.free(t);
+        }
         self.tunnels.deinit(a);
         self.incoming.deinit(a);
         self.pipes.deinit(a);
@@ -145,8 +171,8 @@ pub const Edge = struct {
     // ---- sessions ----
 
     /// A CONNECT to a `tunnel_accept` location, past its checks.
-    pub fn accept(self: *Edge, session: *event_loop.Session, session_id: u64, headers: []const qpack.Header, ta: config.Location.TunnelAccept) void {
-        self.open(session, session_id, headers, ta) catch |err| wt_relay.answer(session, session_id, switch (err) {
+    pub fn accept(self: *Edge, session: *event_loop.Session, session_id: u64, headers: []const qpack.Header, loc: *const config.Location) void {
+        self.open(session, session_id, headers, loc) catch |err| wt_relay.answer(session, session_id, switch (err) {
             error.BadName => "400",
             error.Taken => "409",
             else => "503",
@@ -158,9 +184,14 @@ pub const Edge = struct {
         self.players.connect(session, session_id, path, headers);
     }
 
-    fn open(self: *Edge, session: *event_loop.Session, session_id: u64, headers: []const qpack.Header, ta: config.Location.TunnelAccept) !void {
+    fn open(self: *Edge, session: *event_loop.Session, session_id: u64, headers: []const qpack.Header, loc: *const config.Location) !void {
         const w = self.worker;
         const a = w.alloc;
+        const ta = loc.tunnel_accept.?;
+        // auth_basic has passed the credentials by now.
+        var cred_buf: [htpasswd.max_credentials]u8 = undefined;
+        defer std.crypto.secureZero(u8, &cred_buf);
+        const user = if (w.shared.guards.policy(loc).auth == null) "-" else if (htpasswd.parseAuthorization(findHeader(headers, "authorization") orelse "", &cred_buf)) |c| c.user else "-";
         var name_buf: [63]u8 = undefined;
         var name: []const u8 = undefined;
         var id: u64 = undefined;
@@ -181,8 +212,10 @@ pub const Edge = struct {
         errdefer registry.release(w.io, name, id);
         const t = try a.create(Tunnel);
         errdefer a.destroy(t);
-        t.* = .{ .link = .{ .entry = session.entry, .sid = session_id }, .id = id, .name = try a.dupe(u8, name) };
+        t.* = .{ .link = .{ .entry = session.entry, .sid = session_id }, .id = id, .name = try a.dupe(u8, name), .user = &.{}, .since_ms = w.timers.now_ms };
         errdefer a.free(t.name);
+        t.user = try a.dupe(u8, user);
+        errdefer a.free(t.user);
         const key: Key = .{ .conn = session.id(), .id = session_id };
         try self.tunnels.put(a, key, t);
         errdefer _ = self.tunnels.swapRemove(key);
@@ -194,7 +227,7 @@ pub const Edge = struct {
         });
         stats.inc(&stats.tunnels_open);
         var addr_buf: [64]u8 = undefined;
-        log.info("tunnel {s} open from {s}: {s}", .{ t.name, socket.formatSockaddr(session.entry.conn.peerAddress(), &addr_buf), url });
+        log.info("tunnel {s} open from {s} for {s}: {s}", .{ t.name, socket.formatSockaddr(session.entry.conn.peerAddress(), &addr_buf), t.user, url });
     }
 
     /// The session is over: its pipes close, and its name is free again.
@@ -206,12 +239,24 @@ pub const Edge = struct {
             if (self.incoming.values()[i].tunnel == t) self.incoming.swapRemoveAt(i) else i += 1;
         }
         self.pipes.detach(&t.link);
-        log.info("tunnel {s} closed", .{t.name});
+        self.logUsage(t, "closed");
         stats.dec(&stats.tunnels_open);
         self.free(t);
     }
 
+    /// The line the module's doc describes; the next one counts from here.
+    fn logUsage(self: *Edge, t: *Tunnel, what: []const u8) void {
+        const now = self.worker.timers.now_ms;
+        log.info("tunnel {s} {s}: user={s} secs={d} to_local={d} from_local={d} player_sessions={d}", .{
+            t.name, what, t.user, @divTrunc(now - t.since_ms, std.time.ms_per_s), t.link.carried.sent, t.link.carried.received, t.player_sessions,
+        });
+        t.since_ms = now;
+        t.link.carried = .{};
+        t.player_sessions = 0;
+    }
+
     fn free(self: *Edge, t: *Tunnel) void {
+        self.worker.alloc.free(t.user);
         self.worker.alloc.free(t.name);
         self.worker.alloc.destroy(t);
     }
@@ -307,12 +352,16 @@ pub const Edge = struct {
     pub fn onDatagram(self: *Edge, session: *event_loop.Session, session_id: u64, data: []const u8) bool {
         const t = self.tunnelFor(session, session_id) orelse return self.players.onDatagram(session, session_id, data);
         const token = wire.getVarint(data) orelse return true;
+        t.link.carried.received += data.len - token.len;
         registry.datagramToPlayer(self.worker.io, token.v, t.id, data[token.len..]);
         return true;
     }
 
-    pub fn checkPaused(self: *Edge) void {
+    /// Every tick.
+    pub fn tick(self: *Edge) void {
         self.pipes.checkPaused();
+        const now = self.worker.timers.now_ms;
+        for (self.tunnels.values()) |t| if (now - t.since_ms >= usage_interval_ms) self.logUsage(t, "usage");
     }
 
     // ---- pipes ----
@@ -322,7 +371,8 @@ pub const Edge = struct {
         const self = ud.?;
         self.inbox.drain(&self.handoffs, &self.datagrams);
         for (self.handoffs.items) |h| switch (h.to) {
-            .agent => |id| self.openPipe(id, h.fd),
+            .agent => |id| self.openPipe(id, h.fd, false),
+            .session => |id| self.openPipe(id, h.fd, true),
             .player => |p| self.players.openStream(p.token, p.uni, h.fd),
         };
         self.handoffs.clearRetainingCapacity();
@@ -348,16 +398,19 @@ pub const Edge = struct {
         self.datagram_buf.appendSliceAssumeCapacity(buf[0..wire.putVarint(&buf, token)]);
         self.datagram_buf.appendSliceAssumeCapacity(bytes);
         var s = t.link.session();
-        s.sendDatagram(t.link.sid, self.datagram_buf.items) catch {};
+        s.sendDatagram(t.link.sid, self.datagram_buf.items) catch return;
+        t.link.carried.sent += bytes.len;
     }
 
-    /// A stream to the agent of tunnel `id` for a connection handed over.
-    /// Refused, the connection just closes: the proxy answers 502.
-    fn openPipe(self: *Edge, id: u64, fd: std.posix.fd_t) void {
+    /// A stream to the agent of tunnel `id` for a connection handed over,
+    /// or for a player's new session (`session`). Refused, the connection
+    /// just closes: the proxy answers 502.
+    fn openPipe(self: *Edge, id: u64, fd: std.posix.fd_t, session: bool) void {
         const t = self.tunnelById(id) orelse {
             _ = std.c.close(fd);
             return;
         };
+        if (session) t.player_sessions += 1;
         var s = t.link.session();
         const stream = s.openBidiStream(t.link.sid, null) catch |err| {
             log.warn("tunnel {s}: no stream for a connection: {s}", .{ t.name, @errorName(err) });

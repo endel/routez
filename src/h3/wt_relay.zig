@@ -419,7 +419,7 @@ pub fn Relay(comptime Listener: type) type {
 
         fn proceed(self: *Self, l: *Listener, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header, loc: *const Location) void {
             const w = l.worker;
-            if (loc.tunnel_accept) |ta| return w.tunnels.accept(session, session_id, headers, ta);
+            if (loc.tunnel_accept != null) return w.tunnels.accept(session, session_id, headers, loc);
             if (loc.tunnel_pass) return w.tunnels.connectPlayer(session, session_id, path, headers);
             const group = w.findGroup(loc.webtransport_pass.?) orelse return refuse(session, session_id);
             var client_buf: [64]u8 = undefined;

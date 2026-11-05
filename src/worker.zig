@@ -675,7 +675,7 @@ pub const Worker = struct {
             .wt => |l| l.relay.checkPaused(),
             .h3 => {},
         };
-        self.tunnels.checkPaused();
+        self.tunnels.tick();
         if (self.finishing) return self.pollFinish();
         if (self.stopping and !self.fresh_closed and self.timers.now_ms - self.stop_started_ms >= fresh_grace_ms) {
             // A connection that stays silent mustn't hold up the stop.

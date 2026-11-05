@@ -22,6 +22,8 @@ pub const Handoff = struct {
     to: union(enum) {
         /// Open a stream to the agent of tunnel `id` and relay the fd on it.
         agent: u64,
+        /// The same, for a player's new session: its control stream.
+        session: u64,
         /// Open a stream to the player of session `token`.
         player: struct { token: u64, uni: bool },
     },
@@ -208,13 +210,14 @@ pub const Registry = struct {
         _ = self.sessions.remove(token);
     }
 
-    /// Pass `fd` to session `token`'s tunnel, for a stream to its agent. On
+    /// Pass `fd` to session `token`'s tunnel, for a stream to its agent:
+    /// the session's control stream (`control`), or one of its streams. On
     /// error the caller still owns it.
-    pub fn toAgent(self: *Registry, io: std.Io, token: u64, fd: std.posix.fd_t) error{ NoSession, OutOfMemory }!void {
+    pub fn toAgent(self: *Registry, io: std.Io, token: u64, fd: std.posix.fd_t, control: bool) error{ NoSession, OutOfMemory }!void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const s = self.sessions.get(token) orelse return error.NoSession;
-        try s.agent.push(.{ .fd = fd, .to = .{ .agent = s.tunnel } });
+        try s.agent.push(.{ .fd = fd, .to = if (control) .{ .session = s.tunnel } else .{ .agent = s.tunnel } });
     }
 
     /// Pass `fd` to session `token`'s player, if the session is tunnel
@@ -340,7 +343,7 @@ test "a session's streams and datagrams reach only its own tunnel and player" {
     try std.testing.expectEqual(@as(usize, 1), dgrams.list.items.len);
 
     r.closeSession(io, s.token);
-    try std.testing.expectError(error.NoSession, r.toAgent(io, s.token, -1));
+    try std.testing.expectError(error.NoSession, r.toAgent(io, s.token, -1, false));
     _ = try r.claim(io, "game", &agent);
     _ = try r.openSession(io, "game", &player);
     r.dropInbox(io, &player);

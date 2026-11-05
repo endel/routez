@@ -8,6 +8,19 @@
 const std = @import("std");
 const access_log = @import("access_log.zig");
 
+/// Both roots' (`main.zig`, `tunnel_agent.zig`). Everything is compiled in;
+/// `level` filters at run time.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = logFn,
+    // quic-zig logs every handshake step and frame on the default scope.
+    .log_scope_levels = &.{
+        // quic-zig reports a peer's normal CONNECTION_CLOSE as a warning.
+        .{ .scope = .default, .level = .err },
+        .{ .scope = .event_loop, .level = .warn },
+    },
+};
+
 /// Least severe level logged; `std.log.Level` as an integer.
 pub var level: std.atomic.Value(u8) = .init(@backingInt(std.log.Level.info));
 

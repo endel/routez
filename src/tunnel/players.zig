@@ -97,7 +97,7 @@ pub const Players = struct {
             p.drop();
             return err;
         };
-        registry.toAgent(w.io, s.token, fds[1]) catch |err| {
+        registry.toAgent(w.io, s.token, fds[1], true) catch |err| {
             _ = std.c.close(fds[1]);
             p.forget();
             p.drop();
@@ -149,7 +149,7 @@ pub const Players = struct {
         var head_buf: [wire.max_head]u8 = undefined;
         pipe.sock.write(wire.head(&head_buf, .stream, p.token, !bidi));
         if (!bidi) pipe.inOnly();
-        registry.toAgent(e.worker.io, p.token, fds[1]) catch {
+        registry.toAgent(e.worker.io, p.token, fds[1], false) catch {
             _ = std.c.close(fds[1]);
             pipe.detach();
             return refuse(session, stream, bidi);
