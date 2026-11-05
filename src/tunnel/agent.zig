@@ -431,6 +431,11 @@ pub const Agent = struct {
 
     fn sessionRejected(self: *Agent, c: *Conn, status: []const u8) void {
         c.state = .refused;
+        // Reset or cut off before an answer: an edge reloading or stopping, so try again.
+        if (status.len == 0) {
+            log.info("the edge dropped the session request unanswered; reconnecting", .{});
+            return self.retire(c);
+        }
         const Refusal = struct { why: []const u8 = "", fatal: bool = false };
         const r: Refusal = switch (std.fmt.parseInt(u16, status, 10) catch 0) {
             400 => .{ .why = "the name must be letters, digits and inner hyphens, up to 63", .fatal = true },
