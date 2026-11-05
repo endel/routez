@@ -35,6 +35,10 @@ wait_file() { for _ in $(seq 1 "$2"); do [ -s "$1" ] && return 0; nap 0.1; done;
 wait_status() { for _ in $(seq 1 "${3:-50}"); do [ "$(get_status "$1")" == "$2" ] && return 0; nap 0.1; done; return 1; }
 get_status() { $CURL -o /dev/null -w '%{http_code}' --resolve "$1.play.test:28080:127.0.0.1" "http://$1.play.test:28080/"; }
 rss() { ps -o rss= -p "$1" | tr -d ' '; }
+# FIELD from a tunnel's usage line on stdin.
+field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
+# The edge's first log line matching PATTERN, waiting for it.
+edge_line() { for _ in $(seq 1 50); do grep -q "$1" "$WORK/edge.log" && break; nap 0.1; done; grep -m1 "$1" "$WORK/edge.log"; }
 
 cp "$HERE/htpasswd" "$WORK/htpasswd"
 cat > "$WORK/edge.zon" <<EOF
@@ -73,10 +77,12 @@ start_edge() { "$BIN" "$WORK/edge.zon" 2>> "$WORK/edge.log" & EDGE=$!; PIDS+=($E
 start_edge
 
 # agent NAME LOCAL [options]: a tunnel in the background; its pid in AGENT.
+# STANDALONE=1 runs routez-tunnel-agent rather than `routez tunnel`.
 agent() {
     local name=$1 local=$2; shift 2
+    local cmd=("$BIN" tunnel); [ -n "${STANDALONE:-}" ] && cmd=("$ROOT/zig-out/bin/routez-tunnel-agent")
     : > "$WORK/$name.out"
-    "$BIN" tunnel -n "$name" --ca "$CERTS/ca.crt" "$@" "https://localhost:28443/.tunnel${PATH_SUFFIX:-}" "$local" \
+    "${cmd[@]}" -n "$name" --ca "$CERTS/ca.crt" "$@" "https://localhost:28443/.tunnel${PATH_SUFFIX:-}" "$local" \
         > "$WORK/$name.out" 2>> "$WORK/$name.log" & AGENT=$!; PIDS+=($AGENT)
 }
 agent game 29001; GAME=$AGENT
@@ -196,6 +202,8 @@ wt_start wt 48 /flood
 for _ in $(seq 1 50); do [ "$(metric routez_tunnel_player_sessions)" == 1 ] && break; nap 0.1; done
 nap 0.5; kill -INT $WTA
 check wt-agent-gone "$(wt_verdict 50 | cut -c1-7) $(wait_metric routez_tunnel_player_sessions 0)" "wt-fail 0"
+# Every players' session above, on the closed tunnel's usage line.
+check usage-player-sessions "$(edge_line 'tunnel wt closed:' | field player_sessions)" $((5 + $(wc -w <<< "${games:-}")))
 
 # A second agent asking for a held name hears 409 and keeps trying.
 agent game 29001; DUP=$AGENT
@@ -207,7 +215,9 @@ PATH_SUFFIX=-auth agent authd 29001
 for _ in $(seq 1 50); do kill -0 $AGENT 2>/dev/null || break; nap 0.1; done
 wait $AGENT; code=$?
 check auth-required "$code $(grep -c 'refused the tunnel: 401' "$WORK/authd.log")" "1 1"
-PATH_SUFFIX=-auth agent authd 29001 -u alice:secret
+# The tunnel agent on its own, with the credentials in its environment.
+(cd "$ROOT" && zig build tunnel-agent) || exit 1
+ROUTEZ_TUNNEL_AUTH=alice:secret STANDALONE=1 PATH_SUFFIX=-auth agent authd 29001
 wait_file "$WORK/authd.out" 100
 check auth-ok "$(get_status authd)" 200
 
@@ -216,6 +226,9 @@ kill -INT $GAME
 for _ in $(seq 1 50); do kill -0 $GAME 2>/dev/null || break; nap 0.1; done
 check agent-exits "$(kill -0 $GAME 2>/dev/null && echo running || echo exited)" exited
 check closed-tunnel "$(get_status game)" 404
+# Its usage line: at least the bodies the checks above sent each way.
+u=$(edge_line 'tunnel game closed:')
+check usage-bytes "$([ "$(field to_local <<< "$u")" -ge 10000000 ] && [ "$(field from_local <<< "$u")" -ge 27000000 ] && echo counted || echo "$u")" counted
 agent game 29001; GAME=$AGENT
 wait_file "$WORK/game.out" 100
 check reopened "$(get_status game)" 200
@@ -234,6 +247,7 @@ nap 0.5; kill -HUP $EDGE
 wait $LOOP
 check reload "$(sort "$WORK/reload.txt" | uniq -c | awk '{printf "%s:%s ", $2, $1}')" "200:80 "
 check reload-took-over "$(grep -c 'draining this session' "$WORK/game.log")" 1
+check usage-user "$(edge_line 'tunnel authd closed:' | field user)" alice
 
 # The edge restarts: agents come back by themselves.
 kill $EDGE; wait $EDGE 2>/dev/null

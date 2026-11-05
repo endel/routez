@@ -1,6 +1,7 @@
-//! `routez tunnel`: share a server on this machine through a routez edge.
+//! `routez tunnel`, or `routez-tunnel-agent` on its own (`tunnel_agent.zig`):
+//! share a server on this machine through a routez edge.
 //!
-//! The agent opens a WebTransport session to the edge's `tunnel_accept`
+//! The tunnel agent opens a WebTransport session to the edge's `tunnel_accept`
 //! location and keeps it open, reconnecting when it drops. The edge opens a
 //! stream on the session for each upstream connection its proxy makes to
 //! the tunnel (`edge.zig`); the agent connects each stream to the local
@@ -26,13 +27,14 @@ const local_wt = @import("local_wt.zig");
 const log = std.log.scoped(.tunnel);
 
 pub const usage =
-    \\usage: routez tunnel [-n name] [-u user:password] [--ca file] [-k] [--wt local] <edge-url> <local>
+    \\usage: {s} [-n name] [-u user:password] [--ca file] [-k] [--wt local] <edge-url> <local>
     \\  <edge-url>  https://host[:port]/path of the edge's tunnel_accept location
     \\  <local>     port, or host:port, of the server to share (host 127.0.0.1)
     \\  --wt local  where players' WebTransport sessions go, over UDP (default:
     \\              <local>); its certificate isn't checked
     \\  -n name     ask for this name (default: the edge picks one)
-    \\  -u user:password  for a location with auth_basic
+    \\  -u user:password  for a location with auth_basic; or set
+    \\              ROUTEZ_TUNNEL_AUTH, which other users can't see in ps
     \\  --ca file   trust this CA bundle (PEM) for the edge, not the system's
     \\  -k          accept any certificate from the edge (testing only)
     \\
@@ -74,10 +76,11 @@ fn onQuit(_: std.posix.SIG) callconv(.c) void {
     quit_requested.store(true, .monotonic);
 }
 
-pub fn main(arena: std.mem.Allocator, args: []const []const u8) u8 {
-    const opts = parseArgs(arena, args) catch |err| {
-        if (err != error.Help) std.debug.print("routez tunnel: {s}\n", .{@errorName(err)});
-        std.debug.print("{s}", .{usage});
+/// `prog` names the program in its messages.
+pub fn main(arena: std.mem.Allocator, prog: []const u8, args: []const []const u8, environ: *const std.process.Environ.Map) u8 {
+    const opts = parseArgs(arena, args, environ.get("ROUTEZ_TUNNEL_AUTH")) catch |err| {
+        if (err != error.Help) std.debug.print("{s}: {s}\n", .{ prog, @errorName(err) });
+        std.debug.print(usage, .{prog});
         return 2;
     };
     const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
@@ -101,11 +104,12 @@ pub fn main(arena: std.mem.Allocator, args: []const []const u8) u8 {
     return agent.exit_code;
 }
 
-fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
+/// `env_auth` stands in for a missing `-u`.
+fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_auth: ?[]const u8) !Options {
     var positional: [2][]const u8 = undefined;
     var n: usize = 0;
     var name: ?[]const u8 = null;
-    var auth: ?[]const u8 = null;
+    var auth: ?[]const u8 = if (env_auth) |e| if (e.len > 0) e else null else null;
     var ca: ?[]const u8 = null;
     var wt_text: ?[]const u8 = null;
     var insecure = false;
@@ -330,7 +334,7 @@ pub const Agent = struct {
         self.retired.append(self.alloc, c) catch {};
         if (self.conn == c) {
             self.conn = null;
-            if (c.state == .ready) log.warn("session to the edge lost; reconnecting", .{});
+            if (c.state == .ready and !self.quitting) log.warn("session to the edge lost; reconnecting", .{});
             self.retryLater(switch (c.state) {
                 .connecting => if (refusedByEdge(c)) .refused else .next_address,
                 else => .backoff,
@@ -430,7 +434,7 @@ pub const Agent = struct {
         const Refusal = struct { why: []const u8 = "", fatal: bool = false };
         const r: Refusal = switch (std.fmt.parseInt(u16, status, 10) catch 0) {
             400 => .{ .why = "the name must be letters, digits and inner hyphens, up to 63", .fatal = true },
-            401 => .{ .why = "wrong or missing user and password (-u)", .fatal = true },
+            401 => .{ .why = "wrong or missing user and password (-u, ROUTEZ_TUNNEL_AUTH)", .fatal = true },
             403 => .{ .fatal = true },
             404 => .{ .why = "no tunnel_accept location at that URL", .fatal = true },
             409 => .{ .why = "the name is taken (maybe by our last session, not yet timed out)" },
@@ -623,16 +627,20 @@ test "the edge URL and the local server" {
     var arena_state: std.heap.ArenaAllocator = .init(a);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const o = try parseArgs(arena, &.{ "-n", "game", "https://edge.example:8443/.tunnel", "2567" });
+    const o = try parseArgs(arena, &.{ "-n", "game", "https://edge.example:8443/.tunnel", "2567" }, null);
     try std.testing.expectEqualStrings("edge.example", o.host);
     try std.testing.expectEqual(@as(u16, 8443), o.port);
     try std.testing.expectEqualStrings("/.tunnel", o.path);
     try std.testing.expectEqualStrings("127.0.0.1:2567", o.local_label);
     try std.testing.expectEqualStrings("game", o.name.?);
-    const v6 = try parseArgs(arena, &.{ "https://[::1]", "[::1]:80" });
+    const v6 = try parseArgs(arena, &.{ "https://[::1]", "[::1]:80" }, null);
     try std.testing.expectEqualStrings("::1", v6.host);
     try std.testing.expectEqual(@as(u16, 443), v6.port);
     try std.testing.expectEqualStrings("/", v6.path);
-    try std.testing.expectError(error.EdgeUrlNotHttps, parseArgs(arena, &.{ "http://edge", "80" }));
-    try std.testing.expectError(error.LocalNeedsPort, parseArgs(arena, &.{ "https://edge", "localhost" }));
+    try std.testing.expectError(error.EdgeUrlNotHttps, parseArgs(arena, &.{ "http://edge", "80" }, null));
+    try std.testing.expectError(error.LocalNeedsPort, parseArgs(arena, &.{ "https://edge", "localhost" }, null));
+    // ROUTEZ_TUNNEL_AUTH, unless -u is given.
+    try std.testing.expectEqualStrings("a:b", (try parseArgs(arena, &.{ "https://edge", "80" }, "a:b")).auth.?);
+    try std.testing.expectEqualStrings("c:d", (try parseArgs(arena, &.{ "-u", "c:d", "https://edge", "80" }, "a:b")).auth.?);
+    try std.testing.expect((try parseArgs(arena, &.{ "https://edge", "80" }, "")).auth == null);
 }

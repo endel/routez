@@ -29,6 +29,19 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "routez", .root_module = root_mod });
     b.installArtifact(exe);
 
+    const tunnel_agent = b.addExecutable(.{ .name = "routez-tunnel-agent", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tunnel_agent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = b.option(bool, "strip", "Strip the tunnel agent's debug info"),
+        .imports = &.{
+            .{ .name = "quic", .module = quic_mod },
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
+    }) });
+    b.step("tunnel-agent", "Build the tunnel agent alone, without the server").dependOn(&b.addInstallArtifact(tunnel_agent, .{}).step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
