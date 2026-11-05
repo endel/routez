@@ -334,7 +334,7 @@ pub const Agent = struct {
         self.retired.append(self.alloc, c) catch {};
         if (self.conn == c) {
             self.conn = null;
-            if (c.state == .ready) log.warn("session to the edge lost; reconnecting", .{});
+            if (c.state == .ready and !self.quitting) log.warn("session to the edge lost; reconnecting", .{});
             self.retryLater(switch (c.state) {
                 .connecting => if (refusedByEdge(c)) .refused else .next_address,
                 else => .backoff,
