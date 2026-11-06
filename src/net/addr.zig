@@ -1,4 +1,5 @@
 const std = @import("std");
+const netdb = @import("quic").sys.netdb;
 const IpAddress = std.Io.net.IpAddress;
 
 /// Resolve `host` (literal or name, via getaddrinfo) and `port`. Blocking;
@@ -20,12 +21,12 @@ pub fn resolveAll(host: []const u8, port: u16, out: []IpAddress) !usize {
     const host_z = std.fmt.bufPrintSentinel(&host_buf, "{s}", .{host}, 0) catch return error.NameTooLong;
     var port_buf: [8]u8 = undefined;
     const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch unreachable;
-    var hints = std.mem.zeroes(std.c.addrinfo);
+    var hints = std.mem.zeroes(netdb.addrinfo);
     hints.family = std.posix.AF.UNSPEC;
     hints.socktype = std.posix.SOCK.DGRAM; // one entry per address, not per socket type
-    var res: ?*std.c.addrinfo = null;
-    if (@backingInt(std.c.getaddrinfo(host_z, port_z, &hints, &res)) != 0) return error.UnknownHostName;
-    defer if (res) |r| std.c.freeaddrinfo(r);
+    var res: ?*netdb.addrinfo = null;
+    if (netdb.getaddrinfo(host_z, port_z, &hints, &res) != 0) return error.UnknownHostName;
+    defer if (res) |r| netdb.freeaddrinfo(r);
     var n: usize = 0;
     var it = res;
     while (it) |ai| : (it = ai.next) {
