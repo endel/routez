@@ -18,8 +18,8 @@
 //!
 //! Each tunnel's usage goes to the log, hourly and when it closes:
 //!
-//!     tunnel game usage: user=alice secs=3600 to_local=1830 from_local=5242880 player_sessions=2
-//!     tunnel game closed: user=alice secs=412 to_local=0 from_local=0 player_sessions=0
+//!     tunnel game.play.example.com usage: user=alice secs=3600 to_local=1830 from_local=5242880 player_sessions=2
+//!     tunnel game.play.example.com closed: user=alice secs=412 to_local=0 from_local=0 player_sessions=0
 //!
 //! A line counts from the tunnel's previous one (or its opening), so the sum
 //! of a user's lines is what their tunnels carried. `user` is auth_basic's
@@ -27,6 +27,10 @@
 //! tunnel's session, toward the local server and back from it, HTTP and
 //! players' streams and datagrams alike. A tunnel that comes back after a
 //! reload or a reconnect is a new one, so its line restarts the count.
+//!
+//! A tunnel is its full host, `<name>.<domain>` of its `tunnel_accept`: two
+//! accept locations with their own domains share an edge as two namespaces,
+//! each name free in both, neither tunnel reachable under the other's domain.
 //!
 //! A `tunnel_pass` request for a secret's path (`.env`, `.git/`, keys, ...)
 //! gets 404 here, whatever the local server would answer: `secrets.zig`.
@@ -73,9 +77,11 @@ const usage_interval_ms = std.time.ms_per_hour;
 /// One agent's session.
 pub const Tunnel = struct {
     link: Edge.Link,
-    /// The registry's, for this claim of `name`.
+    /// The registry's, for this claim of `host`.
     id: u64,
+    /// The label the agent asked for or got, and its full host: the registry's key.
     name: []u8,
+    host: []u8,
     /// auth_basic's user, or "-".
     user: []u8,
     /// Since the last usage line: when, and players' sessions opened.
@@ -121,8 +127,8 @@ pub const Edge = struct {
     incoming: std.AutoArrayHashMapUnmanaged(Key, Incoming) = .empty,
     pipes: EdgePipe.Set = .{},
     players: players.Players = .{},
-    /// `tunnel_pass` groups by tunnel name, made on first use and kept for
-    /// the worker's life: a few hundred bytes for each name ever reached.
+    /// `tunnel_pass` groups by tunnel host, made on first use and kept for
+    /// the worker's life: a few hundred bytes for each host ever reached.
     groups: std.StringHashMapUnmanaged(*upstream.Group) = .empty,
 
     pub fn init(w: *Worker) !Edge {
@@ -137,7 +143,7 @@ pub const Edge = struct {
     /// (WT_DRAIN_SESSION). Each tunnel serves on until its agent's next
     /// session takes the name over.
     pub fn drain(self: *Edge) void {
-        for (self.tunnels.values()) |t| registry.drain(self.worker.io, t.name, t.id);
+        for (self.tunnels.values()) |t| registry.drain(self.worker.io, t.host, t.id);
     }
 
     /// The loop is done: no tunnel here takes another connection, and
@@ -197,27 +203,33 @@ pub const Edge = struct {
         defer std.crypto.secureZero(u8, &cred_buf);
         const user = if (w.shared.guards.policy(loc).auth == null) "-" else if (htpasswd.parseAuthorization(findHeader(headers, "authorization") orelse "", &cred_buf)) |c| c.user else "-";
         var name_buf: [63]u8 = undefined;
+        var host_buf: [max_host]u8 = undefined;
         var name: []const u8 = undefined;
+        var host: []const u8 = undefined;
         var id: u64 = undefined;
         if (findHeader(headers, name_header)) |want| {
             name = label(want, &name_buf) orelse return error.BadName;
-            id = try registry.claim(w.io, name, &self.inbox);
+            host = hostIn(name, ta.domain, &host_buf) orelse return error.BadName;
+            id = try registry.claim(w.io, host, &self.inbox);
         } else {
             // Ten tries at a fresh random name; failing that, something is wrong.
             for (0..10) |_| {
                 name = randomName(&name_buf);
-                id = registry.claim(w.io, name, &self.inbox) catch |err| switch (err) {
+                host = hostIn(name, ta.domain, &host_buf) orelse return error.BadName;
+                id = registry.claim(w.io, host, &self.inbox) catch |err| switch (err) {
                     error.Taken => continue,
                     else => |e| return e,
                 };
                 break;
             } else return error.NoFreeName;
         }
-        errdefer registry.release(w.io, name, id);
+        errdefer registry.release(w.io, host, id);
         const t = try a.create(Tunnel);
         errdefer a.destroy(t);
-        t.* = .{ .link = .{ .entry = session.entry, .sid = session_id }, .id = id, .name = try a.dupe(u8, name), .user = &.{}, .since_ms = w.timers.now_ms };
+        t.* = .{ .link = .{ .entry = session.entry, .sid = session_id }, .id = id, .name = try a.dupe(u8, name), .host = &.{}, .user = &.{}, .since_ms = w.timers.now_ms };
         errdefer a.free(t.name);
+        t.host = try a.dupe(u8, host);
+        errdefer a.free(t.host);
         t.user = try a.dupe(u8, user);
         errdefer a.free(t.user);
         const key: Key = .{ .conn = session.id(), .id = session_id };
@@ -231,12 +243,12 @@ pub const Edge = struct {
         });
         stats.inc(&stats.tunnels_open);
         var addr_buf: [64]u8 = undefined;
-        log.info("tunnel {s} open from {s} for {s}: {s}", .{ t.name, socket.formatSockaddr(session.entry.conn.peerAddress(), &addr_buf), t.user, url });
+        log.info("tunnel {s} open from {s} for {s}: {s}", .{ t.host, socket.formatSockaddr(session.entry.conn.peerAddress(), &addr_buf), t.user, url });
     }
 
     /// The session is over: its pipes close, and its name is free again.
     fn close(self: *Edge, t: *Tunnel) void {
-        registry.release(self.worker.io, t.name, t.id);
+        registry.release(self.worker.io, t.host, t.id);
         _ = self.tunnels.swapRemove(.{ .conn = t.link.entry.id, .id = t.link.sid });
         var i: usize = 0;
         while (i < self.incoming.count()) {
@@ -252,7 +264,7 @@ pub const Edge = struct {
     fn logUsage(self: *Edge, t: *Tunnel, what: []const u8) void {
         const now = self.worker.timers.now_ms;
         log.info("tunnel {s} {s}: user={s} secs={d} to_local={d} from_local={d} player_sessions={d}", .{
-            t.name, what, t.user, @divTrunc(now - t.since_ms, std.time.ms_per_s), t.link.carried.sent, t.link.carried.received, t.player_sessions,
+            t.host, what, t.user, @divTrunc(now - t.since_ms, std.time.ms_per_s), t.link.carried.sent, t.link.carried.received, t.player_sessions,
         });
         t.since_ms = now;
         t.link.carried = .{};
@@ -261,6 +273,7 @@ pub const Edge = struct {
 
     fn free(self: *Edge, t: *Tunnel) void {
         self.worker.alloc.free(t.user);
+        self.worker.alloc.free(t.host);
         self.worker.alloc.free(t.name);
         self.worker.alloc.destroy(t);
     }
@@ -417,7 +430,7 @@ pub const Edge = struct {
         if (session) t.player_sessions += 1;
         var s = t.link.session();
         const stream = s.openBidiStream(t.link.sid, null) catch |err| {
-            log.warn("tunnel {s}: no stream for a connection: {s}", .{ t.name, @errorName(err) });
+            log.warn("tunnel {s}: no stream for a connection: {s}", .{ t.host, @errorName(err) });
             _ = std.c.close(fd);
             return;
         };
@@ -464,13 +477,13 @@ pub const Edge = struct {
 
     // ---- tunnel_pass ----
 
-    /// The group for tunnel `name`, made on first use; null while no
-    /// tunnel by that name is open.
-    fn group(self: *Edge, name: []const u8) !?*upstream.Group {
+    /// The group for tunnel `host`, made on first use; null while no
+    /// tunnel by that host is open.
+    fn group(self: *Edge, host: []const u8) !?*upstream.Group {
         const w = self.worker;
-        if (!registry.has(w.io, name)) return null;
-        if (self.groups.get(name)) |g| return g;
-        const key = try w.alloc.dupe(u8, name);
+        if (!registry.has(w.io, host)) return null;
+        if (self.groups.get(host)) |g| return g;
+        const key = try w.alloc.dupe(u8, host);
         errdefer w.alloc.free(key);
         // One counter for every tunnel: names come and go, and the list never shrinks.
         const g = try upstream.Group.initDialed(w, key, &dial, try stats.peer(w.io, "tunnel", "*"));
@@ -517,18 +530,31 @@ fn dial(p: *upstream.Peer) anyerror!std.posix.socket_t {
 
 /// A `tunnel_pass` location's handler.
 pub fn pass(ex: *exchange.Exchange, loc: *const config.Location) void {
-    var buf: [63]u8 = undefined;
-    const name = nameOfHost(ex.req.authority, &buf) orelse return ex.sendError(404);
+    var buf: [max_host]u8 = undefined;
+    const host = hostOf(ex.req.authority, &buf) orelse return ex.sendError(404);
     // whatever the local server would answer (secrets.zig)
     if (secrets.exposesSecret(ex.req.path)) return ex.sendError(404);
-    const g = (ex.worker.tunnels.group(name) catch return ex.sendError(500)) orelse return ex.sendError(404);
+    const g = (ex.worker.tunnels.group(host) catch return ex.sendError(500)) orelse return ex.sendError(404);
     proxy.startGroup(ex, loc, g);
 }
 
-/// The tunnel a host names: its first label, if it has more than one.
-pub fn nameOfHost(authority: []const u8, buf: *[63]u8) ?[]const u8 {
-    const dot = std.mem.indexOfScalar(u8, authority, '.') orelse return null;
-    return label(authority[0..dot], buf);
+/// Longest host a tunnel's key can be, as DNS allows.
+pub const max_host = 253;
+
+/// The tunnel a request's `authority` names: its host, lowercased and without
+/// a port, if its first label is a name and more labels follow.
+pub fn hostOf(authority: []const u8, buf: *[max_host]u8) ?[]const u8 {
+    const host = authority[0 .. std.mem.lastIndexOfScalar(u8, authority, ':') orelse authority.len];
+    const dot = std.mem.indexOfScalar(u8, host, '.') orelse return null;
+    if (!config.isDnsLabel(host[0..dot]) or dot + 1 == host.len or host.len > buf.len) return null;
+    return std.ascii.lowerString(buf, host);
+}
+
+/// The host tunnel `name` gets on `domain` (a tunnel_accept's, port aside).
+fn hostIn(name: []const u8, domain: []const u8, buf: *[max_host]u8) ?[]const u8 {
+    const d = domain[0 .. std.mem.lastIndexOfScalar(u8, domain, ':') orelse domain.len];
+    const out = std.fmt.bufPrint(buf, "{s}.{s}", .{ name, d }) catch return null;
+    return std.ascii.lowerString(out, out);
 }
 
 /// `text` lowercased, if it is a DNS label.
@@ -545,15 +571,21 @@ fn randomName(buf: *[63]u8) []const u8 {
     return buf[0..raw.len];
 }
 
-test "a tunnel is named by its host's first label" {
-    var buf: [63]u8 = undefined;
-    try std.testing.expectEqualStrings("game", nameOfHost("Game.play.example.com:8443", &buf).?);
-    try std.testing.expectEqualStrings("a-1", nameOfHost("a-1.example.com", &buf).?);
-    try std.testing.expect(nameOfHost("localhost:8080", &buf) == null);
-    try std.testing.expect(nameOfHost(".example.com", &buf) == null);
-    try std.testing.expect(nameOfHost("-a.example.com", &buf) == null);
-    try std.testing.expect(nameOfHost("a_b.example.com", &buf) == null);
+test "a tunnel is its full host, port aside" {
+    var buf: [max_host]u8 = undefined;
+    try std.testing.expectEqualStrings("game.play.example.com", hostOf("Game.Play.example.com:8443", &buf).?);
+    try std.testing.expectEqualStrings("a-1.example.com", hostOf("a-1.example.com", &buf).?);
+    try std.testing.expect(hostOf("localhost:8080", &buf) == null);
+    try std.testing.expect(hostOf(".example.com", &buf) == null);
+    try std.testing.expect(hostOf("-a.example.com", &buf) == null);
+    try std.testing.expect(hostOf("a_b.example.com", &buf) == null);
+    try std.testing.expect(hostOf("game.", &buf) == null);
+    try std.testing.expectEqualStrings("game.play.test", hostIn("game", "Play.Test:28443", &buf).?);
+    // the same name on two domains is two tunnels
+    var other: [max_host]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, hostIn("game", "play.netcode.sh", &buf).?, hostIn("game", "play.colyseus.dev", &other).?));
+    var name_buf: [63]u8 = undefined;
     const long: [64]u8 = @splat('x');
-    try std.testing.expect(label(&long, &buf) == null);
-    try std.testing.expectEqual(@as(usize, 63), label(long[0..63], &buf).?.len);
+    try std.testing.expect(label(&long, &name_buf) == null);
+    try std.testing.expectEqual(@as(usize, 63), label(long[0..63], &name_buf).?.len);
 }
