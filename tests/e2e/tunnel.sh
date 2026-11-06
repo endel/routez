@@ -53,8 +53,18 @@ cat > "$WORK/edge.zon" <<EOF
             .locations = .{
                 .{ .prefix = "/.tunnel", .tunnel_accept = .{ .domain = "play.test:28443" } },
                 .{ .prefix = "/.tunnel-auth", .tunnel_accept = .{ .domain = "play.test:28443" }, .auth_basic = .{ .user_file = "$WORK/htpasswd" } },
+                .{ .prefix = "/.tunnel-other", .tunnel_accept = .{ .domain = "other.test:28443" } },
                 .{ .prefix = "/metrics", .metrics = true },
             },
+        },
+        .{
+            .server_names = .{"*.other.test"},
+            .listen = .{
+                .{ .address = "127.0.0.1", .port = 28080 },
+                .{ .address = "127.0.0.1", .port = 28443, .tls = true, .quic = true },
+            },
+            .tls = .{ .cert = "$CERTS/server.crt", .key = "$CERTS/server.key" },
+            .locations = .{.{ .prefix = "/", .tunnel_pass = true }},
         },
         .{
             .server_names = .{"*.play.test"},
@@ -128,6 +138,17 @@ check local-down "$(tail -1 <<< "$r") $(grep -c 'nothing answered at 127.0.0.1:2
 check load "$(python3 "$HERE/tunnel_load.py" game.play.test:28080 28080 64 20)" ok
 metric() { $CURL -k https://localhost:28443/metrics | python3 "$HERE/check_metrics.py" "$@"; }
 check metrics "$(metric routez_tunnels_open) $([ "$(metric routez_tunnel_streams_total)" -gt 0 ] && echo streams)" "3 streams"
+# Two accept domains are two namespaces: the same name on each is its own
+# tunnel, and a tunnel isn't reached under the other domain.
+get_other() { $CURL -o /dev/null -w '%{http_code}' --resolve "$1.other.test:28080:127.0.0.1" "http://$1.other.test:28080/"; }
+"$BIN" tunnel -n game --ca "$CERTS/ca.crt" https://localhost:28443/.tunnel-other 29003 > "$WORK/game-other.out" 2>> "$WORK/game-other.log" & OTHER=$!; PIDS+=($OTHER)
+"$BIN" tunnel -n solo --ca "$CERTS/ca.crt" https://localhost:28443/.tunnel-other 29001 > "$WORK/solo.out" 2>> "$WORK/solo.log" & SOLO=$!; PIDS+=($SOLO)
+wait_file "$WORK/game-other.out" 100; wait_file "$WORK/solo.out" 100
+check domains-url "$(cat "$WORK/game-other.out")" "https://game.other.test:28443 -> 127.0.0.1:29003"
+# game.play.test is the JSON upstream, game.other.test the WebSocket one (400 to a plain GET)
+check domains-isolated "$(get_status game) $(get_other game) $(get_status solo) $(get_other solo)" "200 400 404 200"
+kill $OTHER $SOLO; wait $OTHER $SOLO 2>/dev/null
+
 # Only Linux spreads one port's connections over the workers.
 if [ "$(uname -s)" == Linux ] && [ "$WORKERS" -gt 1 ]; then
     check cross-worker "$([ "$(metric routez_tunnel_streams_cross_worker_total)" -gt 0 ] && echo crossed)" crossed
@@ -208,7 +229,7 @@ for _ in $(seq 1 50); do [ "$(metric routez_tunnel_player_sessions)" == 1 ] && b
 nap 0.5; kill -INT $WTA
 check wt-agent-gone "$(wt_verdict 50 | cut -c1-7) $(wait_metric routez_tunnel_player_sessions 0)" "wt-fail 0"
 # Every players' session above, on the closed tunnel's usage line.
-check usage-player-sessions "$(edge_line 'tunnel wt closed:' | field player_sessions)" $((5 + $(wc -w <<< "${games:-}")))
+check usage-player-sessions "$(edge_line 'tunnel wt.play.test closed:' | field player_sessions)" $((5 + $(wc -w <<< "${games:-}")))
 
 # A second agent asking for a held name hears 409 and keeps trying.
 agent game 29001; DUP=$AGENT
@@ -232,7 +253,7 @@ for _ in $(seq 1 50); do kill -0 $GAME 2>/dev/null || break; nap 0.1; done
 check agent-exits "$(kill -0 $GAME 2>/dev/null && echo running || echo exited)" exited
 check closed-tunnel "$(get_status game)" 404
 # Its usage line: at least the bodies the checks above sent each way.
-u=$(edge_line 'tunnel game closed:')
+u=$(edge_line 'tunnel game.play.test closed:')
 check usage-bytes "$([ "$(field to_local <<< "$u")" -ge 10000000 ] && [ "$(field from_local <<< "$u")" -ge 27000000 ] && echo counted || echo "$u")" counted
 agent game 29001; GAME=$AGENT
 wait_file "$WORK/game.out" 100
@@ -252,7 +273,7 @@ nap 0.5; kill -HUP $EDGE
 wait $LOOP
 check reload "$(sort "$WORK/reload.txt" | uniq -c | awk '{printf "%s:%s ", $2, $1}')" "200:80 "
 check reload-took-over "$(grep -c 'draining this session' "$WORK/game.log")" 1
-check usage-user "$(edge_line 'tunnel authd closed:' | field user)" alice
+check usage-user "$(edge_line 'tunnel authd.play.test closed:' | field user)" alice
 
 # The edge restarts: agents come back by themselves.
 kill $EDGE; wait $EDGE 2>/dev/null

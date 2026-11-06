@@ -115,7 +115,8 @@ pub const Inbox = struct {
     }
 };
 
-/// Process-wide map from tunnel name to the worker holding it, and from
+/// Process-wide map from tunnel host (`<name>.<domain>`, edge.zig) to the
+/// worker holding it, and from
 /// players' session tokens to the workers on both ends. It spans config
 /// generations, so a request on a new generation still reaches a tunnel an
 /// old one holds while it drains.

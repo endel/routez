@@ -55,21 +55,21 @@ pub const Players = struct {
 
     /// A player's CONNECT: to the tunnel its host names, or 404.
     pub fn connect(self: *Players, session: *event_loop.Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
-        var name_buf: [63]u8 = undefined;
-        const name = edge_mod.nameOfHost(findHeader(headers, ":authority") orelse "", &name_buf) orelse
+        var host_buf: [edge_mod.max_host]u8 = undefined;
+        const host = edge_mod.hostOf(findHeader(headers, ":authority") orelse "", &host_buf) orelse
             return wt_relay.answer(session, session_id, "404", null);
-        self.open(session, session_id, name, path, headers) catch |err| {
+        self.open(session, session_id, host, path, headers) catch |err| {
             if (err == error.NoTunnel) return wt_relay.answer(session, session_id, "404", null);
-            log.warn("tunnel {s}: a player's session: {s}", .{ name, @errorName(err) });
+            log.warn("tunnel {s}: a player's session: {s}", .{ host, @errorName(err) });
             wt_relay.answer(session, session_id, "503", null);
         };
     }
 
-    fn open(self: *Players, session: *event_loop.Session, session_id: u64, name: []const u8, path: []const u8, headers: []const qpack.Header) !void {
+    fn open(self: *Players, session: *event_loop.Session, session_id: u64, host: []const u8, path: []const u8, headers: []const qpack.Header) !void {
         const e = self.edge();
         const w = e.worker;
         const a = w.alloc;
-        const s = try registry.openSession(w.io, name, &e.inbox);
+        const s = try registry.openSession(w.io, host, &e.inbox);
         if (s.remote) stats.inc(&stats.tunnel_player_sessions_cross_worker);
         errdefer registry.closeSession(w.io, s.token);
 
