@@ -548,6 +548,7 @@ test {
     _ = @import("control.zig");
     _ = @import("tunnel/registry.zig");
     _ = @import("tunnel/edge.zig");
+    _ = @import("tunnel/secrets.zig");
     _ = @import("tunnel/agent.zig");
     _ = @import("tunnel/wire.zig");
     _ = @import("browser_check.zig");

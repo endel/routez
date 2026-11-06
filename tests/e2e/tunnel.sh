@@ -109,6 +109,11 @@ else
 fi
 check unknown-tunnel "$(get_status nope)" 404
 check no-label "$($CURL -o /dev/null -w '%{http_code}' http://127.0.0.1:28080/)" 404
+# Secrets never leave the machine, though the local server answers any path.
+codes() { for p in "$@"; do $CURL --path-as-is -o /dev/null -w '%{http_code} ' $RG "$G$p"; done; }
+check secrets-refused "$(codes /.env /app/.env.local /.git/config /%2eenv /%252eenv '/src%5c..%5c.env' /.colyseus-cloud.json /certs/server.key /@fs/C:/game/.ENV)" \
+    "404 404 404 404 404 404 404 404 404 "
+check secrets-only "$(codes /node_modules/.vite/deps/x.js /.well-known/x /src/env.ts /100%25.png)" "200 200 200 200 "
 # One client connection, so one worker's pool: the same local connection.
 check keepalive "$($CURL $RG "$G/k1" "$G/k2" "$G/k3" | python3 -c 'import sys,json; print(len({json.loads(l)["peer_port"] for l in sys.stdin.read().replace("}{", "}\n{").splitlines()}))')" 1
 check download "$($CURL $RG "$G/bytes/3000000" | sha)" "$BYTES3M"
