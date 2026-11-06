@@ -34,6 +34,14 @@ const shared_read_buf = xev.backend == .epoll;
 pub const read_buffer_size = if (shared_read_buf) 64 * 1024 else 16 * 1024;
 threadlocal var thread_read_buf: [read_buffer_size]u8 = undefined;
 /// SIGPIPE is ignored process-wide; MSG_NOSIGNAL covers Linux regardless.
+const sys = @import("quic").sys;
+
+/// Best effort, as every option here is: libc's call on POSIX, never std.posix's, which is
+/// unreachable on EINVAL, and macOS answers EINVAL for a socket whose peer has gone.
+fn setOpt(fd: std.posix.socket_t, level: i32, opt: u32, bytes: []const u8) void {
+    if (builtin.target.os.tag == .windows) return sys.setsockopt(fd, level, opt, bytes) catch {};
+    _ = std.c.setsockopt(fd, level, opt, bytes.ptr, @intCast(bytes.len));
+}
 const send_flags: c_int = if (builtin.target.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
 /// Owners stop producing output above this.
 pub const high_water = 256 * 1024;
@@ -247,7 +255,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             // costs an epoll registration round trip (and on epoll a dup of
             // the fd), which most writes to a healthy socket don't need.
             if (!self.corked and !self.writing and !self.connecting and self.buffered() == 0) {
-                const rc = std.c.send(self.tcp.fd, data.ptr, data.len, send_flags);
+                const rc = sys.send(self.tcp.fd, data, send_flags);
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
                     self.sent_total += n;
@@ -281,7 +289,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                 // What goes ahead of a queued file, or everything.
                 const n = if (self.file != null) self.file_before else self.pending.items.len;
                 if (n > 0) {
-                    const rc = std.c.send(self.tcp.fd, self.pending.items.ptr, n, send_flags);
+                    const rc = sys.send(self.tcp.fd, self.pending.items[0..n], send_flags);
                     if (rc > 0) {
                         const sent: usize = @intCast(rc);
                         self.sent_total += sent;
@@ -400,7 +408,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                     if (self.state == .flushing) self.finishFlush();
                     if (self.shut_after_flush and !self.write_shut) {
                         self.write_shut = true;
-                        _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.WR);
+                        sys.shutdown(self.tcp.fd, .send);
                     }
                     return;
                 }
@@ -425,6 +433,8 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                     .ok => if (r.sent == 0) return .failed, // the file shrank
                     .again => return .blocked,
                     .unsupported => {
+                        // Files are the server's; the agent never queues one.
+                        if (builtin.target.os.tag == .windows) return .failed;
                         const n: usize = @intCast(@min(f.len, 64 * 1024));
                         self.active.ensureTotalCapacity(self.alloc, n) catch return .failed;
                         const rc = std.c.pread(f.fd, self.active.allocatedSlice().ptr, n, @intCast(f.offset));
@@ -524,7 +534,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
         fn finishFlush(self: *Self) void {
             // Half-close so the peer sees the whole response before any RST
             // that closing with unread input would trigger.
-            _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.WR);
+            sys.shutdown(self.tcp.fd, .send);
             self.state = .lingering;
             if (self.read_ended) return self.abort();
             self.read_paused = false;
@@ -538,7 +548,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                 .closed => return,
                 .closing => {
                     // The FIN queues behind unsent bytes the reset discards.
-                    if (self.resetting and self.writing) _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RDWR);
+                    if (self.resetting and self.writing) sys.shutdown(self.tcp.fd, .both);
                     return;
                 },
                 else => {},
@@ -546,7 +556,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             self.state = .closing;
             self.dropOutput();
             // Wakes any in-flight read or write so it completes promptly.
-            _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RDWR);
+            sys.shutdown(self.tcp.fd, .both);
             self.maybeFinishClose();
         }
 
@@ -559,13 +569,14 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
                 .closing, .closed => return,
                 else => {},
             }
-            const l: std.posix.linger = .{ .onoff = 1, .linger = 0 };
-            _ = std.c.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&l), @sizeOf(std.posix.linger));
+            const Linger = if (builtin.target.os.tag == .windows) std.os.windows.ws2_32.linger else std.posix.linger;
+            const l: Linger = .{ .onoff = 1, .linger = 0 };
+            setOpt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&l));
             self.state = .closing;
             self.resetting = true;
             self.dropOutput();
             // Wakes a read without sending anything.
-            _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RD);
+            sys.shutdown(self.tcp.fd, .receive);
             self.maybeFinishClose();
         }
 
@@ -595,7 +606,7 @@ pub fn Socket(comptime Owner: type, comptime connects: bool) type {
             const self: *Self = @fieldParentPtr("closed_cb", d);
             if (!self.fd_closed) {
                 self.fd_closed = true;
-                _ = std.c.close(self.tcp.fd);
+                sys.close(self.tcp.fd);
             }
             Owner.onSocketClosed(self.owner);
         }
@@ -648,24 +659,23 @@ pub fn acceptNow(listen_fd: std.posix.socket_t) ?std.posix.socket_t {
 }
 
 pub fn setNonBlocking(fd: std.posix.socket_t) void {
-    const nonblock: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
-    _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(nonblock)));
+    sys.setNonBlocking(fd);
 }
 
 /// Caps the kernel's send buffer (and stops it growing on its own).
 pub fn setSendBuffer(fd: std.posix.socket_t, bytes: c_int) void {
-    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&bytes), @sizeOf(c_int));
+    setOpt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&bytes));
 }
 
 pub fn setNoDelay(fd: std.posix.socket_t) void {
     const one: c_int = 1;
-    _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+    setOpt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one));
 }
 
 fn setNoSigpipe(fd: std.posix.socket_t) void {
     if (comptime builtin.target.os.tag.isDarwin()) {
         const one: c_int = 1;
-        _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+        setOpt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&one));
     }
 }
 
@@ -673,7 +683,7 @@ fn setNoSigpipe(fd: std.posix.socket_t) void {
 pub fn peerIpKey(fd: std.posix.socket_t) ?[16]u8 {
     var storage: std.posix.sockaddr.storage = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    if (std.c.getpeername(fd, @ptrCast(&storage), &len) != 0) return null;
+    sys.getpeername(fd, @ptrCast(&storage), &len) catch return null;
     return ipKey(&storage);
 }
 
@@ -701,7 +711,7 @@ pub fn ipKey(storage: *const std.posix.sockaddr.storage) ?[16]u8 {
 pub fn peerAddress(fd: std.posix.socket_t, buf: []u8) []const u8 {
     var storage: std.posix.sockaddr.storage = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    if (std.c.getpeername(fd, @ptrCast(&storage), &len) != 0) return "-";
+    sys.getpeername(fd, @ptrCast(&storage), &len) catch return "-";
     return formatSockaddr(&storage, buf);
 }
 

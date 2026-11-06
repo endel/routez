@@ -68,12 +68,84 @@ const Options = struct {
     insecure: bool = false,
 };
 
-/// Set by SIGINT/SIGTERM; the tick closes the session so the edge frees the
-/// name at once rather than at its idle timeout.
+/// Set by SIGINT/SIGTERM, Ctrl-C on Windows, or the parent closing our stdin;
+/// the tick closes the session so the edge frees the name at once rather than
+/// at its idle timeout.
 var quit_requested: std.atomic.Value(bool) = .init(false);
 
 fn onQuit(_: std.posix.SIG) callconv(.c) void {
     quit_requested.store(true, .monotonic);
+}
+
+const is_windows = @import("builtin").os.tag == .windows;
+extern "kernel32" fn SetConsoleCtrlHandler(handler: *const fn (u32) callconv(.winapi) i32, add: i32) callconv(.winapi) i32;
+
+/// Ctrl-C, Ctrl-Break and closing the console window.
+fn onConsoleCtrl(_: u32) callconv(.winapi) i32 {
+    quit_requested.store(true, .monotonic);
+    return 1;
+}
+
+/// A parent that runs us on a pipe (`@colyseus/tunnel`) ends the tunnel by closing it: that
+/// reaches us where a signal can't (Windows), and when the parent dies. A terminal or /dev/null
+/// on stdin is no such parent.
+fn watchParent() void {
+    if (!stdinIsPipe()) return;
+    const t = std.Thread.spawn(.{}, readUntilClosed, .{}) catch return;
+    t.detach();
+}
+
+const STD_INPUT_HANDLE: u32 = @bitCast(@as(i32, -10));
+const FILE_TYPE_PIPE = 3;
+extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetFileType(handle: ?*anyopaque) callconv(.winapi) u32;
+extern "kernel32" fn ReadFile(handle: ?*anyopaque, buf: [*]u8, len: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+
+fn stdinIsPipe() bool {
+    if (is_windows) return GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE;
+    // libuv hands a child a socketpair, a shell's `|` a FIFO
+    const kind = stdinType() orelse return false;
+    return kind == std.c.S.IFIFO or kind == std.c.S.IFSOCK;
+}
+
+/// `S.IFMT` of stdin. Zig's libc bindings have statx on Linux, fstat elsewhere.
+fn stdinType() ?u32 {
+    if (@import("builtin").os.tag == .linux) {
+        var sx: std.os.linux.Statx = undefined;
+        const empty_path = 0x1000; // AT_EMPTY_PATH: fd 0 itself
+        if (std.c.statx(0, "", empty_path, .{ .TYPE = true }, &sx) != 0) return null;
+        return sx.mode & std.c.S.IFMT;
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(0, &st) != 0) return null;
+    return @as(u32, st.mode) & std.c.S.IFMT;
+}
+
+fn readUntilClosed() void {
+    var buf: [256]u8 = undefined;
+    while (true) {
+        if (is_windows) {
+            var n: u32 = 0;
+            if (ReadFile(GetStdHandle(STD_INPUT_HANDLE), &buf, buf.len, &n, null) == 0 or n == 0) break;
+        } else {
+            const n = std.c.read(0, &buf, buf.len);
+            if (n == 0) break;
+            if (n < 0 and std.posix.errno(n) != .INTR) break;
+        }
+    }
+    quit_requested.store(true, .monotonic);
+}
+
+fn handleQuit() void {
+    if (is_windows) {
+        _ = SetConsoleCtrlHandler(onConsoleCtrl, 1);
+        return;
+    }
+    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.PIPE, &ignore, null);
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onQuit }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
 }
 
 /// `prog` names the program in its messages.
@@ -83,11 +155,8 @@ pub fn main(arena: std.mem.Allocator, prog: []const u8, args: []const []const u8
         std.debug.print(usage, .{prog});
         return 2;
     };
-    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(.PIPE, &ignore, null);
-    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onQuit }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(.INT, &act, null);
-    std.posix.sigaction(.TERM, &act, null);
+    handleQuit();
+    watchParent();
 
     const a = std.heap.smp_allocator;
     const agent = a.create(Agent) catch return 1;
@@ -426,7 +495,7 @@ pub const Agent = struct {
         // The one line a user waits for; stdout, so a script can take it.
         var buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "{s} -> {s}\n", .{ url, self.opts.local_label }) catch return;
-        _ = std.c.write(1, line.ptr, line.len);
+        @import("quic").sys.stdout().writeAll(line) catch {};
     }
 
     fn sessionRejected(self: *Agent, c: *Conn, status: []const u8) void {

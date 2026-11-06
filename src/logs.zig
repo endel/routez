@@ -6,6 +6,8 @@
 //! worker writing concurrently lands whole in the old file or the new one:
 //! no line is lost and no descriptor is ever closed under a writer.
 const std = @import("std");
+const builtin = @import("builtin");
+const sys = @import("quic").sys;
 const access_log = @import("access_log.zig");
 
 /// Both roots' (`main.zig`, `tunnel_agent.zig`). Everything is compiled in;
@@ -44,10 +46,11 @@ pub fn logFn(
     w.print("{d:0>4}/{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} " ++ prefix ++ format, .{ t.year, t.month, t.day, t.hour, t.minute, t.second } ++ args) catch {};
     const n = w.end;
     buf[n] = '\n';
-    writeAll(2, buf[0 .. n + 1]);
+    writeStderr(buf[0 .. n + 1]);
 }
 
 pub fn realtimeMs() i64 {
+    if (builtin.os.tag == .windows) return @divTrunc(sys.realtimeNs(), std.time.ns_per_ms);
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return 0;
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
@@ -55,6 +58,12 @@ pub fn realtimeMs() i64 {
 
 /// Write a whole line; lines are small, so a short write means a full disk
 /// or a closed pipe, where retrying won't help.
+/// One line to stderr, whole.
+pub fn writeStderr(bytes: []const u8) void {
+    if (builtin.os.tag == .windows) return sys.stderr().writeAll(bytes) catch {};
+    writeAll(2, bytes);
+}
+
 pub fn writeAll(fd: std.posix.fd_t, bytes: []const u8) void {
     var rest = bytes;
     while (rest.len > 0) {
