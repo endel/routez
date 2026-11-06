@@ -28,6 +28,9 @@
 //! players' streams and datagrams alike. A tunnel that comes back after a
 //! reload or a reconnect is a new one, so its line restarts the count.
 //!
+//! A `tunnel_pass` request for a secret's path (`.env`, `.git/`, keys, ...)
+//! gets 404 here, whatever the local server would answer: `secrets.zig`.
+//!
 //! Known gap: a socketpair has no reset, so a local server resetting its
 //! connection reaches the proxy as a plain close. A body read until the
 //! close can then pass for complete; a sized or chunked one cannot.
@@ -51,6 +54,7 @@ const players = @import("players.zig");
 const Worker = @import("../worker.zig").Worker;
 const stats = @import("../stats.zig");
 const htpasswd = @import("../auth/htpasswd.zig");
+const secrets = @import("secrets.zig");
 
 const log = std.log.scoped(.tunnel);
 const registry = &reg.registry;
@@ -515,6 +519,8 @@ fn dial(p: *upstream.Peer) anyerror!std.posix.socket_t {
 pub fn pass(ex: *exchange.Exchange, loc: *const config.Location) void {
     var buf: [63]u8 = undefined;
     const name = nameOfHost(ex.req.authority, &buf) orelse return ex.sendError(404);
+    // whatever the local server would answer (secrets.zig)
+    if (secrets.exposesSecret(ex.req.path)) return ex.sendError(404);
     const g = (ex.worker.tunnels.group(name) catch return ex.sendError(500)) orelse return ex.sendError(404);
     proxy.startGroup(ex, loc, g);
 }
